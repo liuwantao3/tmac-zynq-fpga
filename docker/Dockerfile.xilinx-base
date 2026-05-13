@@ -1,0 +1,35 @@
+FROM --platform=linux/amd64 ubuntu:22.04
+
+LABEL maintainer="FPGA Development"
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV XILINX_DIR=/opt/Xilinx
+ENV XILINX_VERSION=2023.1
+ENV XILINX_LICENSE_FILE=/workspace/xilinx.lic
+
+# Install dependencies
+RUN apt-get update && apt-get install -y \
+    wget curl tar xz-utils openjdk-11-jdk-headless \
+    libncurses-dev libstdc++6 libglib2.0-0 libsm6 libxext6 libxrender1 \
+    libgomp1 libusb-1.0-0 python3 bc sudo kmod \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Create directories
+RUN mkdir -p ${XILINX_DIR} /workspace /root/.Xilinx /tmp/xilinx_payload
+
+# Copy project files (these are on local disk)
+COPY licenses/xilinx.lic ${XILINX_LICENSE_FILE}
+COPY hls /workspace/hls
+COPY firmware /workspace/firmware
+COPY scripts /workspace/scripts
+
+# Create user
+RUN useradd -m -s /bin/bash fpgauser && \
+    usermod -aG sudo fpgauser && \
+    chown -R fpgauser:fpgauser /workspace
+
+USER fpgauser
+WORKDIR /workspace
+
+# Installation will be done via docker run with volume mount
+# See install-xilinx.sh script

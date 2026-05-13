@@ -1,0 +1,43 @@
+# T-MAC Inference in QEMU (ARMv7 emulation)
+# Simulates Zynq 7010 ARM Cortex-A9 environment
+FROM ubuntu:22.04
+
+LABEL maintainer="FPGA Development"
+LABEL description="T-MAC QEMU ARMv7 emulation of Zynq 7010"
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    gcc \
+    g++ \
+    python3 \
+    python3-pip \
+    git \
+    wget \
+    curl \
+    file \
+    qemu-user \
+    qemu-user-static \
+    binfmt-support \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN update-binfmts --enable qemu-arm
+
+WORKDIR /workspace
+
+COPY models/ /workspace/models/
+COPY firmware/ /workspace/firmware/
+COPY scripts/ /workspace/scripts/
+COPY sim/ /workspace/sim/
+
+RUN echo "=== Building T-MAC for ARM (32-bit) ===" && \
+    apt-get update && apt-get install -y gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf && \
+    cd /workspace/sim && \
+    arm-linux-gnueabihf-g++ -static -O2 -march=armv7-a -mtune=cortex-a9 -o tmac_test tmac_test.cpp -lm -fno-exceptions && \
+    file tmac_test && \
+    echo "Build complete!"
+
+CMD ["/bin/bash"]

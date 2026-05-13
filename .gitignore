@@ -1,0 +1,64 @@
+# OS files
+.DS_Store
+Thumbs.db
+
+# Compiled binaries (host)
+sim/tmac_gguf
+sim/tmac_gguf_asan
+sim/tmac_gguf_dbg
+sim/Transaction Tracer/bare_test
+sim/Transaction Tracer/demo
+sim/Transaction Tracer/demo_asan
+sim/Transaction Tracer/simple_test
+
+# Debug symbol directories
+*.dSYM/
+
+# Object files
+*.o
+*.obj
+
+# Vivado / HLS build artifacts
+hls/solution*/
+hls/*.log
+vivado/.Xil/
+vivado/*.log
+vivado/vivado_project/
+vivado/*.jou
+vivado/*.str
+
+# Logs
+logs/
+*.log
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Model weight files (large generated blobs, not source)
+*.gguf
+*.tmac
+*.bin
+
+# Docker installer archives (large, must be manually placed)
+docker/xilinx_installers/*.tar.gz
+docker/xilinx_installers/*.tar
+
+# Editor temp files
+*.swp
+*.swo
+*~
+*.new
+
+# IDE
+.idea/
+.vscode/
+
+# Xilinx license (users provide their own per the docs)
+licenses/xilinx.lic
+docker/licenses/xilinx.lic
+
+# Third-party gguf-tools build artifacts
+gguf-tools-main/gguf-tools
+gguf-tools-main/*.o

@@ -1,0 +1,59 @@
+FROM ubuntu:22.04
+
+LABEL maintainer="FPGA Development"
+LABEL description="Xilinx Vivado/Vitis HLS CPU-only build"
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV XILINX_DIR=/opt/Xilinx
+ENV XILINX_VERSION=2023.1
+ENV PATH="${XILINX_DIR}/Vivado/2023.1/bin:${XILINX_DIR}/Vitis_HLS/2023.1/bin:${PATH}"
+ENV LD_LIBRARY_PATH="${XILINX_DIR}/Vivado/2023.1/lib/lnx64.o:${XILINX_DIR}/Vitis_HLS/2023.1/lib/lnx64:${LD_LIBRARY_PATH}"
+
+RUN apt-get update && apt-get install -y \
+    wget \
+    curl \
+    tar \
+    libncurses-dev \
+    libstdc++6 \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender1 \
+    libgomp1 \
+    openjdk-11-jdk-headless \
+    python3 \
+    python3-pip \
+    git \
+    make \
+    gcc \
+    g++ \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p ${XILINX_DIR} && \
+    mkdir -p /root/.Xilinx && \
+    mkdir -p /workspace
+
+COPY xilinx_installers/* ${XILINX_DIR}/
+
+RUN if [ -f "${XILINX_DIR}/Vivado_${XILINX_VERSION}_preliminary.tar" ]; then \
+        echo "Extracting Vivado..."; \
+        tar -xf ${XILINX_DIR}/Vivado_${XILINX_VERSION}_preliminary.tar -C ${XILINX_DIR}/; \
+    fi
+
+RUN if [ -f "${XILINX_DIR}/Vitis_HLS_${XILINX_VERSION}.tar" ]; then \
+        echo "Extracting Vitis HLS..."; \
+        tar -xf ${XILINX_DIR}/Vitis_HLS_${XILINX_VERSION}.tar -C ${XILINX_DIR}/; \
+    fi
+
+RUN chmod -R 755 ${XILINX_DIR} && \
+    chmod -R 755 /root/.Xilinx
+
+RUN useradd -m -s /bin/bash fpgauser && \
+    chown -R fpgauser:fpgauser /workspace && \
+    chown -R fpgauser:fpgauser ${XILINX_DIR}
+
+USER fpgauser
+WORKDIR /workspace
+
+CMD ["/bin/bash"]

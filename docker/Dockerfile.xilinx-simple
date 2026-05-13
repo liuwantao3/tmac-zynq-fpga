@@ -1,0 +1,39 @@
+# syntax=docker/dockerfile:1.4
+# Xilinx Installation from local source using Rosetta 2
+
+FROM --platform=linux/amd64 ubuntu:22.04
+
+LABEL maintainer="FPGA Development"
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV XILINX_DIR=/opt/Xilinx
+ENV XILINX_VERSION=2023.1
+
+# Install core dependencies
+RUN apt-get update && apt-get install -y \
+    wget curl tar xz-utils \
+    libncurses-dev libstdc++6 libglib2.0-0 libsm6 libxext6 libxrender1 \
+    libgomp1 libusb-1.0-0 openjdk-11-jdk-headless \
+    python3 python3-pip git make gcc g++ kmod sudo bc perl \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Create directories
+RUN mkdir -p ${XILINX_DIR} /workspace /root/.Xilinx /tmp/xilinx_payload
+
+# Copy project files
+COPY hls /workspace/hls
+COPY firmware /workspace/firmware
+COPY scripts /workspace/scripts
+COPY licenses/xilinx.lic /workspace/licenses/xilinx.lic
+
+# ============================================================================
+# Mount Xilinx installer from external drive at build time
+# This copies the installer into the image
+# ============================================================================
+COPY --from=0 --chown=0:0 /Volumes/Xilinx/Xilinx_Unified_2023.1_0507_1903 ${XILINX_DIR}/unified_installer 2>/dev/null || \
+COPY --from=builder --chown=0:0 /Volumes/Xilinx/Xilinx_Unified_2023.1_0507_1903 ${XILINX_DIR}/unified_installer 2>/dev/null || true
+
+USER root
+WORKDIR /workspace
+
+CMD ["/bin/bash"]

@@ -1,0 +1,25 @@
+# T-MAC ARM64 Native Build (for Apple Silicon)
+FROM --platform=linux/arm64 ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    g++ \
+    python3 \
+    file \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
+COPY models/ /workspace/models/
+COPY sim/ /workspace/sim/
+
+RUN echo "Building T-MAC binaries..." && \
+    g++ -O2 -march=armv8-a -o tmac_test /workspace/sim/tmac_test.cpp -lm && \
+    g++ -O2 -march=armv8-a -o tmac_cli /workspace/sim/tmac_cli.cpp -lm && \
+    file tmac_test tmac_cli && \
+    echo "Build complete!"
+
+CMD ["/bin/bash"]

@@ -1,0 +1,43 @@
+version: '3.8'
+
+services:
+  fpga-builder:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.xilinx-base
+    image: fpga-xilinx-local:2023.1
+    container_name: fpga-dev
+    hostname: fpga-dev
+    platform: linux/amd64
+    privileged: true
+    environment:
+      - DISPLAY=${DISPLAY}
+      - XILINX_LICENSE_FILE=/workspace/xilinx.lic
+      - XILINX_DIR=/opt/Xilinx
+    volumes:
+      - .:/workspace
+      - ./licenses:/workspace/licenses:ro
+      - /Volumes/Xilinx:/xilinx:ro
+      - /dev/bus/usb:/dev/bus/usb
+    devices:
+      - /dev/ttyUSB0:/dev/ttyUSB0
+    working_dir: /workspace
+    command: bash
+
+  fpga-build-cpu:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.xilinx-base
+    image: fpga-xilinx-local:2023.1
+    container_name: fpga-build-cpu
+    hostname: fpga-build-cpu
+    platform: linux/amd64
+    environment:
+      - XILINX_LICENSE_FILE=/workspace/licenses/xilinx.lic
+      - XILINX_DIR=/opt/Xilinx
+    volumes:
+      - .:/workspace
+      - ./licenses:/workspace/licenses:ro
+      - /Volumes/Xilinx:/xilinx:ro
+    working_dir: /workspace
+    command: bash

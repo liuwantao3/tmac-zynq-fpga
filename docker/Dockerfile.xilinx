@@ -1,0 +1,81 @@
+FROM --platform=linux/amd64 ubuntu:22.04
+
+LABEL maintainer="FPGA Development"
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV XILINX_DIR=/opt/Xilinx
+ENV XILINX_VERSION=2023.1
+ENV XILINX_LICENSE_FILE=/workspace/xilinx.lic
+
+# Install dependencies
+RUN apt-get update && apt-get install -y \
+    wget curl tar xz-utils openjdk-11-jdk-headless \
+    libncurses-dev libstdc++6 libglib2.0-0 libsm6 libxext6 libxrender1 \
+    libgomp1 libusb-1.0-0 python3 bc sudo kmod \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Create directories
+RUN mkdir -p ${XILINX_DIR} /workspace /root/.Xilinx /tmp/xilinx_payload
+
+# Copy project files
+COPY licenses/xilinx.lic ${XILINX_LICENSE_FILE}
+COPY hls /workspace/hls
+COPY firmware /workspace/firmware
+COPY scripts /workspace/scripts
+
+# Mount Xilinx installer from external drive
+# Source: /xilinx (mounted at runtime)
+
+# ============================================================================
+# Extract payload files (.xz → raw)
+# ============================================================================
+RUN echo "Extracting payload files..." && \
+    cd /xilinx/Xilinx_Unified_2023.1_0507_1903 && \
+    mkdir -p extracted && \
+    for f in payload/*.xz; do \
+        fname=$(basename "$f"); \
+        echo "Extracting $fname..."; \
+        xz -d -k -c "$f" > "extracted/${fname%.xz}" || echo "FAILED: $fname"; \
+    done && \
+    echo "Extraction complete"
+
+# ============================================================================
+# Create installation config
+# ============================================================================
+RUN echo '[CODE]
+BOM_REVISION=Latest
+BOM_SERIAL_NUM=xc7z010clg400-1
+INSTALL_DEVICE=yes
+INSTALL_DOCS=no
+INSTALL_EXAMPLES=no
+INSTALL_IC=yes
+INSTALL_SECURE=no
+INSTALL_SIM=no
+INSTALL_SYMMETRICAL=yes
+INSTALL_TARGET=all
+SKIP_2ND_BOARD=yes
+XILINX_DIR=/opt/Xilinx
+XILINX_SDK_DIR=/opt/Xilinx_SDK
+ENABLE_MODULE_XILINX_VIVADO=true
+ENABLE_MODULE_XILINX_VITIS_HLS=true
+ENABLE_MODULE_XILINX_SDK=false
+' > /tmp/install_zynq.cfg
+
+# ============================================================================
+# Run installation (batch mode)
+# ============================================================================
+RUN chmod +x /xilinx/Xilinx_Unified_2023.1_0507_1903/xsetup && \
+    echo "Starting Xilinx installation..." && \
+    cd /xilinx/Xilinx_Unified_2023.1_0507_1903 && \
+    yes | ./xsetup --config /tmp/install_zynq.cfg --batch || \
+    echo "Installation completed or failed"
+
+# Create user
+RUN useradd -m -s /bin/bash fpgauser && \
+    usermod -aG sudo fpgauser && \
+    chown -R fpgauser:fpgauser /workspace
+
+USER fpgauser
+WORKDIR /workspace
+
+CMD ["/bin/bash"]

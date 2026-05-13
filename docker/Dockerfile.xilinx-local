@@ -1,0 +1,119 @@
+# syntax=docker/dockerfile:1.4
+# Xilinx Installation from local source using Rosetta 2
+
+FROM --platform=linux/amd64 ubuntu:22.04
+
+LABEL maintainer="FPGA Development"
+LABEL description="Xilinx Vivado/Vitis installation from local source"
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV XILINX_DIR=/opt/Xilinx
+ENV XILINX_VERSION=2023.1
+ENV XILINX_LICENSE_FILE=/workspace/licenses/xilinx.lic
+
+# Install core dependencies
+RUN apt-get update && apt-get install -y \
+    wget \
+    curl \
+    tar \
+    xz-utils \
+    libncurses-dev \
+    libstdc++6 \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender1 \
+    libgomp1 \
+    libusb-1.0-0 \
+    openjdk-11-jdk-headless \
+    python3 \
+    python3-pip \
+    git \
+    make \
+    gcc \
+    g++ \
+    kmod \
+    sudo \
+    bc \
+    perl \
+    coreutils \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create directories
+RUN mkdir -p ${XILINX_DIR} \
+    && mkdir -p /workspace \
+    && mkdir -p /root/.Xilinx \
+    && mkdir -p /tmp/xilinx_payload
+
+# Copy license file
+COPY licenses/xilinx.lic ${XILINX_LICENSE_FILE}
+
+# Copy project files (will be mounted to /workspace)
+COPY --chown=1000:1000 ../hls /workspace/hls
+COPY --chown=1000:1000 ../firmware /workspace/firmware
+COPY --chown=1000:1000 ../scripts /workspace/scripts
+
+# ============================================================================
+# Extract installer from external drive
+# The installer is located at /mnt/xilinx_installer/Xilinx_Unified_2023.1_0507_1903/
+# ============================================================================
+COPY --from=fpga-xilinx /mnt/xilinx_installer/Xilinx_Unified_2023.1_0507_1903 ${XILINX_DIR}/unified_installer
+
+# ============================================================================
+# Extract .xz payload files
+# ============================================================================
+RUN echo "Extracting payload files (this may take 30-60 minutes)..." && \
+    cd ${XILINX_DIR}/unified_installer && \
+    ls payload/ | wc -l && \
+    for f in payload/*.xz; do \
+        fname=$(basename "$f" .xz); \
+        if [ ! -f "payload/${fname}" ]; then \
+            echo "Extracting $fname..."; \
+            xz -d -k "$f" || echo "Failed: $fname"; \
+        fi; \
+    done && \
+    echo "Payload extraction complete" && \
+    ls payload/ | wc -l
+
+# ============================================================================
+# Create install configuration for Zynq-7000
+# ============================================================================
+RUN echo '[CODE]
+BOM_REVISION=Latest
+BOM_SERIAL_NUM=xc7z010clg400-1
+INSTALL_DEVICE=yes
+INSTALL_DOCS=no
+INSTALL_EXAMPLES=no
+INSTALL_IC=yes
+INSTALL_SECURE=no
+INSTALL_SIM=no
+INSTALL_SYMMETRICAL=yes
+INSTALL_TARGET=all
+SKIP_2ND_BOARD=yes
+XILINX_DIR=/opt/Xilinx
+XILINX_SDK_DIR=/opt/Xilinx_SDK
+ENABLE_MODULE_XILINX_VIVADO=true
+ENABLE_MODULE_XILINX_VITIS_HLS=true
+ENABLE_MODULE_XILINX_SDK=false
+' > /tmp/install_zynq.cfg
+
+# ============================================================================
+# Run installation (headless/batch mode)
+# ============================================================================
+RUN chmod +x ${XILINX_DIR}/unified_installer/xsetup && \
+    echo "Starting Xilinx installation (may take 1-2 hours)..." && \
+    cd ${XILINX_DIR}/unified_installer && \
+    yes | ./xsetup --config /tmp/install_zynq.cfg --batch || \
+    echo "Installation completed or failed - checking results..."
+
+# Create user
+RUN useradd -m -s /bin/bash fpgauser && \
+    usermod -aG sudo fpgauser && \
+    chown -R fpgauser:fpgauser /workspace
+
+USER fpgauser
+WORKDIR /workspace
+
+# Default commands
+CMD ["/bin/bash"]
