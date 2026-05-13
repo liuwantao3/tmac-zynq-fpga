@@ -56,7 +56,6 @@ Debug C++ TMAC inference for Qwen2-0.5B-Instruct by comparing layer-by-layer out
 │   └── hls_config.tcl
 ├── vivado/
 │   └── block_design.tcl
-├── docker/                 # Docker files for Vivado (not usable — no disk)
 ├── models/
 │   └── qwen2-0_5b-instruct-q4_k_m.gguf  # Source GGUF (~392 MB)
 ├── docs/
@@ -65,7 +64,6 @@ Debug C++ TMAC inference for Qwen2-0.5B-Instruct by comparing layer-by-layer out
 │   └── PROGRESS_SUMMARY.md # Historical progress tracking
 ├── learning/               # User's personal learning materials
 ├── Makefile                # FPGA workflow targets
-├── docker-compose.yml      # Docker Compose for Vivado
 └── SESSION_SUMMARY.md      # This file
 ```
 

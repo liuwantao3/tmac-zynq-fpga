@@ -300,41 +300,6 @@ cd /Users/arctic/fpga && make iterate
 cd /Users/arctic/fpga && make clean && make iterate
 ```
 
-## Docker Development Environment
-
-### Quick Start
-```bash
-cd /Users/arctic/fpga/docker
-
-# Build container (after placing installers in xilinx_installers/)
-./setup.sh build
-
-# Start container
-./setup.sh start
-
-# Attach shell
-./setup.sh shell
-```
-
-### Inside Container
-```bash
-cd /workspace
-make iterate
-```
-
-### Requirements
-- Docker 20.10+, Docker Compose 2.0+
-- Xilinx license file at `licenses/xilinx.lic`
-- Installers in `docker/xilinx_installers/`:
-  - `Vivado_2023.1_preliminary.tar.gz`
-  - `Vitis_HLS_2023.1.tar.gz`
-
-### Container Modes
-| Service | Purpose | Hardware Access |
-|---------|---------|-----------------|
-| fpga-builder | Full build + JTAG | Yes |
-| fpga-build-cpu | CPU-only build | No |
-
 ## Tool Paths
 
 - Vitis HLS: `/opt/Xilinx/Vitis_HLS/2023.1/bin/vitis_hls`

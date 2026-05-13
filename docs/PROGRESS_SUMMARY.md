@@ -244,7 +244,7 @@ These items were from the INT4 era. The current project status:
 - ✅ **C++ inference engine**: `sim/tmac_gguf.cpp` — verified matching ground truth across all 24 layers
 - ✅ **GGUF→TMAC converter**: `scripts/extract_tmac.py` working
 - ✅ **HLS kernel**: `hls/matmul_q8.cpp` — Q8_0 direct path with LUT-based scale multipliers
-- ❌ **FPGA deployment**: Not yet synthesized (needs Vitis HLS in Docker)
+- ❌ **FPGA deployment**: Not yet synthesized (needs Vitis HLS)
 
 ---
 

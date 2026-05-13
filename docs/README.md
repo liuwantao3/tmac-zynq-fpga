@@ -19,5 +19,4 @@
 | `hls/` | HLS kernel source (aspirational) |
 | `firmware/` | ARM runtime (aspirational) |
 | `vivado/` | Vivado block design (aspirational) |
-| `docker/` | Vivado Docker environment |
 | `models/` | GGUF source model file |

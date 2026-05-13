@@ -102,7 +102,7 @@ void matmul_int16(
 | FF | 35,200 |
 | DDR | 512 MB |
 
-## Build (in Docker)
+## Build
 ```bash
 cd /workspace/fpga/hls
 

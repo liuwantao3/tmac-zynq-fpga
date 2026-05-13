@@ -14,11 +14,10 @@ No llama.cpp dependency — reads weights via GGUF→TMAC conversion.
 | C++ inference engine (`sim/tmac_gguf.cpp`) | **Complete** | FP32 matches ground truth across all 24 layers (max diff < 0.002), logits (max diff < 0.0003) |
 | GGUF → TMAC converter (`scripts/extract_tmac.py`) | **Complete** | Output `/tmp/model.tmac` (373.7 MB, 290 tensors) |
 | FPGA simulation (`sim/fpga_sim.hpp`) | **Complete** | Cycle-accurate MatmulAccel with AXI-Lite register model + interrupt |
-| HLS kernel Q8_0 direct path (`hls/matmul_q8.cpp`) | **Design complete** | Not yet synthesized (needs Vitis HLS in Docker) |
+| HLS kernel Q8_0 direct path (`hls/matmul_q8.cpp`) | **Design complete** | Not yet synthesized (needs Vitis HLS) |
 | HLS kernel INT16 fallback (`hls/matmul_int16.cpp`) | **Design complete** | Legacy alternative, not primary |
 | ARM firmware (`firmware/`) | **Aspirational** | Stub — needs full implementation for matmul_q8 IP |
 | Vivado block design (`vivado/block_design.tcl`) | **Aspirational** | Stub — needs HLS IP export first |
-| Docker environment | **Ready** | Dockerfiles for Xilinx 2023.1, QEMU, firmware cross-compile |
 
 ---
 
@@ -68,7 +67,6 @@ No llama.cpp dependency — reads weights via GGUF→TMAC conversion.
 ├── README.md                  ← This file — project overview & handover
 ├── .gitignore
 ├── Makefile                   ← FPGA build targets (HLS, Vivado, clean)
-├── docker-compose.yml         ← Docker Compose for Xilinx tools
 │
 ├── sim/                       ← C++ host simulation (MATURE)
 │   ├── tmac_gguf.cpp          ← Main inference engine (1299 lines)
@@ -121,20 +119,6 @@ No llama.cpp dependency — reads weights via GGUF→TMAC conversion.
 │   ├── architecture.md        ← Full architecture, quantization formats, bug history
 │   ├── AGENTS.md              ← FPGA design workflow for AI agents (Vivado/HLS commands)
 │   └── PROGRESS_SUMMARY.md    ← Historical progress (INT4 era, kept for reference)
-│
-├── docker/                    ← Docker environment for FPGA tooling
-│   ├── Dockerfile             ← Main build container
-│   ├── Dockerfile.arm64       ← ARM64-native build
-│   ├── Dockerfile.cpu         ← CPU-only (no FPGA tools)
-│   ├── Dockerfile.firmware    ← ARM cross-compile
-│   ├── Dockerfile.inference   ← Runtime inference
-│   ├── Dockerfile.qemu        ← QEMU arm emulation
-│   ├── Dockerfile.xilinx*     ← Xilinx Vivado/Vitis HLS variants
-│   ├── setup.sh               ← Docker setup helper
-│   ├── install-xilinx.sh      ← Xilinx installer automation
-│   ├── setup_license.sh       ← License setup
-│   ├── run_test.sh            ← Test runner inside container
-│   └── xilinx_installers/     ← Installer sources (gitignored, must be placed manually)
 │
 ├── licenses/                  ← Xilinx license file (gitignored)
 │   └── xilinx.lic
@@ -349,38 +333,6 @@ Target memory map (512 MB DDR):
 
 ---
 
-## 9. Docker Environment
-
-The `docker/` directory contains multiple Dockerfiles for different use cases:
-
-| Service | File | Purpose |
-|---------|------|---------|
-| fpga-builder | `Dockerfile.xilinx-base` | Vivado + Vitis HLS 2023.1, full build + JTAG |
-| fpga-build-cpu | `Dockerfile.xilinx-base` | CPU-only build (no HW access) |
-| firmware | `Dockerfile.firmware` | ARM cross-compilation toolchain |
-| inference | `Dockerfile.inference` | Runtime inference container |
-| qemu | `Dockerfile.qemu` | ARM emulation via QEMU |
-
-### Quick Start
-
-```bash
-cd /Users/arctic/fpga/docker
-
-# 1. Place Xilinx installers in xilinx_installers/:
-#    - Vivado_2023.1_preliminary.tar.gz
-#    - Vitis_HLS_2023.1.tar.gz
-
-# 2. Place Xilinx license in ../licenses/xilinx.lic
-
-# 3. Build & start:
-./setup.sh build
-./setup.sh start
-
-# 4. Inside container:
-cd /workspace
-make iterate   # Full HLS → Vivado iteration loop
-```
-
 ---
 
 ## 10. Key Technical Details
@@ -420,7 +372,7 @@ See `docs/architecture.md` §6 for complete list. Notable:
 
 ### High Priority
 
-1. **HLS Synthesis & Resource Feedback** — Run `make hls-q8` inside Docker to get actual resource usage. The current estimates (~14K LUT, 64 DSP) need verification. Use `scripts/feedback_parser.py` to parse reports.
+1. **HLS Synthesis & Resource Feedback** — Run `make hls-q8` to get actual resource usage. The current estimates (~14K LUT, 64 DSP) need verification. Use `scripts/feedback_parser.py` to parse reports.
 
 2. **ARM Firmware Implementation** — Rewrite `firmware/` to use the `matmul_q8` IP's actual register map. Current stubs (`tmac_fpga.hpp`) have correct interface signatures but no real AXI driver code.
 
@@ -453,7 +405,7 @@ See `docs/architecture.md` §6 for complete list. Notable:
 
 ### 12.2 What Needs Work
 
-- **HLS synthesis** is the next step. Requires Docker with Xilinx tools.
+- **HLS synthesis** is the next step. Requires Xilinx Vitis HLS.
 - After synthesis, check actual resource usage (DSP, LUT, BRAM) against estimates.
 - If LUT > 85%, reduce unroll factor in `vecmul_1x64_q8` or `matmul_64x64`.
 - If DSP > 80%, reduce systolic array size from 8×8 to 4×4 (cost: 2× latency).
@@ -482,7 +434,7 @@ The `docs/AGENTS.md` file contains the FPGA design workflow for AI agents:
 - **Host**: macOS (arm64)
 - **C++ compiler**: Apple Clang (Xcode), also g++ via Homebrew
 - **Python**: 3.x with `gguf`, `numpy`, `tokenizers` packages
-- **FPGA tools**: Xilinx Vivado 2023.1 + Vitis HLS 2023.1 (in Docker)
+- **FPGA tools**: Xilinx Vivado 2023.1 + Vitis HLS 2023.1
 - **ARM target**: Cortex-A9, cross-compiled with `arm-linux-gnueabihf-g++`
 
 ---
