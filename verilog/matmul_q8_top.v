@@ -1,0 +1,421 @@
+`timescale 1ns / 1ps
+
+module matmul_q8_top (
+    input  wire         clk,
+    input  wire         rst_n,
+
+    // AXI4-Lite slave interface
+    input  wire         s_axil_awvalid,
+    output reg          s_axil_awready,
+    input  wire [15:0]  s_axil_awaddr,
+    input  wire         s_axil_wvalid,
+    output reg          s_axil_wready,
+    input  wire [31:0]  s_axil_wdata,
+    input  wire [3:0]   s_axil_wstrb,
+    output reg          s_axil_bvalid,
+    input  wire         s_axil_bready,
+    output reg  [1:0]   s_axil_bresp,
+    input  wire         s_axil_arvalid,
+    output reg          s_axil_arready,
+    input  wire [15:0]  s_axil_araddr,
+    output reg          s_axil_rvalid,
+    input  wire         s_axil_rready,
+    output reg  [31:0]  s_axil_rdata,
+    output reg  [1:0]   s_axil_rresp,
+
+    // Interrupt
+    output reg          interrupt
+);
+
+    // ======================================================================
+    // Parameters
+    // ======================================================================
+    localparam REG_AP_CTRL   = 16'h0000;
+    localparam REG_GIE       = 16'h0004;
+    localparam REG_IER       = 16'h0008;
+    localparam REG_ISR       = 16'h000C;
+    localparam REG_CTRL_USER = 16'h0010;
+    localparam REG_STATUS    = 16'h0014;
+
+    // Data buffer base addresses (word-aligned)
+    localparam BUF_WEIGHT_BASE = 16'h0400;  // AXI addr 0x1000 >> 2
+    localparam BUF_WEIGHT_END  = 16'h07FF;  // AXI addr 0x1FFF >> 2
+    localparam BUF_SCALE_BASE  = 16'h0800;  // AXI addr 0x2000 >> 2
+    localparam BUF_SCALE_END   = 16'h0803;  // 128 entries = 64 words
+    localparam BUF_ACT_BASE    = 16'h0840;  // AXI addr 0x2100 >> 2
+    localparam BUF_ACT_END     = 16'h0847;  // 64 entries = 32 words
+    localparam BUF_RES_BASE    = 16'h1000;  // AXI addr 0x4000 >> 2
+    localparam BUF_RES_END     = 16'h103F;  // 64 entries = 64 words (lower 32b)
+    localparam BUF_RES_HI_BASE = 16'h1080;  // AXI addr 0x4200 >> 2
+    localparam BUF_RES_HI_END  = 16'h109F;  // upper 16b of 64 entries
+
+    // ======================================================================
+    // Register file
+    // ======================================================================
+    reg [31:0] reg_ap_ctrl;
+    reg [31:0] reg_gie;
+    reg [31:0] reg_ier;
+    reg [31:0] reg_isr;
+    reg [31:0] reg_ctrl_user;
+    reg [31:0] reg_status;
+
+    // ======================================================================
+    // Data buffer memories
+    // ======================================================================
+    reg [7:0]  weight_buf [0:4095];
+    reg [15:0] scale_buf  [0:127];
+    reg [15:0] act_buf    [0:63];
+    reg [47:0] result_buf [0:63];
+
+    integer bi;
+
+    // ======================================================================
+    // Core internal connections
+    // ======================================================================
+    reg         core_start;
+    reg         core_op_vecmul;
+    wire        core_done;
+    wire        core_busy;
+
+    // Core memory interfaces (byte-level for weights, 16-bit for scales/act)
+    reg         wt_we;
+    reg [11:0]  wt_addr;
+    reg [7:0]   wt_din;
+    reg         sc_we;
+    reg [6:0]   sc_addr;
+    reg [15:0]  sc_din;
+    reg         act_we;
+    reg [5:0]   act_addr;
+    reg [15:0]  act_din;
+    reg [5:0]   res_addr;
+    wire [47:0] res_dout;
+
+    matmul_q8_core u_core (
+        .clk       (clk),
+        .rst_n     (rst_n),
+        .start     (core_start),
+        .op_vecmul (core_op_vecmul),
+        .done      (core_done),
+        .busy      (core_busy),
+        .wt_we     (wt_we),
+        .wt_addr   (wt_addr),
+        .wt_din    (wt_din),
+        .sc_we     (sc_we),
+        .sc_addr   (sc_addr),
+        .sc_din    (sc_din),
+        .act_we    (act_we),
+        .act_addr  (act_addr),
+        .act_din   (act_din),
+        .res_addr  (res_addr),
+        .res_dout  (res_dout)
+    );
+
+    // ======================================================================
+    // AXI-Lite write transaction
+    // ======================================================================
+    reg [1:0] wstate;
+    localparam W_IDLE = 0, W_WAIT = 1, W_RESP = 2;
+
+    wire is_ctrl_write, is_buf_write;
+    assign is_ctrl_write = (s_axil_awaddr[15:12] == 0);
+    assign is_buf_write  = (s_axil_awaddr[15:12] == 1); // 0x1000-0x1FFF
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            wstate <= W_IDLE;
+            s_axil_awready <= 0;
+            s_axil_wready  <= 0;
+            s_axil_bvalid  <= 0;
+            s_axil_bresp   <= 0;
+            reg_ap_ctrl    <= 32'h0000_0004;
+            reg_gie        <= 0;
+            reg_ier        <= 0;
+            reg_isr        <= 0;
+            reg_ctrl_user  <= 0;
+        end else begin
+            case (wstate)
+                W_IDLE: begin
+                    s_axil_awready <= 1;
+                    s_axil_wready  <= 1;
+                    if (s_axil_awvalid && s_axil_wvalid) begin
+                        s_axil_awready <= 0;
+                        s_axil_wready  <= 0;
+
+                        // Control register writes
+                        if (is_ctrl_write) begin
+                            case (s_axil_awaddr)
+                                REG_AP_CTRL:   reg_ap_ctrl   <= s_axil_wdata;
+                                REG_GIE:       reg_gie       <= s_axil_wdata;
+                                REG_IER:       reg_ier       <= s_axil_wdata;
+                                REG_CTRL_USER: reg_ctrl_user <= s_axil_wdata;
+                                REG_ISR: begin
+                                    if (s_axil_wdata[0])
+                                        reg_isr[0] <= 0;  // W1C
+                                end
+                            endcase
+                        end
+
+                        // Buffer writes (into weight/scale/act memories)
+                        if (is_buf_write) begin
+                            write_buffer(s_axil_awaddr, s_axil_wdata, s_axil_wstrb);
+                        end
+
+                        wstate <= W_RESP;
+                    end
+                end
+
+                W_RESP: begin
+                    s_axil_bvalid <= 1;
+                    s_axil_bresp  <= 2'b00;
+                    if (s_axil_bready) begin
+                        s_axil_bvalid <= 0;
+                        wstate <= W_IDLE;
+                    end
+                end
+            endcase
+        end
+    end
+
+    // ======================================================================
+    // Buffer write helper
+    // ======================================================================
+    task write_buffer(input [15:0] addr, input [31:0] data, input [3:0] strb);
+        reg [11:0] word_off;
+        begin
+            word_off = addr[13:2];  // word address
+
+            // Weights: 0x1000-0x1FFF → word_off 0x400-0x7FF
+            if (word_off >= BUF_WEIGHT_BASE && word_off <= BUF_WEIGHT_END) begin
+                if (strb[0]) weight_buf[(word_off - BUF_WEIGHT_BASE) * 4 + 0] <= data[7:0];
+                if (strb[1]) weight_buf[(word_off - BUF_WEIGHT_BASE) * 4 + 1] <= data[15:8];
+                if (strb[2]) weight_buf[(word_off - BUF_WEIGHT_BASE) * 4 + 2] <= data[23:16];
+                if (strb[3]) weight_buf[(word_off - BUF_WEIGHT_BASE) * 4 + 3] <= data[31:24];
+            end
+
+            // Scales: 0x2000-0x20FF → word_off 0x800-0x803
+            if (word_off >= BUF_SCALE_BASE && word_off <= BUF_SCALE_END) begin
+                scale_buf[(word_off - BUF_SCALE_BASE) * 2 + 0] <= data[15:0];
+                scale_buf[(word_off - BUF_SCALE_BASE) * 2 + 1] <= data[31:16];
+            end
+
+            // Activations: 0x2100-0x217F → word_off 0x840-0x847
+            if (word_off >= BUF_ACT_BASE && word_off <= BUF_ACT_END) begin
+                act_buf[(word_off - BUF_ACT_BASE) * 2 + 0] <= data[15:0];
+                act_buf[(word_off - BUF_ACT_BASE) * 2 + 1] <= data[31:16];
+            end
+        end
+    endtask
+
+    // ======================================================================
+    // AXI-Lite read transaction
+    // ======================================================================
+    reg [1:0] rstate;
+    localparam R_IDLE = 0, R_DATA = 1;
+
+    wire [11:0] rd_word;
+    assign rd_word = s_axil_araddr[13:2];
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            rstate <= R_IDLE;
+            s_axil_arready <= 0;
+            s_axil_rvalid  <= 0;
+            s_axil_rdata   <= 0;
+            s_axil_rresp   <= 0;
+        end else begin
+            case (rstate)
+                R_IDLE: begin
+                    s_axil_arready <= 1;
+                    if (s_axil_arvalid) begin
+                        s_axil_arready <= 0;
+                        rstate <= R_DATA;
+
+                        // Control register reads
+                        case (s_axil_araddr)
+                            REG_AP_CTRL:   s_axil_rdata <= reg_ap_ctrl;
+                            REG_GIE:       s_axil_rdata <= reg_gie;
+                            REG_IER:       s_axil_rdata <= reg_ier;
+                            REG_ISR:       s_axil_rdata <= reg_isr;
+                            REG_CTRL_USER: s_axil_rdata <= reg_ctrl_user;
+                            REG_STATUS:    s_axil_rdata <= reg_status;
+                            default: begin
+                                // Buffer reads
+                                if (rd_word >= BUF_WEIGHT_BASE && rd_word <= BUF_WEIGHT_END) begin
+                                    s_axil_rdata <= {weight_buf[(rd_word - BUF_WEIGHT_BASE) * 4 + 3],
+                                                     weight_buf[(rd_word - BUF_WEIGHT_BASE) * 4 + 2],
+                                                     weight_buf[(rd_word - BUF_WEIGHT_BASE) * 4 + 1],
+                                                     weight_buf[(rd_word - BUF_WEIGHT_BASE) * 4 + 0]};
+                                end else if (rd_word >= BUF_SCALE_BASE && rd_word <= BUF_SCALE_END) begin
+                                    s_axil_rdata <= {scale_buf[(rd_word - BUF_SCALE_BASE) * 2 + 1],
+                                                     scale_buf[(rd_word - BUF_SCALE_BASE) * 2 + 0]};
+                                end else if (rd_word >= BUF_ACT_BASE && rd_word <= BUF_ACT_END) begin
+                                    s_axil_rdata <= {act_buf[(rd_word - BUF_ACT_BASE) * 2 + 1],
+                                                     act_buf[(rd_word - BUF_ACT_BASE) * 2 + 0]};
+                                end else if (rd_word >= BUF_RES_BASE && rd_word <= BUF_RES_END) begin
+                                    s_axil_rdata <= result_buf[rd_word - BUF_RES_BASE][31:0];
+                                end else if (rd_word >= BUF_RES_HI_BASE && rd_word <= BUF_RES_HI_END) begin
+                                    s_axil_rdata <= {16'b0, result_buf[rd_word - BUF_RES_HI_BASE][47:32]};
+                                end else begin
+                                    s_axil_rdata <= 32'h0;
+                                end
+                            end
+                        endcase
+                    end
+                end
+
+                R_DATA: begin
+                    s_axil_rvalid <= 1;
+                    s_axil_rresp  <= 2'b00;
+                    if (s_axil_rready) begin
+                        s_axil_rvalid <= 0;
+                        rstate <= R_IDLE;
+                    end
+                end
+            endcase
+        end
+    end
+
+    // ======================================================================
+    // Data loading into core (before compute)
+    // ======================================================================
+    reg        loading;
+    reg [12:0] load_addr;
+    reg [2:0]  load_phase;
+
+    localparam LP_IDLE   = 0;
+    localparam LP_WEIGHT = 1;
+    localparam LP_SCALE  = 2;
+    localparam LP_ACT    = 3;
+    localparam LP_DONE   = 4;
+
+    assign core_start    = reg_ap_ctrl[0] && !core_busy && !loading;
+    assign core_op_vecmul = reg_ctrl_user[3];
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            loading    <= 0;
+            load_phase <= LP_IDLE;
+            load_addr  <= 0;
+            wt_we      <= 0;
+            sc_we      <= 0;
+            act_we     <= 0;
+        end else if (reg_ap_ctrl[0] && !core_busy && !loading) begin
+            // AP_CTRL start asserted: begin loading data into core
+            reg_ap_ctrl[0] <= 0;  // auto-clear start
+            loading    <= 1;
+            load_phase <= LP_WEIGHT;
+            load_addr  <= 0;
+        end else if (loading) begin
+            wt_we <= 0;
+            sc_we <= 0;
+            act_we <= 0;
+
+            case (load_phase)
+                LP_WEIGHT: begin
+                    if (load_addr < 4096) begin
+                        wt_we   <= 1;
+                        wt_addr <= load_addr[11:0];
+                        wt_din  <= weight_buf[load_addr[11:0]];
+                        load_addr <= load_addr + 1;
+                    end else begin
+                        load_addr <= 0;
+                        load_phase <= LP_SCALE;
+                    end
+                end
+
+                LP_SCALE: begin
+                    if (load_addr < 128) begin
+                        sc_we   <= 1;
+                        sc_addr <= load_addr[6:0];
+                        sc_din  <= scale_buf[load_addr[6:0]];
+                        load_addr <= load_addr + 1;
+                    end else begin
+                        load_addr <= 0;
+                        load_phase <= LP_ACT;
+                    end
+                end
+
+                LP_ACT: begin
+                    if (load_addr < 64) begin
+                        act_we   <= 1;
+                        act_addr <= load_addr[5:0];
+                        act_din  <= act_buf[load_addr[5:0]];
+                        load_addr <= load_addr + 1;
+                    end else begin
+                        load_addr <= 0;
+                        load_phase <= LP_DONE;
+                    end
+                end
+
+                LP_DONE: begin
+                    loading    <= 0;
+                    load_phase <= LP_IDLE;
+                end
+            endcase
+        end
+    end
+
+    // ======================================================================
+    // Capture core results
+    // ======================================================================
+    reg [5:0] result_idx;
+    reg       draining;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            draining   <= 0;
+            result_idx <= 0;
+        end else if (core_done && !draining) begin
+            draining   <= 1;
+            result_idx <= 0;
+        end else if (draining) begin
+            if (result_idx < 64) begin
+                result_buf[result_idx] <= res_dout;
+                result_idx <= result_idx + 1;
+            end else begin
+                draining <= 0;
+            end
+        end
+    end
+
+    assign res_addr = draining ? result_idx : 0;
+
+    // ======================================================================
+    // STATUS register
+    // ======================================================================
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            reg_status <= 0;
+        else if (core_busy)
+            reg_status <= 1;
+        else if (core_done && !draining)
+            reg_status <= 2;
+        else
+            reg_status <= 0;
+    end
+
+    // ======================================================================
+    // AP_CTRL done/idle/ready bits (read-only)
+    // ======================================================================
+    always @(*) begin
+        reg_ap_ctrl[3:1] = {~core_busy, ~core_busy, core_done};
+    end
+
+    // ======================================================================
+    // Interrupt
+    // ======================================================================
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            reg_isr <= 0;
+        else if (core_done && reg_gie[0] && reg_ier[0])
+            reg_isr[0] <= 1;
+    end
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            interrupt <= 0;
+        else
+            interrupt <= reg_gie[0] && reg_ier[0] && reg_isr[0];
+    end
+
+endmodule

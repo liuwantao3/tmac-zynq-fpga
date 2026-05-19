@@ -181,6 +181,11 @@ static bool g_fpga_int16 = false;
 static bool g_fpga_int16_q8path = false;
 static bool g_fpga_q8 = false;
 
+// Cosimulation tile dump
+static FILE* g_dump_file = nullptr;
+static int g_dump_tiles_remaining = 0;
+static constexpr int COSIM_TILE_SIZE = 4096 + 256 + 128 + 512; // weights + scales + vec + result
+
 // ===========================================================================
 // F16 TO F32
 // ===========================================================================
@@ -685,12 +690,35 @@ void matmul_fpga_q8(const Tensor* A, const float* x, float* y, int rows, int col
             for (int k = 0; k < c_size; k++) vec[k] = x_q[c + k];
 
             fpga_sim::acc16_t result[fpga_sim::N] = {0};
-            fpga_sim::axi_vecmul_tile_q8(
-                (const uint8_t*)q8_tile,
-                combined_scales,
-                vec,
-                result
-            );
+
+            // Cosimulation tile dump
+            if (g_dump_file && g_dump_tiles_remaining > 0) {
+                // Write tile to dump file: weights + scales + vec, then compute + write result
+                fwrite(q8_tile, 1, sizeof(q8_tile), g_dump_file);
+                fwrite(combined_scales, 2, fpga_sim::N * 2, g_dump_file);
+                fwrite(vec, 2, fpga_sim::N, g_dump_file);
+                // Compute reference result via fpga_sim
+                fpga_sim::axi_vecmul_tile_q8(
+                    (const uint8_t*)q8_tile,
+                    combined_scales,
+                    vec,
+                    result
+                );
+                fwrite(result, 8, fpga_sim::N, g_dump_file);
+                g_dump_tiles_remaining--;
+                if (g_dump_tiles_remaining == 0) {
+                    fclose(g_dump_file);
+                    g_dump_file = nullptr;
+                    printf("[COSIM] Dumped all tiles to /tmp/cosim_tiles.bin\n");
+                }
+            } else {
+                fpga_sim::axi_vecmul_tile_q8(
+                    (const uint8_t*)q8_tile,
+                    combined_scales,
+                    vec,
+                    result
+                );
+            }
 
             for (int i = 0; i < r_size; i++)
                 y[r + i] += (double)result[i] * x_scale * row_scale[i];
@@ -1079,6 +1107,9 @@ int load_tmac(const char* path) {
     if (!f) { printf("[ERROR] Cannot open %s\n", path); return -1; }
     uint8_t magic[4];
     if (fread(magic, 1, 4, f) != 4) return -1;
+#ifdef TMAC_DEBUG
+    printf("[DEBUG] TMAC magic: %02x %02x %02x %02x\n", magic[0], magic[1], magic[2], magic[3]);
+#endif
     uint64_t n_tensors;
     if (fread(&n_tensors, 8, 1, f) != 1) return -1;
     g_tensors = (Tensor*)malloc(n_tensors * sizeof(Tensor));
@@ -1110,13 +1141,19 @@ int load_tmac(const char* path) {
         g_tensors[i].data = g_ddr + offset;
         if (fread(g_tensors[i].data, 1, n_bytes, f) != n_bytes) { printf("[ERROR] fread data failed at tensor %lu: name=%s rows=%lu cols=%lu n_bytes=%lu\n", (unsigned long)i, g_tensors[i].name, (unsigned long)rows, (unsigned long)cols, (unsigned long)n_bytes); return -1; }
         offset += n_bytes;
+#ifdef TMAC_DEBUG
         if (i < 5 || i >= n_tensors - 3) fprintf(stderr, "[LOAD] tensor[%lu] %s rows=%lu cols=%lu type=%u n_bytes=%lu offset_after=%lu\n", (unsigned long)i, g_tensors[i].name, (unsigned long)rows, (unsigned long)cols, type, (unsigned long)n_bytes, (unsigned long)offset);
+#endif
     }
     fclose(f);
-    fprintf(stderr, "[LOAD] done loading, about to print OK\n"); fflush(stderr);
+#ifdef TMAC_DEBUG
+    fprintf(stderr, "[LOAD] done loading\n"); fflush(stderr);
+#endif
     printf("[OK] Loaded %lu tensors, DDR: %.1f MB / %d MB\n",
            (unsigned long)n_tensors, offset / (1024.0 * 1024.0), (int)(DDR_SIZE / (1024 * 1024))); fflush(stdout);
+#ifdef TMAC_DEBUG
     fprintf(stderr, "[LOAD] about to return\n"); fflush(stderr);
+#endif
     return 0;
 }
 
@@ -1223,12 +1260,13 @@ void generate(float* hidden, float* logits, int prompt_len, int n_tokens, int to
 // ===========================================================================
 int main(int argc, char** argv) {
     if (argc < 2) {
-        printf("Usage: %s <model.tmac> [--generate N] [--dump-layers] [--fpga] [--fpga-int16] [--fpga-q8] [--perf]\n", argv[0]);
+        printf("Usage: %s <model.tmac> [--generate N] [--dump-layers] [--fpga] [--fpga-int16] [--fpga-q8] [--perf] [--dump-tiles N]\n", argv[0]);
         printf("  Prompt tokens read from stdin, generated tokens printed to stdout\n");
         printf("  --fpga:       Use INT8 FPGA simulation path (lower accuracy)\n");
         printf("  --fpga-int16: Use INT16 FPGA simulation path (higher accuracy, recommended)\n");
         printf("  --fpga-q8:    Use Q8_0 direct path — FPGA handles Q8→INT16 dequant (experimental)\n");
         printf("  --perf:       Enable pipeline profiling (Chrome trace JSON + bottleneck analysis)\n");
+        printf("  --dump-tiles N: Dump first N Q8 tiles for Verilog cosimulation\n");
         return 1;
     }
 
@@ -1251,6 +1289,18 @@ int main(int argc, char** argv) {
         if (strcmp(argv[i], "--fpga-int16") == 0) { g_use_fpga = true; g_fpga_int16 = true; }
         if (strcmp(argv[i], "--fpga-q8") == 0) { g_use_fpga = true; g_fpga_q8 = true; g_fpga_int16 = true; }
         if (strcmp(argv[i], "--perf") == 0) g_perf_enabled = true;
+        if (strcmp(argv[i], "--dump-tiles") == 0 && i + 1 < argc) {
+            int n = atoi(argv[++i]);
+            if (n > 0) {
+                g_dump_file = fopen("/tmp/cosim_tiles.bin", "wb");
+                if (g_dump_file) {
+                    uint32_t header[4] = {(uint32_t)n, 0, 0, 0};
+                    fwrite(header, 4, 4, g_dump_file);
+                    g_dump_tiles_remaining = n;
+                    printf("[COSIM] Dumping first %d Q8 tiles to /tmp/cosim_tiles.bin\n", n);
+                }
+            }
+        }
     }
 
     std::vector<int> tokens;

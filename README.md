@@ -11,25 +11,25 @@ No llama.cpp dependency — reads weights via GGUF→TMAC conversion.
 
 | Component | Status | Verified |
 |-----------|--------|----------|
-| C++ inference engine (`sim/tmac_gguf.cpp`) | **Complete** | FP32 matches ground truth across all 24 layers (max diff < 0.002), logits (max diff < 0.0003) |
+| C++ inference engine (`sim/tmac_gguf.cpp`) | **Complete** | FP32 matches ground truth across all 24 layers (max diff < 0.0003), logits (max diff < 0.0003) |
 | GGUF → TMAC converter (`scripts/extract_tmac.py`) | **Complete** | Output `/tmp/model.tmac` (373.7 MB, 290 tensors) |
 | FPGA simulation (`sim/fpga_sim.hpp`) | **Complete** | Cycle-accurate MatmulAccel with AXI-Lite register model + interrupt |
-| HLS kernel Q8_0 direct path (`hls/matmul_q8.cpp`) | **Design complete** | Not yet synthesized (needs Vitis HLS) |
-| HLS kernel INT16 fallback (`hls/matmul_int16.cpp`) | **Design complete** | Legacy alternative, not primary |
-| ARM firmware (`firmware/`) | **Aspirational** | Stub — needs full implementation for matmul_q8 IP |
-| Vivado block design (`vivado/block_design.tcl`) | **Aspirational** | Stub — needs HLS IP export first |
+| Verilog Q8_0 accelerator (`verilog/`) | **Complete** | 6/6 tests pass, 5 cosim tiles (320 checks) pass |
+| HLS kernel Q8_0 direct path (`hls/matmul_q8.cpp`) | **Deprecated** | Superseded by Verilog RTL |
+| ARM firmware (`firmware/`) | **Aspirational** | Stub — needs full implementation |
+| Vivado block design (`vivado/block_design.tcl`) | **Aspirational** | Stub — needs HLS/Verilog export first |
 
 ---
 
 ## 2. Hardware Target: Zynq 7010 (xc7z010clg400-1)
 
-| Resource | Available | Allocated to Accelerator |
-|----------|-----------|--------------------------|
-| DSP slices | 80 | 64 (8×8 systolic array, 80%) |
-| LUT | 17,600 | ~14K (scale multipliers + control, ~80%) |
-| BRAM | 135 KB (60 × BRAM18K) | ~36 KB (27%) |
-| FF | 35,200 | ~16K (45%) |
-| DDR3 | 512 MB | Model: ~374 MB, KV cache + scratch: ~138 MB |
+| Resource | Available | Used (Verilog) | Notes |
+|----------|-----------|---------------|-------|
+| DSP slices | 80 | 8 (10%) | 8× INT16 MAC (one per lane) |
+| LUT | 17,600 | ~2.5-3.5K (est.) | Post-synthesis required for exact |
+| BRAM | 135 KB (60 × BRAM18K) | 1 BRAM36 (36 KB) | Weight storage: 512×64-bit |
+| FF | 35,200 | ~6.5-9.7K (est.) | Accumulators + pipeline regs |
+| DDR3 | 512 MB | ~374 MB | Model weights |
 
 ---
 
@@ -77,7 +77,18 @@ No llama.cpp dependency — reads weights via GGUF→TMAC conversion.
 │   ├── merges.txt             ← BPE merges
 │   └── Transaction Tracer/    ← AXI transaction tracing utilities
 │
-├── hls/                       ← HLS kernel sources (DESIGN-COMPLETE)
+├── verilog/                  ← Verilog RTL accelerator (PRIMARY — COMPLETE)
+│   ├── matmul_q8_core.v      ← 3-stage pipeline Q8_0 compute core
+│   ├── dequant_lut.v         ← Q8_0 dequant LUT (standalone)
+│   ├── systolic_8x8.v       ← 8×8 systolic array (standalone, not used)
+│   ├── matmul_q8_top.v      ← Top-level: AXI4-Lite + BRAM buffers
+│   ├── axilite_slave.v      ← AXI4-Lite slave + register file
+│   ├── tb_matmul_q8.v        ← Core testbench (6 tests, all pass)
+│   ├── tb_cosim.v           ← Cosimulation with real model tiles
+│   ├── Makefile             ← iverilog build targets
+│   └── DESIGN.md            ← Verilog design document
+
+├── hls/                       ← HLS kernel sources (DEPRECATED — superseded by Verilog)
 │   ├── matmul_q8.cpp          ← PRIMARY: Q8_0 direct path, LUT scale mult, INT16 systolic
 │   ├── matmul_q8.hpp          ← Type/constant defines for matmul_q8
 │   ├── matmul_int16.cpp       ← LEGACY: INT16×INT16→INT64, same 8×8 systolic
@@ -152,25 +163,20 @@ The GGUF model uses Q5_0 (5-bit) for most weights, Q6_K for FFN output layers, a
 critical tensors (embedding, V projection). Block size increased from 4→32/256 elements, giving
 significantly better statistical accuracy.
 
-### 5.2 INT8 Insufficient → INT16 Systolic Array
+### 5.2 INT8 Insufficient → INT16 Direct MAC
 
-The FPGA uses a 64-DSP 8×8 systolic array. INT8×INT8 (8-bit) causes catastrophic SwiGLU divergence
-by layer 3 (max logit diff 35.6, top-1 wrong). INT16×INT16 achieves near-identical results to FP32
-(max logit diff 0.24, top-5 match 5/5). Zynq 7010 DSP48E1 handles INT16×INT16 in one slice
-(no extra resource cost vs INT8).
+The Verilog accelerator uses 8 parallel INT16 MAC lanes (not systolic). INT8×INT8 (8-bit)
+causes catastrophic SwiGLU divergence by layer 3 (max logit diff 35.6, top-1 wrong). INT16×INT16
+achieves near-identical results to FP32 (max logit diff 0.24, top-5 match 5/5). Zynq 7010
+DSP48E1 handles INT16×INT16 in one slice (no extra resource cost vs INT8).
 
 ### 5.3 Q8_0 Direct Path: Dequant on FPGA, Not ARM
 
 **Approach**: FPGA receives raw Q8_0 weight bytes + precomputed UQ8.8 combined scales.
-FPGA handles Q8→INT16 dequantization via LUT-based multipliers (0 DSPs), then INT16×INT16
-systolic matmul (64 DSPs).
+FPGA handles Q8→INT16 dequantization via combinational multipliers (LUT-based, 0 DSP),
+then INT16×INT16 direct MAC with 8 parallel lanes (8 DSPs).
 
-**Rationale**: Moving dequantization to FPGA saves ARM CPU cycles (no FP32 compute on ARM).
-The LUT-based scale multiplier (`q8_val * combined_scale >> 8`) maps to ~14K LUTs, leaving
-all 64 DSPs for the systolic array. The combined scale `UQ8.8 = block_scale / row_scale` is
-precomputed on ARM once per tile.
-
-**Tile compute budget**: 214 cycles/tile @ 150 MHz = ~1.43 µs → 906,836 tiles → total ~82 ms for full inference.
+**Tile compute**: 515 cycles/tile @ 150 MHz → 120,596 tiles → ~413 ms/token.
 
 ### 5.4 GGUF → TMAC Format
 
@@ -199,6 +205,10 @@ g++ -std=c++17 -pthread -O2 -o tmac_gguf tmac_gguf.cpp matmul_q8.cpp
 
 # Debug / ASAN:
 g++ -std=c++17 -pthread -O0 -g -o tmac_gguf_dbg tmac_gguf.cpp matmul_q8.cpp
+
+# Debug with verbose TMAC tracing:
+g++ -std=c++17 -pthread -DTMAC_DEBUG -O0 -g -o tmac_gguf_debug tmac_gguf.cpp matmul_q8.cpp
+
 g++ -std=c++17 -pthread -fsanitize=address -O1 -o tmac_gguf_asan tmac_gguf.cpp matmul_q8.cpp
 ```
 
@@ -248,66 +258,55 @@ time spent per operation (attn_norm, attn_q, ffn_gate, etc.). Use for bottleneck
 
 ---
 
-## 7. FPGA Accelerator
+## 7. FPGA Accelerator (Verilog RTL)
 
-### 7.1 Primary Kernel: `matmul_q8` (Q8_0 Direct Path)
+### 7.1 Verilog Q8_0 Core (`verilog/matmul_q8_core.v`)
 
-```cpp
-void matmul_q8(
-    ap_int<8> A[N * N],                   // Q8_0 weight bytes (4096 B)
-    combined_scale_t combined_scales[N*2], // 128 × UQ8.8 fixed-point (256 B)
-    in_t X[N],                            // Activation vector (INT16, 128 B)
-    acc_t Y[N],                           // Output vector (INT64, 512 B)
-    volatile ap_uint<32> *control,
-    volatile ap_uint<32> *status,
-    ap_uint<1> &interrupt
-);
-```
+Custom Verilog RTL with 3-stage pipeline:
 
-**Dequant logic** (LUT, 0 DSP):
-```
-val = (q8_val * combined_scale) >> 8    // INT8 × UQ8.8 → INT16
-combined_scale = block_scale / row_scale // precomputed on ARM as UQ8.8
-```
+| Stage | Description |
+|-------|-------------|
+| 0 | BRAM address set {g,k}, act_reg[k] + smem[...] read |
+| 1 | BRAM data arrives, dequant + multiply by activation → partial |
+| 2 | Partial products accumulated into acc[64 × 48-bit] |
 
-**Systolic array**: 8×8, INT16×INT16→INT64, 64 DSPs, fully unrolled.
+**Key design choices:**
+- 8 parallel dequant+MAC lanes (one per row in bank group)
+- BRAM-based weight storage (512×64-bit → 1 BRAM36)
+- Single-bank accumulators (read-before-write, no copy block)
+- Dequant: `q8_val * scale >> 8` (INT8 × UQ8.8 → INT16, 0 DSP)
 
-**AXI interfaces**: 4× m_axi (aximm0-3) + 1× s_axilite (control) + ap_vld interrupt.
+**Performance:** 515 cycles/tile, ~413 ms/token @ 150 MHz
 
-### 7.2 Simulation Model (`sim/fpga_sim.hpp`)
+### 7.2 Top-level Integration (`verilog/matmul_q8_top.v`)
 
-The `MatmulAccel` class in `fpga_sim.hpp` implements a bit-accurate software model of the
-HLS IP with:
-- AXI-Lite register map (AP_CTRL, GIE, IER, ISR, CTRL_USER, STATUS, SIZE)
-- Background FSM thread with start→running→done state machine
-- Cycle-accounting for performance modeling (TileCycleBudget)
-- AXI transfer timing model (AxiTiming)
-- Q8_0 direct-path support (INT8 weight dequant + combined scale multiply)
+AXI4-Lite control interface + internal BRAM data buffers.
 
-### 7.3 Legacy Kernels
+### 7.3 Legacy HLS Kernels (Deprecated)
 
 | File | Type | Precision | Status |
 |------|------|-----------|--------|
-| `hls/matmul_q8.cpp` | Q8_0 direct path | INT16 systolic | **Primary** |
-| `hls/matmul_int16.cpp` | Pure INT16 | INT16×INT16→INT64 | Fallback |
+| `hls/matmul_q8.cpp` | Q8_0 direct path | INT16 systolic | **Deprecated** — superseded by Verilog |
+| `hls/matmul_int16.cpp` | Pure INT16 | INT16×INT16→INT64 | **Deprecated** |
 | `hls/matmul_int8.cpp` | Pure INT8 | INT8×INT8→INT32 | **Deprecated** (SwiGLU divergence) |
 
-### 7.4 Resource Budget (matmul_q8)
+### 7.4 Resource Budget (Verilog, estimated)
 
-| Resource | Available | Used | % |
-|----------|-----------|------|---|
-| DSP | 80 | 64 | 80% |
-| LUT | 17,600 | ~14,000 | ~80% |
-| BRAM | 135 KB | ~36 KB | ~27% |
-| FF | 35,200 | ~16,000 | ~45% |
+| Resource | Available | Used (est.) | % |
+|----------|-----------|-------------|---|
+| DSP | 80 | 8 | 10% |
+| LUT | 17,600 | ~2.5-3.5K | 14-20% |
+| BRAM | 135 KB | 1 BRAM36 (36 KB) | ~27% |
+| FF | 35,200 | ~6.5-9.7K | 37-55% |
+
+*Post-synthesis numbers needed for exact usage.*
 
 ### 7.5 Estimated Performance
 
 | Mode | Tiles | Cycles/Tile | Total Cycles | Time @ 150 MHz |
 |------|-------|-------------|-------------|----------------|
-| Prefill (batch) | 906,836 | 214 | 194M | 1.29 s |
-| Decode (vecmul) | 906,836 | 214 | 194M | 1.29 s |
-| Optimistic (no re-quant) | 906,836 | 10 | 9M | 60 ms |
+| Decode (vecmul) | 120,596 | 515 | 62.1M | 413 ms |
+| Prefill (batch) | 120,596 | 515 | 62.1M | 413 ms |
 
 The optimistic case assumes ARM pre-dequants all weights once (cost amortized across tokens).
 

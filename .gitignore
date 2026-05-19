@@ -6,6 +6,7 @@ Thumbs.db
 sim/tmac_gguf
 sim/tmac_gguf_asan
 sim/tmac_gguf_dbg
+sim/tmac_gguf_debug
 sim/Transaction Tracer/bare_test
 sim/Transaction Tracer/demo
 sim/Transaction Tracer/demo_asan
@@ -50,6 +51,10 @@ docker/xilinx_installers/*.tar
 *.swo
 *~
 *.new
+
+# Simulation outputs (iverilog)
+*.vvp
+*.vcd
 
 # IDE
 .idea/
