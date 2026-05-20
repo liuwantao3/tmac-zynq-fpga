@@ -858,14 +858,12 @@ void forward_layer_with_cache(float* hidden, int layer, int pos) {
             for (int p = 0; p <= pos; p++) exp_sum += expf(scores[p] - max_score);
             float log_sum = logf(exp_sum) + max_score;
 
-            for (int d = 0; d < HEAD_DIM; d++) {
-                float weighted_sum = 0;
-                for (int p = 0; p <= pos; p++) {
-                    float* v_cached = g_v_cache[layer][p] + kv * HEAD_DIM;
-                    float exp_score = expf(scores[p] - log_sum);
-                    weighted_sum += exp_score * v_cached[d];
+            for (int p = 0; p <= pos; p++) {
+                float* v_cached = g_v_cache[layer][p] + kv * HEAD_DIM;
+                float exp_score = expf(scores[p] - log_sum);
+                for (int d = 0; d < HEAD_DIM; d++) {
+                    ctx_h[d] += exp_score * v_cached[d];
                 }
-                ctx_h[d] = weighted_sum;
             }
         }
     }
