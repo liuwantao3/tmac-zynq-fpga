@@ -1,6 +1,6 @@
 `timescale 1ns / 1ps
 
-module matmul_q8_top (
+module matmul_top (
     input  wire         clk,
     input  wire         rst_n,
 
@@ -39,7 +39,9 @@ module matmul_q8_top (
 
     // Data buffer base addresses (word-aligned)
     localparam BUF_WEIGHT_BASE = 16'h0400;  // AXI addr 0x1000 >> 2
-    localparam BUF_WEIGHT_END  = 16'h07FF;  // AXI addr 0x1FFF >> 2
+    localparam BUF_WEIGHT_END  = 16'h07FF;  // AXI addr 0x1FFF >> 2 (Q8: 4KB, Q4K: first 8KB)
+    localparam BUF_WEIGHT_Q4K_BASE = 16'h0400;  // AXI addr 0x1000 >> 2 (same base, extended range)
+    localparam BUF_WEIGHT_Q4K_END  = 16'h0BFF;  // AXI addr 0x2FFF >> 2 (8192 bytes for INT16)
     localparam BUF_SCALE_BASE  = 16'h0800;  // AXI addr 0x2000 >> 2
     localparam BUF_SCALE_END   = 16'h0803;  // 128 entries = 64 words
     localparam BUF_ACT_BASE    = 16'h0840;  // AXI addr 0x2100 >> 2
@@ -62,7 +64,7 @@ module matmul_q8_top (
     // ======================================================================
     // Data buffer memories
     // ======================================================================
-    reg [7:0]  weight_buf [0:4095];
+    reg [7:0]  weight_buf [0:8191];  // Q8: 4KB, Q4K: 8KB (INT16 pre-dequant)
     reg [15:0] scale_buf  [0:127];
     reg [15:0] act_buf    [0:63];
     reg [47:0] result_buf [0:63];
@@ -72,10 +74,25 @@ module matmul_q8_top (
     // ======================================================================
     // Core internal connections
     // ======================================================================
-    reg         core_start;
-    reg         core_op_vecmul;
+    wire mode_q4k;
+    assign mode_q4k = reg_ctrl_user[6];
+
+    wire        core_start;
+    wire        core_op_vecmul;
     wire        core_done;
     wire        core_busy;
+
+    // Q8 core signals
+    wire        q8_done, q8_busy;
+    wire [47:0] q8_res_dout;
+
+    // Q4K core signals
+    reg         q4k_start;
+    wire        q4k_done, q4k_busy;
+    reg         q4k_wt_we;
+    reg [12:0]  q4k_wt_addr;
+    reg [7:0]   q4k_wt_din;
+    wire [47:0] q4k_res_dout;
 
     // Core memory interfaces (byte-level for weights, 16-bit for scales/act)
     reg         wt_we;
@@ -87,17 +104,17 @@ module matmul_q8_top (
     reg         act_we;
     reg [5:0]   act_addr;
     reg [15:0]  act_din;
-    reg [5:0]   res_addr;
+    wire [5:0]   res_addr;
     wire [47:0] res_dout;
 
-    matmul_q8_core u_core (
+    matmul_q8_core u_core_q8 (
         .clk       (clk),
         .rst_n     (rst_n),
-        .start     (core_start),
+        .start     (core_start & ~mode_q4k),
         .op_vecmul (core_op_vecmul),
-        .done      (core_done),
-        .busy      (core_busy),
-        .wt_we     (wt_we),
+        .done      (q8_done),
+        .busy      (q8_busy),
+        .wt_we     (wt_we & ~mode_q4k),
         .wt_addr   (wt_addr),
         .wt_din    (wt_din),
         .sc_we     (sc_we),
@@ -107,8 +124,33 @@ module matmul_q8_top (
         .act_addr  (act_addr),
         .act_din   (act_din),
         .res_addr  (res_addr),
-        .res_dout  (res_dout)
+        .res_dout  (q8_res_dout)
     );
+
+    matmul_q4k_core u_core_q4k (
+        .clk       (clk),
+        .rst_n     (rst_n),
+        .start     (core_start & mode_q4k),
+        .op_vecmul (core_op_vecmul),
+        .done      (q4k_done),
+        .busy      (q4k_busy),
+        .wt_we     (q4k_wt_we),
+        .wt_addr   (q4k_wt_addr),
+        .wt_din    (q4k_wt_din),
+        .sc_we     (1'b0),
+        .sc_addr   (7'd0),
+        .sc_din    (16'd0),
+        .act_we    (act_we),
+        .act_addr  (act_addr),
+        .act_din   (act_din),
+        .res_addr  (res_addr),
+        .res_dout  (q4k_res_dout)
+    );
+
+    // MUX: select active core signals
+    assign core_done = mode_q4k ? q4k_done : q8_done;
+    assign core_busy = mode_q4k ? q4k_busy : q8_busy;
+    assign res_dout  = mode_q4k ? q4k_res_dout : q8_res_dout;
 
     // ======================================================================
     // AXI-Lite write transaction
@@ -118,7 +160,7 @@ module matmul_q8_top (
 
     wire is_ctrl_write, is_buf_write;
     assign is_ctrl_write = (s_axil_awaddr[15:12] == 0);
-    assign is_buf_write  = (s_axil_awaddr[15:12] == 1); // 0x1000-0x1FFF
+    assign is_buf_write  = (s_axil_awaddr[15:12] == 1 || s_axil_awaddr[15:12] == 2); // 0x1000-0x2FFF
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -184,24 +226,31 @@ module matmul_q8_top (
         begin
             word_off = addr[13:2];  // word address
 
-            // Weights: 0x1000-0x1FFF → word_off 0x400-0x7FF
-            if (word_off >= BUF_WEIGHT_BASE && word_off <= BUF_WEIGHT_END) begin
-                if (strb[0]) weight_buf[(word_off - BUF_WEIGHT_BASE) * 4 + 0] <= data[7:0];
-                if (strb[1]) weight_buf[(word_off - BUF_WEIGHT_BASE) * 4 + 1] <= data[15:8];
-                if (strb[2]) weight_buf[(word_off - BUF_WEIGHT_BASE) * 4 + 2] <= data[23:16];
-                if (strb[3]) weight_buf[(word_off - BUF_WEIGHT_BASE) * 4 + 3] <= data[31:24];
-            end
-
-            // Scales: 0x2000-0x20FF → word_off 0x800-0x803
+            // Scales: 0x2000-0x20FF → word_off 0x800-0x803 (Q8 only)
             if (word_off >= BUF_SCALE_BASE && word_off <= BUF_SCALE_END) begin
                 scale_buf[(word_off - BUF_SCALE_BASE) * 2 + 0] <= data[15:0];
                 scale_buf[(word_off - BUF_SCALE_BASE) * 2 + 1] <= data[31:16];
             end
 
-            // Activations: 0x2100-0x217F → word_off 0x840-0x847
-            if (word_off >= BUF_ACT_BASE && word_off <= BUF_ACT_END) begin
+            // Activations: 0x2100-0x217F → word_off 0x840-0x847 (Q8 only — Q4K writes activations via separate path)
+            if (!mode_q4k && word_off >= BUF_ACT_BASE && word_off <= BUF_ACT_END) begin
                 act_buf[(word_off - BUF_ACT_BASE) * 2 + 0] <= data[15:0];
                 act_buf[(word_off - BUF_ACT_BASE) * 2 + 1] <= data[31:16];
+            end
+
+            // Weights: 0x1000-0x1FFF (Q8) or 0x1000-0x2FFF (Q4K) → word_off 0x400-0xBFF
+            // Must come AFTER scale/act to avoid overlapping writes at 0x2000-0x217F.
+            // In Q4K mode, bypass exclusion guard so weight_buf[4096:8191] is fully writable
+            // via addresses 0x2000-0x2FFF (scale_buf/act_buf are unused in Q4K mode).
+            if (word_off >= BUF_WEIGHT_Q4K_BASE && word_off <= BUF_WEIGHT_Q4K_END) begin
+                if (mode_q4k ||
+                    !(word_off >= BUF_SCALE_BASE && word_off <= BUF_SCALE_END) &&
+                    !(word_off >= BUF_ACT_BASE && word_off <= BUF_ACT_END)) begin
+                    if (strb[0]) weight_buf[(word_off - BUF_WEIGHT_BASE) * 4 + 0] <= data[7:0];
+                    if (strb[1]) weight_buf[(word_off - BUF_WEIGHT_BASE) * 4 + 1] <= data[15:8];
+                    if (strb[2]) weight_buf[(word_off - BUF_WEIGHT_BASE) * 4 + 2] <= data[23:16];
+                    if (strb[3]) weight_buf[(word_off - BUF_WEIGHT_BASE) * 4 + 3] <= data[31:24];
+                end
             end
         end
     endtask
@@ -239,18 +288,18 @@ module matmul_q8_top (
                             REG_CTRL_USER: s_axil_rdata <= reg_ctrl_user;
                             REG_STATUS:    s_axil_rdata <= reg_status;
                             default: begin
-                                // Buffer reads
-                                if (rd_word >= BUF_WEIGHT_BASE && rd_word <= BUF_WEIGHT_END) begin
-                                    s_axil_rdata <= {weight_buf[(rd_word - BUF_WEIGHT_BASE) * 4 + 3],
-                                                     weight_buf[(rd_word - BUF_WEIGHT_BASE) * 4 + 2],
-                                                     weight_buf[(rd_word - BUF_WEIGHT_BASE) * 4 + 1],
-                                                     weight_buf[(rd_word - BUF_WEIGHT_BASE) * 4 + 0]};
-                                end else if (rd_word >= BUF_SCALE_BASE && rd_word <= BUF_SCALE_END) begin
+                                // Buffer reads (scale/act first to resolve overlap)
+                                if (rd_word >= BUF_SCALE_BASE && rd_word <= BUF_SCALE_END) begin
                                     s_axil_rdata <= {scale_buf[(rd_word - BUF_SCALE_BASE) * 2 + 1],
                                                      scale_buf[(rd_word - BUF_SCALE_BASE) * 2 + 0]};
                                 end else if (rd_word >= BUF_ACT_BASE && rd_word <= BUF_ACT_END) begin
                                     s_axil_rdata <= {act_buf[(rd_word - BUF_ACT_BASE) * 2 + 1],
                                                      act_buf[(rd_word - BUF_ACT_BASE) * 2 + 0]};
+                                end else if (rd_word >= BUF_WEIGHT_Q4K_BASE && rd_word <= BUF_WEIGHT_Q4K_END) begin
+                                    s_axil_rdata <= {weight_buf[(rd_word - BUF_WEIGHT_BASE) * 4 + 3],
+                                                     weight_buf[(rd_word - BUF_WEIGHT_BASE) * 4 + 2],
+                                                     weight_buf[(rd_word - BUF_WEIGHT_BASE) * 4 + 1],
+                                                     weight_buf[(rd_word - BUF_WEIGHT_BASE) * 4 + 0]};
                                 end else if (rd_word >= BUF_RES_BASE && rd_word <= BUF_RES_END) begin
                                     s_axil_rdata <= result_buf[rd_word - BUF_RES_BASE][31:0];
                                 end else if (rd_word >= BUF_RES_HI_BASE && rd_word <= BUF_RES_HI_END) begin
@@ -297,6 +346,7 @@ module matmul_q8_top (
             load_phase <= LP_IDLE;
             load_addr  <= 0;
             wt_we      <= 0;
+            q4k_wt_we  <= 0;
             sc_we      <= 0;
             act_we     <= 0;
         end else if (reg_ap_ctrl[0] && !core_busy && !loading) begin
@@ -307,19 +357,35 @@ module matmul_q8_top (
             load_addr  <= 0;
         end else if (loading) begin
             wt_we <= 0;
+            q4k_wt_we <= 0;
             sc_we <= 0;
             act_we <= 0;
 
             case (load_phase)
                 LP_WEIGHT: begin
-                    if (load_addr < 4096) begin
-                        wt_we   <= 1;
-                        wt_addr <= load_addr[11:0];
-                        wt_din  <= weight_buf[load_addr[11:0]];
-                        load_addr <= load_addr + 1;
+                    if (mode_q4k) begin
+                        // Q4K mode: load 8192 bytes of pre-dequant INT16 data
+                        if (load_addr < 8192) begin
+                            q4k_wt_we   <= 1;
+                            // addr format: {byte_lane[3:0], entry[8:0]}
+                            q4k_wt_addr <= {load_addr[3:0], load_addr[12:4]};
+                            q4k_wt_din  <= weight_buf[load_addr];
+                            load_addr <= load_addr + 1;
+                        end else begin
+                            load_addr <= 0;
+                            load_phase <= LP_ACT;  // skip LP_SCALE in Q4K mode
+                        end
                     end else begin
-                        load_addr <= 0;
-                        load_phase <= LP_SCALE;
+                        // Q8 mode: load 4096 bytes of Q8 weight data
+                        if (load_addr < 4096) begin
+                            wt_we   <= 1;
+                            wt_addr <= load_addr[11:0];
+                            wt_din  <= weight_buf[load_addr[11:0]];
+                            load_addr <= load_addr + 1;
+                        end else begin
+                            load_addr <= 0;
+                            load_phase <= LP_SCALE;
+                        end
                     end
                 end
 

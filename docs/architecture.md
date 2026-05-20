@@ -274,25 +274,34 @@ Type codes:
 
 | File | Purpose |
 |------|---------|
-| `sim/tmac_gguf.cpp` | **Final C++ inference engine** |
+| `sim/tmac_gguf.cpp` | **C++ inference engine** (3 dispatch branches: Q4K→FFN, Q8→logits, else→INT16) |
+| `sim/fpga_sim.hpp` | FPGA simulator: MatmulAccel, AXI-Lite buffer API, timing model |
+| `sim/test_integration.cpp` | C++ integration test (address map / Q4K compute / 5-tile roundtrip — all pass) |
+| `verilog/matmul_top.v` | **Dual-core Verilog top**: Q8_0 + Q4_K, AXI4-Lite, 8192-byte weight_buf |
+| `verilog/matmul_q8_core.v` | Q8_0 compute core (3-stage FSM, LUT dequant, 1 BRAM) |
+| `verilog/matmul_q4k_core.v` | Q4_K compute core (INT16×INT16 pipeline, 512×128-bit wmem, 2 BRAMs) |
 | `scripts/extract_tmac.py` | Converts GGUF to TMAC format |
 | `scripts/py_tmac_vec.py` | **Python reference** (matches C++ exactly) |
-| `scripts/gguf_inference.py` | Ground truth via gguf library |
 | `scripts/ground_truth_v2.py` | Ground truth with tokenizer/chat |
 | `scripts/verify_layers_fast.py` | Layer-by-layer comparison tool |
-| `scripts/compare_weights.py` | Weight dequant comparison |
 | `sim/chat.py` | Chat interface |
 | `scripts/feedback_parser.py` | FPGA HLS/Vivado feedback parser |
 | `scripts/design_iteration.sh` | FPGA design iteration workflow |
-| `scripts/llama_dump.c` | Reference for patching llama.cpp |
 
 ### Build & Run
 ```bash
+# Build inference engine
 cd sim
 g++ -std=c++17 -pthread -O2 -o tmac_gguf tmac_gguf.cpp matmul_q8.cpp
-echo "9707" | ./tmac_gguf /tmp/model.tmac           # single token, dump logits
-echo "9707" | ./tmac_gguf /tmp/model.tmac --dump-layers  # + layer dumps
+echo "9707" | ./tmac_gguf /tmp/model.tmac                # single token, FP32
+echo "9707" | ./tmac_gguf /tmp/model.tmac --fpga-q4k     # Q4_K path (FFN layers)
+echo "9707" | ./tmac_gguf /tmp/model.tmac --fpga-q8      # Q8_0 path (logits)
 echo "9707" | ./tmac_gguf /tmp/model.tmac --generate 10  # generate tokens
+echo "9707" | ./tmac_gguf /tmp/model.tmac --dump-layers  # + layer dumps
+
+# Build and run integration test
+g++ -std=c++14 -O2 -I. -I../gguf -I.. test_integration.cpp -lpthread -o /tmp/test_integration
+/tmp/test_integration
 
 # Chat pipeline:
 python3 -c "

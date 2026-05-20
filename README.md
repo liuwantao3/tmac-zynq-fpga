@@ -66,8 +66,6 @@ No llama.cpp dependency — reads weights via GGUF→TMAC conversion.
 /Users/arctic/fpga/
 ├── README.md                  ← This file — project overview & handover
 ├── .gitignore
-├── Makefile                   ← FPGA build targets (HLS, Vivado, clean)
-│
 ├── sim/                       ← C++ host simulation (MATURE)
 │   ├── tmac_gguf.cpp          ← Main inference engine (1299 lines)
 │   ├── matmul_q8.cpp          ← Q8_0 direct-path matmul (simulated FPGA dequant)
@@ -75,18 +73,21 @@ No llama.cpp dependency — reads weights via GGUF→TMAC conversion.
 │   ├── chat.py                ← Chat interface (Python, uses tmac_gguf binary)
 │   ├── vocab.json             ← Qwen2 tokenizer vocab
 │   ├── merges.txt             ← BPE merges
-│   └── Transaction Tracer/    ← AXI transaction tracing utilities
+│       └── Transaction Tracer/    ← Pipeline profiler (fpga_profiler.hpp, 6-stage CPU-time tracking)
 │
 ├── verilog/                  ← Verilog RTL accelerator (PRIMARY — COMPLETE)
 │   ├── matmul_q8_core.v      ← 3-stage pipeline Q8_0 compute core
+│   ├── matmul_q4k_core.v     ← INT16×INT16 Q4_K compute core (2 BRAMs)
+│   ├── matmul_top.v          ← Top-level: dual-core, AXI4-Lite + BRAM buffers
+│   ├── axilite_slave.v       ← AXI4-Lite slave + register file
 │   ├── dequant_lut.v         ← Q8_0 dequant LUT (standalone)
-│   ├── systolic_8x8.v       ← 8×8 systolic array (standalone, not used)
-│   ├── matmul_q8_top.v      ← Top-level: AXI4-Lite + BRAM buffers
-│   ├── axilite_slave.v      ← AXI4-Lite slave + register file
-│   ├── tb_matmul_q8.v        ← Core testbench (6 tests, all pass)
-│   ├── tb_cosim.v           ← Cosimulation with real model tiles
-│   ├── Makefile             ← iverilog build targets
-│   └── DESIGN.md            ← Verilog design document
+│   ├── systolic_8x8.v        ← 8×8 systolic array (standalone, not used)
+│   ├── tb_matmul_q8.v        ← Q8_0 core testbench (6 tests, all pass)
+│   ├── tb_matmul_q4k.v       ← Q4_K core testbench (7 tests, all pass)
+│   ├── tb_minimal_q4k.v      ← Q4_K smoke test
+│   ├── tb_cosim.v            ← Q8_0 cosimulation with real model tiles
+│   ├── Makefile              ← iverilog build targets
+│   └── DESIGN.md             ← Design document
 
 ├── hls/                       ← HLS kernel sources (DEPRECATED — superseded by Verilog)
 │   ├── matmul_q8.cpp          ← PRIMARY: Q8_0 direct path, LUT scale mult, INT16 systolic
@@ -112,14 +113,12 @@ No llama.cpp dependency — reads weights via GGUF→TMAC conversion.
 ├── scripts/                   ← Python utilities & verification
 │   ├── extract_tmac.py        ← GGUF → TMAC binary converter
 │   ├── ground_truth_v2.py     ← Ground truth via gguf Python library
-│   ├── gguf_inference.py      ← FP32 inference via GGUFReader
-│   ├── gguf_layer_inference.py ← Vectorized layer-by-layer ground truth
 │   ├── py_tmac_vec.py         ← Vectorized Python TMAC reference (matches C++ exactly)
 │   ├── verify_layers_fast.py  ← Compare C++ vs Python layer by layer
-│   ├── compare_weights.py     ← Dequantization element-by-element comparison
-│   ├── llama_dump.c           ← Reference patch for llama.cpp ground truth
+│   ├── test_integration.sh    ← C++ + Verilog integration test suite
 │   ├── feedback_parser.py     ← HLS/Vivado report parser (three-layer feedback)
-│   └── design_iteration.sh    ← FPGA design iteration loop
+│   ├── design_iteration.sh    ← FPGA design iteration loop
+│   └── README.md              ← Scripts documentation
 │
 ├── models/                    ← Model weight files (large, gitignored)
 │   ├── qwen2-0_5b-instruct-q4_k_m.gguf  ← Source GGUF (~392 MB)
@@ -237,7 +236,7 @@ echo 9707 | ./tmac_gguf /tmp/model.tmac --fpga-int16 --perf
 The engine is verified against two independent ground truth sources:
 
 1. **gguf Python library** (`scripts/ground_truth_v2.py`): Official dequantize → run FP32 forward pass
-2. **llama.cpp patched main** (`scripts/llama_dump.c`): Dump logits after prompt eval
+2. **llama.cpp patched main**: Dump logits after prompt eval (removed, was `scripts/llama_dump.c`)
 
 Results:
 - Layer-by-layer hidden state: max diff < **0.002** across all 24 layers
@@ -278,7 +277,7 @@ Custom Verilog RTL with 3-stage pipeline:
 
 **Performance:** 515 cycles/tile, ~413 ms/token @ 150 MHz
 
-### 7.2 Top-level Integration (`verilog/matmul_q8_top.v`)
+### 7.2 Top-level Integration (`verilog/matmul_top.v`)
 
 AXI4-Lite control interface + internal BRAM data buffers.
 
@@ -371,11 +370,11 @@ See `docs/architecture.md` §6 for complete list. Notable:
 
 ### High Priority
 
-1. **HLS Synthesis & Resource Feedback** — Run `make hls-q8` to get actual resource usage. The current estimates (~14K LUT, 64 DSP) need verification. Use `scripts/feedback_parser.py` to parse reports.
+1. **HLS Synthesis & Resource Feedback** — Run `bash scripts/design_iteration.sh hls` to get actual resource usage. The current estimates (~14K LUT, 64 DSP) need verification. Use `scripts/feedback_parser.py` to parse reports.
 
 2. **ARM Firmware Implementation** — Rewrite `firmware/` to use the `matmul_q8` IP's actual register map. Current stubs (`tmac_fpga.hpp`) have correct interface signatures but no real AXI driver code.
 
-3. **Vivado Block Design** — After HLS export, generate `hls_ip.tcl` and integrate into `vivado/block_design.tcl`. Connect AXI master ports to DDR via Zynq PS HP port.
+3. **Vivado Block Design** — After Verilog synthesis, integrate `verilog/matmul_top.v` into `vivado/block_design.tcl`. Connect AXI-Lite slave to Zynq PS M_AXI_GP port.
 
 ### Medium Priority
 
@@ -416,7 +415,7 @@ The `docs/AGENTS.md` file contains the FPGA design workflow for AI agents:
 - HLS/Vivado commands
 - Three-layer feedback system (console, reports, Tcl queries)
 - Optimization strategies for resource overuse
-- Iteration loop (`make iterate`)
+- Iteration loop (`bash scripts/design_iteration.sh all`)
 
 ### 12.4 Key Files to Read First
 

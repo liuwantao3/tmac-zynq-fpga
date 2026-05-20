@@ -4,14 +4,16 @@
 
 This skill automates FPGA development workflows using Xilinx Vivado Design Suite and Vitis HLS with a three-layer feedback system.
 
+> **Note**: The primary implementation has moved from HLS to Verilog RTL (`verilog/matmul_top.v`, `verilog/matmul_q8_core.v`, `verilog/matmul_q4k_core.v`). The HLS kernel (`hls/matmul_q8.cpp`) is now legacy. See `verilog/DESIGN.md` for the current design.
+
 ## Hardware Target
 
 - **Device**: Xilinx Zynq 7010 (xc7z010clg400-1)
 - **Constraints**:
-  - DSP slices: 80 (64 used for 8×8 systolic array, 16 spare)
-  - BRAM: 240 KB (60 × BRAM 18K blocks)
-  - LUTs: 17,600
-  - FF: 35,200
+  - DSP slices: 80 (0 used by Q8 core, 8 by Q4K core, 72 spare)
+  - BRAM: 240 KB (60 × BRAM 18K blocks, 3 used)
+  - LUTs: 17,600 (~3.5K used)
+  - FF: 35,200 (~9.7K used)
   - DDR3: 512 MB
 - **Application**: Qwen 0.5B LLM inference on edge
 
@@ -20,12 +22,16 @@ This skill automates FPGA development workflows using Xilinx Vivado Design Suite
 | Config Register | Values | Description |
 |----------------|--------|-------------|
 | `op_vecmul` | 0=MatMul, 1=VecMul | Operation mode |
+| `mode_q4k` | 0=Q8_0, 1=Q4_K | Core select (bit 6 of `reg_ctrl_user`) |
 
 ### Use Cases
 - **Prefill**: Matrix-matrix (batch processing)
 - **Decode**: Vector-matrix (single token generation)
+- **Q4_K path**: FFN layers (gate, up, down) — largest workload
+- **Q8_0 path**: Token embedding (logits)
+- **INT16 path**: Attention QKV + all other layers (CPU pre-dequant)
 
-## HLS Kernel: matmul_q8 (Primary)
+## Legacy HLS Kernel: matmul_q8
 
 N=64 fixed, 8×8 systolic sub-blocking, LUT-based scale multipliers.
 
@@ -41,14 +47,16 @@ void matmul_q8(
 );
 ```
 
-### Control Register (32-bit AXI slave)
+### Control Register (32-bit AXI slave, Verilog top)
 | Bit | Name | Description |
 |-----|------|-------------|
 | [0] | start | Write 1 to start operation |
 | [1] | int_enable | Enable interrupt on completion |
 | [2] | reserved | — |
 | [3] | op_vecmul | 0=MatMul, 1=VecMul |
-| [31:4] | reserved | Reserved |
+| [5] | mode_q8path | Q8_0 direct path (FPGA dequant) |
+| [6] | mode_q4k | 0=Q8_0 core, 1=Q4_K core |
+| [31:7] | reserved | Reserved |
 
 ### Status Register (32-bit AXI slave)
 | Value | Name | Description |
@@ -91,19 +99,21 @@ cd sim && g++ -std=c++17 -pthread -O2 -o tmac_gguf tmac_gguf.cpp matmul_q8.cpp
 
 ### Usage
 ```bash
-echo 9707 | ./tmac_gguf /path/to/model.tmac              # FP32 (ground truth)
-echo 9707 | ./tmac_gguf /path/to/model.tmac --fpga        # INT8 FPGA sim
-echo 9707 | ./tmac_gguf /path/to/model.tmac --fpga-int16  # INT16 FPGA sim (recommended)
-echo 9707 | ./tmac_gguf /path/to/model.tmac --generate 10 # autoregressive generation
-echo 9707 | ./tmac_gguf /path/to/model.tmac --dump-layers # layer-by-layer dump
+echo 9707 | ./tmac_gguf /path/to/model.tmac                    # FP32 (ground truth)
+echo 9707 | ./tmac_gguf /path/to/model.tmac --fpga-int16       # INT16 FPGA sim (all layers via CPU pre-dequant)
+echo 9707 | ./tmac_gguf /path/to/model.tmac --fpga-q4k         # Q4_K path (FFN layers) + INT16 fallback
+echo 9707 | ./tmac_gguf /path/to/model.tmac --fpga-q8          # Q8_0 logits path + INT16 fallback
+echo 9707 | ./tmac_gguf /path/to/model.tmac --fpga-q4k --fpga-q8  # Both Q4K + Q8 + INT16 fallback
+echo 9707 | ./tmac_gguf /path/to/model.tmac --generate 10      # Autoregressive generation
+echo 9707 | ./tmac_gguf /path/to/model.tmac --dump-layers      # Layer-by-layer dump
 ```
 
 ### Flags
 | Flag | Description |
 |------|-------------|
-| `--fpga` | INT8 quantized matmul via simulated systolic array |
-| `--fpga-int16` | INT16 quantized matmul (highest FPGA accuracy) |
-| `--fpga-q8` | Q8_0 direct path — FPGA receives raw Q8_0 bytes, does LUT-based Q8→INT16 dequant + INT16 systolic matmul |
+| `--fpga` / `--fpga-int16` | INT16 matmul (CPU pre-dequant, default FPGA mode) |
+| `--fpga-q4k` | Q4_K pre-dequant path (FFN layers) + INT16 fallback for everything else |
+| `--fpga-q8` | Q8_0 direct path (logits only, FPGA receives raw Q8_0 bytes) |
 | `--generate N` | Generate N tokens autoregressively |
 | `--perf` | Enable pipeline profiling (Chrome trace JSON + bottleneck analysis) |
 | `--dump-layers` | Save hidden state after each layer to `/tmp/` |
@@ -156,24 +166,37 @@ Total: ~400-450 MB (within 512 MB DDR)
 
 ```
 /Users/arctic/fpga/
+├── verilog/
+│   ├── matmul_top.v          # Dual-core top (Q8_0 + Q4_K), AXI4-Lite + BRAM
+│   ├── matmul_q8_core.v      # Q8_0 compute core (3-stage FSM, LUT dequant)
+│   ├── matmul_q4k_core.v     # Q4_K compute core (INT16×INT16, 2 BRAMs)
+│   ├── axilite_slave.v       # AXI4-Lite slave + register file
+│   └── tb_matmul_q8.v/.q4k.v # Testbenches (all pass)
+├── sim/
+│   ├── tmac_gguf.cpp         # Main inference engine
+│   ├── fpga_sim.hpp          # FPGA simulator: MatmulAccel, AXI-Lite, timing model
+│   └── test_integration.cpp  # Integration test (3/3 pass)
 ├── hls/
-│   ├── matmul_q8.cpp        # Primary HLS kernel (Q8_0 direct path, LUT scale mult)
-│   ├── matmul_q8.hpp        # Q8 kernel type/constant defines
-│   ├── matmul_int16.cpp     # INT16 kernel (legacy fallback)
-│   ├── matmul_int8.cpp      # INT8 kernel (deprecated)
-│   ├── script_q8.tcl        # Q8 kernel synthesis script (recommended)
-│   ├── script_int16.tcl     # INT16 kernel synthesis script
-│   ├── script.tcl           # INT8 kernel synthesis script (deprecated)
-│   ├── hls_config.tcl       # Shared HLS directives (config_bind -mul_style luts)
+│   ├── matmul_q8.cpp         # Legacy HLS kernel (primary implementation moved to Verilog)
+│   ├── matmul_q8.hpp         # Q8 kernel type/constant defines
+│   ├── matmul_int16.cpp      # INT16 kernel (legacy)
+│   ├── matmul_int8.cpp       # INT8 kernel (deprecated)
+│   ├── script_q8.tcl         # Q8 kernel synthesis script
+│   ├── script_int16.tcl      # INT16 kernel synthesis script
+│   ├── script.tcl            # INT8 kernel synthesis script (deprecated)
+│   └── hls_config.tcl        # Shared HLS directives
 ├── vivado/
-│   ├── block_design.tcl     # Vivado block design
-│   └── hls_ip.tcl           # HLS IP integration
+│   ├── block_design.tcl      # Vivado block design
+│   └── hls_ip.tcl            # HLS IP integration
 ├── scripts/
+│   ├── test_integration.sh   # C++ + Verilog integration test suite
 │   ├── design_iteration.sh   # Iteration loop wrapper
-│   └── feedback_parser.py    # Three-layer feedback parser
-├── Makefile
+│   ├── feedback_parser.py    # Three-layer feedback parser
+│   └── README.md             # Scripts documentation
 └── docs/
-    └── AGENTS.md             # This file
+    ├── AGENTS.md              # This file
+    ├── architecture.md        # System architecture
+    └── Q4_K_IMPLEMENTATION_PLAN.md  # Implementation plan (archived)
 ```
 
 ## Three-Layer Feedback System
@@ -193,19 +216,16 @@ Direct queries to Vivado for design exploration
 ### HLS Synthesis
 ```bash
 cd /Users/arctic/fpga && ./scripts/design_iteration.sh hls
-# or: make hls
 ```
 
 ### Vivado Implementation
 ```bash
 cd /Users/arctic/fpga && ./scripts/design_iteration.sh vivado
-# or: make vivado
 ```
 
 ### Full Pipeline
 ```bash
 cd /Users/arctic/fpga && ./scripts/design_iteration.sh all
-# or: make all
 ```
 
 ### Get Structured Feedback
@@ -215,7 +235,7 @@ python3 /Users/arctic/fpga/scripts/feedback_parser.py
 
 ### Iteration Loop
 ```bash
-make iterate
+cd /Users/arctic/fpga && ./scripts/design_iteration.sh all
 ```
 
 ## Feedback Parser Output (JSON)
@@ -294,10 +314,10 @@ make iterate
 
 ```bash
 # Full pipeline with feedback
-cd /Users/arctic/fpga && make iterate
+cd /Users/arctic/fpga && ./scripts/design_iteration.sh all
 
 # Clean and rebuild
-cd /Users/arctic/fpga && make clean && make iterate
+rm -rf logs && ./scripts/design_iteration.sh all
 ```
 
 ## Tool Paths

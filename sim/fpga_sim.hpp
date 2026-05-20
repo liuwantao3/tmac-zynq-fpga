@@ -79,9 +79,7 @@ enum AxiReg : uint32_t {
     REG_ISR       = 0x0C,
     REG_CTRL_USER = 0x10,
     REG_STATUS    = 0x14,
-    REG_A_ADDR_LO = 0x18,
-    REG_B_ADDR_LO = 0x20,
-    REG_C_ADDR_LO = 0x28,
+
     REG_SIZE      = 0x30,
 };
 
@@ -96,32 +94,17 @@ constexpr uint32_t STATUS_DONE    = 2;
 constexpr uint32_t STATUS_ERROR   = 3;
 
 // CTRL_USER bit positions
-constexpr uint32_t CTRL_INT_ENABLE  = 1u << 1;
+
 constexpr uint32_t CTRL_OP_VECMUL   = 1u << 3;
 constexpr uint32_t CTRL_MODE_INT16  = 1u << 4;
 
 // Q8_0 direct path: FPGA receives Q8_0 bytes + scales, does Q8→INT16 internally
 constexpr uint32_t CTRL_MODE_Q8PATH = 1u << 5;
 
-// ===========================================================================
-// Phase-Accurate DSP Timing Model
-//
-// Models the time-multiplexed DSP pipeline within a single 64-PE systolic array.
-// Each tile goes through 3 phases: QUANT → COMPUTE → DEQUANT
-// The same 64 DSPs are reused across phases with pipeline flush overhead.
-//
-// Phase timing at 150 MHz (6.67 ns/cycle):
-//   DSP_FILL_CYCLES:     4 cycles  (~27 ns) — pipeline fills
-//   DSP_DRAIN_CYCLES:    4 cycles  (~27 ns) — pipeline drains
-//   MODE_SWITCH_CYCLES:  2 cycles  (~13 ns) — LUT muxes select new mode
-//   COMPUTE_CYCLES:     64 cycles (~427 ns) — systolic array active
-// ===========================================================================
+// Q4_K direct path: FPGA receives Q4_K blocks, does Q4_K→INT16 internally
+constexpr uint32_t CTRL_MODE_Q4K = 1u << 6;
 
-enum class DspPhase : uint8_t {
-    QUANT_PHASE   = 0,
-    COMPUTE_PHASE = 1,
-    DEQUANT_PHASE = 2
-};
+
 
 struct TileCycleBudget {
     static constexpr uint32_t DSP_FILL_CYCLES    = 4;
@@ -165,60 +148,11 @@ inline float read_f16(const uint8_t* data) {
     return (sign ? -1.0f : 1.0f) * (1.0f + mant / 1024.0f) * powf(2.0f, (int)exp - 15);
 }
 
-// Pipeline simulation statistics
-struct PipelineStats {
-    double cpu_prep_ms = 0;      // total CPU prep wall time
-    double fpga_sleep_ms = 0;    // total FPGA sleep time
-    double wall_ms = 0;          // total end-to-end wall time
-    int64_t cpu_tiles = 0;       // tiles pushed by CPU
-    int64_t fpga_tiles = 0;      // tiles processed by FPGA
 
-    void report(const char* label) const {
-        printf("\n[PIPELINE %s]\n", label);
-        printf("  CPU prep:  %.2f ms (%lld tiles)\n", cpu_prep_ms, (long long)cpu_tiles);
-        printf("  FPGA:      %.2f ms (%lld tiles)\n", fpga_sleep_ms, (long long)fpga_tiles);
-        printf("  Wall:      %.2f ms\n", wall_ms);
-        if (cpu_tiles > 0) {
-            double cpu_us_per_tile = cpu_prep_ms * 1000.0 / cpu_tiles;
-            double fpga_us_per_tile = fpga_sleep_ms * 1000.0 / fpga_tiles;
-            printf("  CPU/tile:  %.3f us  FPGA/tile: %.3f us\n", cpu_us_per_tile, fpga_us_per_tile);
-            printf("  Pipeline bound: %s\n",
-                   cpu_us_per_tile > fpga_us_per_tile ? "CPU" : "FPGA");
-        }
-    }
-};
 
-// ===========================================================================
-// AXI Transfer Timing Model
-//
-// Models AXI-Lite GP0 on Zynq 7010 at 150 MHz, 32-bit bus.
-// Each register write = 5 cycles (AW+W+B handshake).
-// Tile data transfer bandwidth depends on tile size and bus width.
-// ===========================================================================
 
-struct AxiTiming {
-    static constexpr double BUS_MHZ = 150.0;
-    static constexpr double BUS_MBPS = BUS_MHZ * 4.0 * 0.8;  // 32-bit @ 80% efficiency ≈ 480 MB/s
 
-    static constexpr uint32_t REG_WRITE_CYCLES = 5;
-    static constexpr uint32_t REG_WRITE_US      = 5 * 1000 / 150;  // ~33 ns = 0.033 µs
 
-    // Per-tile AXI transfer time based on data size
-    static double tile_transfer_us(size_t bytes) {
-        return bytes / BUS_MBPS * 1000.0;  // ms→µs conversion
-    }
-
-    // Tile sizes for different paths
-    static constexpr size_t INT8_TILE_BYTES   = 64 * 64 * 1;   // 4,096 B
-    static constexpr size_t INT16_TILE_BYTES  = 64 * 64 * 2;   // 8,192 B
-    static constexpr size_t Q8_0_TILE_BYTES  = 64 * 64 * 1;   // 4,096 B (Q8_0 raw bytes)
-    static constexpr size_t Q8_SCALE_BYTES   = 128 * 2;         // 128 combined UQ8.8 scales (256 B)
-
-    // Precomputed transfer times (inlined since all values are constexpr)
-    static constexpr double INT8_TILE_US   = (double)(INT8_TILE_BYTES) / BUS_MBPS * 1000.0;
-    static constexpr double INT16_TILE_US  = (double)(INT16_TILE_BYTES) / BUS_MBPS * 1000.0;
-    static constexpr double Q8_TILE_US     = (double)(Q8_0_TILE_BYTES + Q8_SCALE_BYTES) / BUS_MBPS * 1000.0;
-};
 
 // ===========================================================================
 // Timing accumulator (unchanged)
@@ -251,10 +185,6 @@ struct TimingStats {
 
 inline TimingStats g_timing;
 
-// Forward declare tracer callback type (defined externally by axitrace.hpp)
-using AxiTraceFn = void (*)(void* ctx, uint32_t cycle, int dir,
-                            uint32_t addr, uint32_t data);
-
 // ===========================================================================
 // MatmulAccel — simulates the matmul_int8 / matmul_int16 HLS IP with AXI-Lite
 // register interface, background compute thread, and interrupt generation.
@@ -269,10 +199,6 @@ using AxiTraceFn = void (*)(void* ctx, uint32_t cycle, int dir,
 //   accel.write_reg(REG_AP_CTRL, AP_START);   // start
 //   accel.wait_done();                  // poll or ISR
 //   memcpy(out, accel.ddr() + 8192, ...);     // read C from DDR
-//
-// Optional tracing: attach a callback to observe every register access.
-//   accel.set_tracer(my_fn, my_ctx);
-//   // my_fn(ctx, cycle, dir, addr, data) is called on every write/read
 // ===========================================================================
 class MatmulAccel {
 public:
@@ -293,8 +219,6 @@ public:
     // AXI-Lite write (ARM → FPGA)
     void write_reg(uint32_t byte_off, uint32_t val) {
         if (byte_off >= sizeof(regs_)) return;
-        trace_cycle_++;
-        if (trace_fn_) trace_fn_(trace_ctx_, trace_cycle_, 0, byte_off, val);
         switch (byte_off) {
         case REG_AP_CTRL:
             if (val & AP_START) { regs_[byte_off / 4] |= AP_START; start_flag_.store(true); }
@@ -313,8 +237,6 @@ public:
 
     uint32_t read_reg(uint32_t byte_off) const {
         if (byte_off >= sizeof(regs_)) return 0xFFFFFFFF;
-        trace_cycle_++;
-        if (trace_fn_) trace_fn_(trace_ctx_, trace_cycle_, 1, byte_off, regs_[byte_off / 4]);
         return regs_[byte_off / 4];
     }
 
@@ -330,26 +252,20 @@ public:
         return true;
     }
 
-    // Attach an AXI transaction tracer callback
-    void set_tracer(AxiTraceFn fn, void* ctx = nullptr) {
-        trace_fn_ = fn; trace_ctx_ = ctx;
-    }
 
-    uint64_t trace_cycle() const { return trace_cycle_; }
 
     // Total FPGA cycles consumed (for performance accounting)
     uint64_t total_cycles() const { return total_cycles_; }
-    void add_cycles(uint64_t n) { total_cycles_ += n; }
+
 
     uint8_t* ddr() { return ddr_; }
     const uint8_t* ddr() const { return ddr_; }
 
-    bool interrupt() const { return intr_flag_.load(); }
-    void set_latency_ms(uint32_t ms) { latency_ms_ = ms; }
+
 
     // Q8_0 direct path support
     void set_q8_path(bool enable) { q8_path_ = enable; }
-    bool q8_path() const { return q8_path_; }
+
 
 private:
     mutable uint32_t regs_[64];
@@ -359,10 +275,7 @@ private:
     std::atomic<bool> done_flag_{false};
     std::atomic<bool> stop_{false};
     std::thread fsm_thread_;
-    uint32_t latency_ms_ = 0;  // default: no artificial latency
-    AxiTraceFn trace_fn_ = nullptr;
-    void* trace_ctx_ = nullptr;
-    mutable uint64_t trace_cycle_ = 0;
+
     uint64_t total_cycles_ = 0;
     bool q8_path_ = false;
 
@@ -398,9 +311,6 @@ private:
         uint32_t dimN = (sz >> 8)  & 0xFF;
         uint32_t dimK = sz & 0xFF;
         if (dimM == 0) dimM = 64; if (dimN == 0) dimN = 64; if (dimK == 0) dimK = 64;
-
-        if (latency_ms_ > 0)
-            std::this_thread::sleep_for(std::chrono::milliseconds(latency_ms_));
 
         bool use_q8 = (ctrl & CTRL_MODE_Q8PATH) != 0 && q8_path_;
 
@@ -537,18 +447,6 @@ inline MatmulAccel& accel() {
     return instance;
 }
 
-// INT8 vecmul tile: vec[64] × W[64][64] → result[64] through AXI interface
-inline void axi_vecmul_tile_int8(const in_t vec[N], const in_t W[N][N], acc_t result[N]) {
-    auto& a = accel();
-    memcpy(a.ddr(), vec, N * sizeof(in_t));
-    memcpy(a.ddr() + 4096, W, N * N * sizeof(in_t));
-    a.write_reg(REG_CTRL_USER, CTRL_OP_VECMUL);
-    a.write_reg(REG_SIZE, (1 << 16) | (N << 8) | N);
-    a.write_reg(REG_AP_CTRL, AP_START);
-    a.wait_done();
-    memcpy(result, a.ddr() + 8192, N * sizeof(acc_t));
-}
-
 // INT16 vecmul tile: vec[64] × W[64][64] → result[64] through AXI interface
 inline void axi_vecmul_tile_int16(const in16_t vec[N], const in16_t W[N][N], acc16_t result[N]) {
     auto& a = accel();
@@ -574,49 +472,6 @@ inline void axi_vecmul_tile_int16(const in16_t vec[N], const in16_t W[N][N], acc
 //   float row_scales[14];           // per-row normalization scales
 //   axi_vecmul_tile_q8(q8_bytes, row_scales, vec, result);
 // ===========================================================================
-
-// Q8_0 block: 32 elements, each = val * scale, packed as [scale:FP16][val:INT8×32]
-inline uint16_t read_q8_scale(const uint8_t* data, uint64_t block_idx) {
-    uint64_t off = block_idx * 34;
-    return (uint16_t)data[off] | ((uint16_t)data[off + 1] << 8);
-}
-
-// Compute per-row scales from Q8_0 data (same as ARM-side precompute)
-inline void compute_q8_row_scales(const uint8_t* q8_data, int row, int cols,
-                                   float* scales_out, int max_rows) {
-    for (int r = 0; r < max_rows; r++) {
-        float max_abs = 0.0f;
-        for (int c = 0; c < cols; c++) {
-            uint64_t idx = (uint64_t)r * cols + c;
-            uint64_t block = idx / 32;
-            uint64_t off_in_block = idx % 32;
-            uint64_t block_off = block * 34 + 2 + off_in_block;
-            int8_t val = (int8_t)q8_data[block_off];
-            float a = fabsf((float)val);
-            if (a > max_abs) max_abs = a;
-        }
-        scales_out[r] = (max_abs < 1e-10f) ? 1.0f : max_abs / 32767.0f;
-    }
-    (void)row; (void)cols;
-}
-
-// Precompute combined UQ8.8 fixed-point scales for a 64×64 tile's rows.
-// Each row needs block_scale[row][blk] (from the Q8_0 tensor) and row_scale[row].
-// Combined = block_scale / row_scale → UQ8.8 fixed-point.
-// FPGA receives these and does LUT-based integer multiply: q8_val * combined >> 8.
-inline void compute_combined_scales(const float block_scales[64][2],
-                                     const float row_scales[64],
-                                     uint16_t combined_scales[128]) {
-    for (int r = 0; r < 64; r++) {
-        float row_inv = (row_scales[r] < 1e-10f) ? 1.0f : (1.0f / row_scales[r]);
-        for (int blk = 0; blk < 2; blk++) {
-            float combined = block_scales[r][blk] * row_inv;
-            if (combined >= 256.0f) combined = 255.996f;
-            if (combined < 0.0f) combined = 0.0f;
-            combined_scales[r * 2 + blk] = (uint16_t)(combined * 256.0f + 0.5f);
-        }
-    }
-}
 
 // Q8_0 direct tile: FPGA receives pure INT8 weight bytes + combined UQ8.8 scales.
 // ARM precomputes combined = block_scale / row_scale as UQ8.8 fixed-point.
@@ -649,36 +504,283 @@ inline void axi_vecmul_tile_q8(const uint8_t* q8_W,                // 64×64 pur
     a.set_q8_path(false);
 }
 
+
+
 // ===========================================================================
-// Q8_0 Logits Path — FPGA handles full (1×896) @ (896×151936) matmul
-//
-// Flow:
-//   1. CPU sends hidden vector (1×896 FP32) ONCE to FPGA BRAM
-//   2. FPGA streams Q8_0 token_embd.weight blocks from DDR
-//   3. FPGA does Q8→INT16 dequantization internally
-//   4. FPGA computes hidden × Q8_embeddings
-//   5. CPU receives raw_logits (151936 floats) for top-k comparison
-//
-// DDR layout for logits Q8 path (fits within 512 MB):
-//   Hidden vector (1×896 FP32):        offset 0,       ~3.5 KB
-//   Q8_0 embeddings (896×151936):      offset 65536,   ~139 MB
-//   Raw logits output (151936 FP32):   offset 150000000, ~607 KB
+// Q4_K Direct Path — FPGA receives Q4_K blocks, does Q4_K→INT16 internally.
+// Tile: 64×64 weights = 16 Q4_K blocks × 144 bytes = 2304 bytes.
+// ARM side (CPU): sends raw Q4_K blocks (2304 B/tile) + activation vector.
+// FPGA side: Q4_K→INT16 dequant + INT16 matmul.
 // ===========================================================================
 
-inline void fpga_logits_q8(const Tensor* emb_t,
-                           const float* hidden,
-                           float* raw_logits,
-                           int hidden_dim,
-                           int vocab_size) {
-    auto t0 = std::chrono::high_resolution_clock::now();
+// Q4_K block constants
+constexpr int Q4K_BLOCK_SIZE = 256;           // 256 weights per block
+constexpr int Q4K_BLOCK_BYTES = 144;          // 144 bytes per block
+constexpr int Q4K_TILE_BLOCKS = 16;           // 16 blocks per 64×64 tile
+constexpr int Q4K_TILE_BYTES = Q4K_TILE_BLOCKS * Q4K_BLOCK_BYTES;  // 2304
 
-    memset(raw_logits, 0, vocab_size * sizeof(float));
-    extern void q8_logits_matmul_with_tensor(const Tensor* t, const float* x, float* y, int rows, int cols);
-    q8_logits_matmul_with_tensor(emb_t, hidden, raw_logits, vocab_size, hidden_dim);
+// Dequantize a single Q4_K block (144 bytes) → INT16[256]
+// Block layout: 4 rows × 64 cols in column-major order within the tile
+//   sub_block: 0-7, each covering 32 consecutive tensor indices
+//   For a 64×64 tile: sub_block = row_in_block*2 + (col>=32 ? 1 : 0)
+inline void dequant_q4k_block_to_int16(const uint8_t block[Q4K_BLOCK_BYTES],
+                                        int16_t out[Q4K_BLOCK_SIZE]) {
+    float d = read_f16(block);
+    float dmin = read_f16(block + 2);
+    const uint8_t* scales = block + 4;
+    const uint8_t* qs = block + 16;
 
-    auto t1 = std::chrono::high_resolution_clock::now();
-    double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-    g_timing.cpu_ms += ms;
+    for (int sub = 0; sub < 8; sub++) {
+        int sc, m;
+        if (sub < 4) {
+            sc = scales[sub] & 63;
+            m = scales[sub + 4] & 63;
+        } else {
+            sc = (scales[sub + 4] & 0xF) | ((scales[sub - 4] >> 6) << 4);
+            m = (scales[sub + 4] >> 4) | ((scales[sub] >> 6) << 4);
+        }
+        sc = std::min(sc, 63);
+        m = std::min(m, 63);
+
+        for (int j = 0; j < 32; j++) {
+            uint64_t qs_byte_idx = (sub / 2) * 32 + j;
+            uint8_t q4 = (sub % 2 == 0) ? (qs[qs_byte_idx] & 0xF) : (qs[qs_byte_idx] >> 4);
+            float val = d * (float)sc * (float)q4 - dmin * (float)m;
+            int idx = sub * 32 + j;
+            if (val >= 32767.0f) out[idx] = 32767;
+            else if (val <= -32768.0f) out[idx] = -32768;
+            else out[idx] = (int16_t)roundf(val);
+        }
+    }
 }
+
+// Dequantize a full 64×64 tile from 16 Q4_K blocks → INT16[64][64]
+// Each block covers 4 rows × 64 cols in the tile (rows 4*BI..4*BI+3)
+inline void dequant_q4k_tile(const uint8_t q4k_blocks[Q4K_TILE_BYTES],
+                              int16_t tile[fpga_sim::N][fpga_sim::N]) {
+    memset(tile, 0, fpga_sim::N * fpga_sim::N * sizeof(int16_t));
+    int16_t block_out[Q4K_BLOCK_SIZE];
+    for (int bi = 0; bi < Q4K_TILE_BLOCKS; bi++) {
+        dequant_q4k_block_to_int16(q4k_blocks + bi * Q4K_BLOCK_BYTES, block_out);
+        int row_base = bi * 4;  // 4 rows per block
+        for (int idx = 0; idx < Q4K_BLOCK_SIZE; idx++) {
+            int r = row_base + idx / 64;
+            int c = idx % 64;
+            if (r < fpga_sim::N)
+                tile[c][r] = block_out[idx];  // tile[col][row] = mat[col][row]
+        }
+    }
+}
+
+// ===========================================================================
+// AXI-Lite Buffer Simulation — matches matmul_top.v AXI-Lite buffer I/O.
+//
+// The buffer-based accelerator uses AXI-Lite writes to populate internal
+// buffers at specific address ranges, then sets registers to trigger compute.
+// Results are read back from result buffer addresses.
+//
+// AXI-Lite address map (matches verilog/matmul_top.v):
+//   0x0000-0x00FF:  Control registers (AP_CTRL, GIE, IER, ISR, CTRL_USER, STATUS)
+//   0x1000-0x1FFF:  Weight buffer lower 4KB (Q8: all, Q4K: first half)
+//   0x2000-0x20FF:  Scale buffer (Q8 mode only)
+//   0x2100-0x217F:  Activation buffer (64 × int16_t)
+//   0x2200-0x2FFF:  Weight buffer upper (Q4K: second half)
+//   0x4000-0x41FF:  Result buffer (64 × int48_t, lower 32b @ 0x4000, upper 16b @ 0x4200)
+//
+// Usage:
+//   axilite_write_buf(AXI_WEIGHT_ADDR(offset), data, strb);  // write to weight_buf
+//   axilite_write_buf(AXI_ACT_ADDR(i), act_buf[i], 0xF);     // write to act_buf
+//   axilite_write_reg(REG_AP_CTRL, AP_START);                 // trigger compute
+//   axilite_wait_done();
+//   val = axilite_read_buf(AXI_RES_ADDR(i));                  // read result
+// ===========================================================================
+
+// AXI-Lite buffer address constants (matches Verilog localparams)
+constexpr uint32_t AXI_WEIGHT_BASE  = 0x1000;  // weight_buf start
+constexpr uint32_t AXI_WEIGHT_Q4K_MAX = 0x3000; // weight_buf end (exclusive)
+constexpr uint32_t AXI_SCALE_BASE   = 0x2000;  // scale_buf start
+constexpr uint32_t AXI_ACT_BASE     = 0x2100;  // act_buf start
+constexpr uint32_t AXI_RES_BASE     = 0x4000;  // result_buf lower 32b
+constexpr uint32_t AXI_RES_HI_BASE  = 0x4200;  // result_buf upper 16b
+
+// AXI address for result entry i, lower 32 bits (0-63)
+inline uint32_t AXI_RES_ADDR(int i) {
+    return AXI_RES_BASE + i * 4;
+}
+
+// AXI address for result entry i, upper 16 bits (0-63)
+inline uint32_t AXI_RES_HI_ADDR(int i) {
+    return AXI_RES_HI_BASE + i * 4;
+}
+
+// Simulated AXI-Lite buffer accelerator state
+struct AxiliteAccelState {
+    // Internal buffers (match Verilog exactly)
+    uint8_t  weight_buf[8192] = {0};  // 0x1000-0x2FFF
+    uint16_t scale_buf[128]   = {0};  // 0x2000-0x20FF (Q8 only)
+    uint16_t act_buf[64]      = {0};  // 0x2100-0x217F
+    uint64_t result_buf[64]   = {0};  // 0x4000-0x41FF (48-bit results)
+
+    // Control registers
+    uint32_t reg_ap_ctrl   = AP_IDLE | AP_READY;
+    uint32_t reg_ctrl_user = 0;
+    uint32_t reg_status    = STATUS_IDLE;
+
+    // Simulated done flag
+    bool done_flag = false;
+};
+
+// Write to AXI-Lite buffer: simulates write_buffer task in Verilog
+// Writes 32-bit data to the correct buffer based on address, with byte strobes.
+// In Q4K mode, weight_buf accepts writes across the full 0x1000-0x2FFF range
+// (scale_buf/act_buf are unused in Q4K mode, so no aliasing issue).
+inline void axilite_write_buf(AxiliteAccelState& s, uint32_t addr, uint32_t data,
+                               uint32_t strb, bool mode_q4k = false) {
+    // Scale buffer writes (Q8 mode only — Q4K uses this address range for weight data)
+    if (!mode_q4k && addr >= AXI_SCALE_BASE && addr < AXI_SCALE_BASE + 256) {
+        int off = addr - AXI_SCALE_BASE;
+        int word_off = off & ~3;
+        int idx = word_off / 2;
+        if (idx < 127) {
+            s.scale_buf[idx]     = (uint16_t)(data & 0xFFFF);
+            s.scale_buf[idx + 1] = (uint16_t)((data >> 16) & 0xFFFF);
+        }
+    }
+    // Weight buffer writes — exclusion guard matches Verilog
+    if (addr >= AXI_WEIGHT_BASE && addr < AXI_WEIGHT_Q4K_MAX) {
+        int off = addr - AXI_WEIGHT_BASE;
+        bool is_scale_region = (addr >= AXI_SCALE_BASE && addr < AXI_SCALE_BASE + 256);
+        bool is_act_region   = (addr >= AXI_ACT_BASE   && addr < AXI_ACT_BASE + 128);
+        bool skip = false;
+        if (!mode_q4k && (is_scale_region || is_act_region)) skip = true;
+        if (!skip) {
+            for (int b = 0; b < 4 && (off + b) < 8192; b++)
+                if (strb & (1u << b)) s.weight_buf[off + b] = (data >> (b * 8)) & 0xFF;
+        }
+    }
+}
+
+// Read from AXI-Lite buffer
+inline uint32_t axilite_read_buf(const AxiliteAccelState& s, uint32_t addr) {
+    if (addr >= AXI_RES_BASE && addr < AXI_RES_BASE + 256) {
+        int idx = (addr - AXI_RES_BASE) / 4;
+        if (idx < 64) return (uint32_t)(s.result_buf[idx] & 0xFFFFFFFF);
+    }
+    if (addr >= AXI_RES_HI_BASE && addr < AXI_RES_HI_BASE + 256) {
+        int idx = (addr - AXI_RES_HI_BASE) / 4;
+        if (idx < 64) return (uint32_t)(s.result_buf[idx] >> 32);
+    }
+    return 0;
+}
+
+// Simulate the loading FSM + Q4K core compute in one step.
+// This mirrors the Verilog: loading FSM → core start → compute → drain.
+inline void axilite_q4k_run(AxiliteAccelState& s) {
+    // Phase 1: Loading FSM — copy weight_buf → wmem, act_buf → cmem
+    // Simulate Q4K core's wmem as int16_t[512][8] = 4096 INT16 values
+    int16_t wmem[512][8] = {{0}};  // 512 entries × 8 INT16s
+    for (int load_addr = 0; load_addr < 8192; load_addr++) {
+        // Address format matches Verilog loading FSM:
+        //   entry = load_addr / 16  (0-511)
+        //   byte_lane = load_addr % 16  (0-15)
+        //   byte_lane 0-7 → wmem_lo, 8-15 → wmem_hi
+        //   Within each 64-bit half: byte_lane[2:0] selects byte position
+        int entry = load_addr / 16;
+        int byte_lane = load_addr % 16;
+        int half = (byte_lane >= 8) ? 1 : 0;    // lo/hi 64-bit half
+        int byte_in_half = byte_lane % 8;         // byte within 64-bit half
+        int int16_idx = byte_in_half / 2;         // which INT16 in the half
+        int byte_in_int16 = byte_in_half % 2;     // lo/hi byte of INT16
+
+        uint8_t val = s.weight_buf[load_addr];
+        int16_t entry_arr[8];  // 8 INT16s per wmem entry
+        memcpy(entry_arr, &wmem[entry], 16);
+
+        // Build the INT16 at position int16_idx within the half
+        int idx_in_entry = half * 4 + int16_idx;  // 0-7
+        if (byte_in_int16 == 0)
+            entry_arr[idx_in_entry] = (entry_arr[idx_in_entry] & 0xFF00) | val;
+        else
+            entry_arr[idx_in_entry] = (entry_arr[idx_in_entry] & 0x00FF) | ((int16_t)val << 8);
+
+        memcpy(&wmem[entry], entry_arr, 16);
+    }
+
+    // Phase 2: Compute — vecmul_1x64_int16 with wmem rearranged
+    // wmem[entry][8] holds 8 INT16s per entry.
+    // The tile is 64×64, col-major: tile[col][row] = wmem[(col*64+row)/8][(col*64+row)%8]
+    int16_t mat[N][N] = {{0}};
+    for (int c = 0; c < N; c++) {
+        for (int r = 0; r < N; r++) {
+            int idx = c * N + r;
+            int entry = idx / 8;
+            int pos = idx % 8;
+            mat[c][r] = wmem[entry][pos];
+        }
+    }
+
+    int16_t vec[N] = {0};
+    for (int i = 0; i < N; i++) vec[i] = s.act_buf[i];
+
+    acc16_t result[N] = {0};
+    vecmul_1x64_int16(vec, mat, result);
+
+    // Phase 3: Drain — write results to result_buf
+    for (int i = 0; i < N; i++)
+        s.result_buf[i] = (uint64_t)(int64_t)result[i];
+
+    s.done_flag = true;
+    s.reg_status = STATUS_DONE;
+}
+
+// High-level Q4K tile function using AXI-Lite buffer interface.
+// Writes INT16 pre-dequant tile data via simulated buffer writes,
+// triggers compute, reads results.
+// This exactly mirrors the Verilog data flow in matmul_top.v + matmul_q4k_core.v.
+//
+// tile_int16: 64×64 INT16 matrix, col-major: tile_int16[col][row]
+// vec:        64 INT16 activation vector
+// result:     64 INT64 output
+inline void axi_vecmul_tile_q4k_axilite(const int16_t tile_int16[N][N],
+                                         const in16_t vec[N],
+                                         acc16_t result[N]) {
+    AxiliteAccelState s;
+
+    // Write activation vector directly to act_buf (bypass axilite_write_buf
+    // to avoid overwrite by weight writes at the same 0x2100-0x217F address range)
+    for (int i = 0; i < N; i += 2) {
+        s.act_buf[i]     = vec[i];
+        s.act_buf[i + 1] = vec[i + 1];
+    }
+
+    // Write weight data: 64×64 INT16 = 4096 values × 2 bytes = 8192 bytes
+    // AXI addresses: 0x1000-0x2FFF (contiguous, passes through scale/act hole in Q4K mode)
+    // This overwrites weight_buf at 0x2100-0x217F (col 34) but act_buf retains activations
+    // Write 2 INT16s per 32-bit word for efficiency:
+    //   addr = 0x1000 + col*128 + row*2  (row even → word-aligned)
+    //   data = tile_int16[col][row] (16b) | tile_int16[col][row+1] << 16 (16b)
+    //   strb = 0xF  (write all 4 bytes)
+    for (int c = 0; c < N; c++) {
+        for (int r = 0; r < N; r += 2) {
+            int byte_off = c * N * 2 + r * 2;  // 2 bytes per INT16, 2 INT16s per word
+            uint32_t w0 = (uint16_t)(tile_int16[c][r]);
+            uint32_t w1 = (uint16_t)(tile_int16[c][r + 1]);
+            uint32_t data_word = w0 | (w1 << 16);
+            axilite_write_buf(s, AXI_WEIGHT_BASE + byte_off, data_word, 0xF, true);
+        }
+    }
+
+    // Run compute (simulates loading FSM + core)
+    axilite_q4k_run(s);
+
+    // Read results from result buffer
+    for (int i = 0; i < N; i++) {
+        uint32_t lo = axilite_read_buf(s, AXI_RES_ADDR(i));
+        uint32_t hi = axilite_read_buf(s, AXI_RES_HI_ADDR(i));
+        result[i] = (acc16_t)((uint64_t)hi << 32) | lo;
+    }
+}
+
+
 
 } // namespace fpga_sim

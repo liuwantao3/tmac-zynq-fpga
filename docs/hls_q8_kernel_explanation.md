@@ -1,5 +1,7 @@
 # HLS Q8 Kernel Line-by-Line Explanation
 
+> **Note**: The primary implementation has moved to Verilog (`verilog/matmul_top.v`, `verilog/matmul_q8_core.v`, `verilog/matmul_q4k_core.v`). This document describes the legacy HLS kernel (`hls/matmul_q8.cpp`), kept for reference.
+
 **File**: `hls/matmul_q8.cpp`
 **Target**: Zynq 7010 (80 DSP, 17,600 LUT, 135 KB BRAM)
 **Kernel**: Q8_0 direct-path vector-matrix / matrix multiply with LUT-based scale multipliers

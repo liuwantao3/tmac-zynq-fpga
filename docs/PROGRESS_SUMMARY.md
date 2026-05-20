@@ -240,7 +240,7 @@ Following the successful debugging pattern from v13 development:
 
 These items were from the INT4 era. The current project status:
 
-- ✅ **GGUF-based ground truth**: Generated using `scripts/ground_truth_v2.py` and `scripts/gguf_inference.py`
+- ✅ **GGUF-based ground truth**: Generated using `scripts/ground_truth_v2.py`
 - ✅ **C++ inference engine**: `sim/tmac_gguf.cpp` — verified matching ground truth across all 24 layers
 - ✅ **GGUF→TMAC converter**: `scripts/extract_tmac.py` working
 - ✅ **HLS kernel**: `hls/matmul_q8.cpp` — Q8_0 direct path with LUT-based scale multipliers

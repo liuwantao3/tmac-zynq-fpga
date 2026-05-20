@@ -388,7 +388,7 @@ void extract_q4k_tile(const Tensor* A, int row_start, int col_start,
 ### 7.4 Driver Register Changes
 
 ```verilog
-// matmul_q8_top.v - New control bit
+// matmul_top.v - New control bit
 localparam CTRL_MODE_Q4K = 1 << 6;  // In REG_CTRL_USER
 ```
 
