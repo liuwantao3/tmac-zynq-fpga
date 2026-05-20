@@ -106,34 +106,8 @@ constexpr uint32_t CTRL_MODE_Q4K = 1u << 6;
 
 
 
-struct TileCycleBudget {
-    static constexpr uint32_t DSP_FILL_CYCLES    = 4;
-    static constexpr uint32_t DSP_DRAIN_CYCLES    = 4;
-    static constexpr uint32_t MODE_SWITCH_CYCLES = 2;
-    static constexpr uint32_t COMPUTE_CYCLES        = 64;  // N×N systolic at 1 op/cycle
-
-    // Total cycles for one tile pass through all 3 phases
-    static constexpr uint32_t INT16_TILE_CYCLES =
-        DSP_FILL_CYCLES + MODE_SWITCH_CYCLES + COMPUTE_CYCLES + DSP_DRAIN_CYCLES +  // quant
-        DSP_FILL_CYCLES + MODE_SWITCH_CYCLES + COMPUTE_CYCLES + DSP_DRAIN_CYCLES +  // compute
-        DSP_FILL_CYCLES + MODE_SWITCH_CYCLES + COMPUTE_CYCLES + DSP_DRAIN_CYCLES;   // dequant
-    // = 10 + 10 + 10 = 30 cycles overhead + 192 compute = 202 cycles
-
-    // Q8_0 path adds 4 extra cycles per phase (slower scale search on FPGA)
-    static constexpr uint32_t Q8_TILE_CYCLES = INT16_TILE_CYCLES + 12;
-    // = 214 cycles
-
-    // For pure compute-only mode (if Q/D already done on ARM)
-    static constexpr uint32_t COMPUTE_ONLY_CYCLES =
-        DSP_FILL_CYCLES + MODE_SWITCH_CYCLES + COMPUTE_CYCLES + DSP_DRAIN_CYCLES;
-    // = 10 cycles per tile
-
-    static constexpr double US_PER_CYCLE = 6.67 / 1000.0;  // 150 MHz
-
-    static double tile_us(int mode_q8) {
-        return (mode_q8 ? Q8_TILE_CYCLES : INT16_TILE_CYCLES) * US_PER_CYCLE;
-    }
-};
+// Matches actual Verilog timing: 1 IDLE exit + 512 COMPUTE + 1 DRAIN + 1 DRAIN2
+constexpr uint32_t CYCLES_PER_TILE = 515;
 
 // FP16→FP32 conversion (shared across simulation files)
 inline float read_f16(const uint8_t* data) {
@@ -322,9 +296,7 @@ private:
 
         // Account for tile compute cycles in performance model
         uint64_t num_tiles = ((dimM + N - 1) / N) * ((dimN + N - 1) / N);
-        uint32_t cycles_per_tile = use_q8 ? TileCycleBudget::Q8_TILE_CYCLES
-                                          : TileCycleBudget::COMPUTE_ONLY_CYCLES;
-        total_cycles_ += num_tiles * cycles_per_tile;
+        total_cycles_ += num_tiles * CYCLES_PER_TILE;
     }
 
     void compute_int16(uint32_t dimM, uint32_t dimN, uint32_t dimK, bool vecmul, bool q8_path) {

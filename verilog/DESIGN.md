@@ -314,7 +314,7 @@ g++ -std=c++14 -O2 -I sim -I gguf -I . sim/test_integration.cpp -lpthread -o /tm
 Estimates FPGA performance: cycles/tile, total compute time, bandwidth, and CPU-vs-FPGA speedup.
 
 **Components:**
-- `fpga_sim.hpp::TileCycleBudget` — Static constants: `INT16_TILE_CYCLES=202`, `Q8_TILE_CYCLES=214`, `COMPUTE_ONLY_CYCLES=74`, `US_PER_CYCLE=6.67ns`
+- `fpga_sim.hpp::CYCLES_PER_TILE = 515` — Matches actual Verilog timing (IDLE exit + 512 COMPUTE + 2 DRAIN)
 - `fpga_sim.hpp::TimingStats` — Accumulates tile count, MAC operations, CPU wall time, FPGA cycle count. Reports speedup at end of inference.
 - `MatmulAccel::run_compute()` — Accumulates `total_cycles_ = num_tiles × cycles_per_tile` after each compute.
 
