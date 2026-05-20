@@ -843,14 +843,15 @@ void forward_layer_with_cache(float* hidden, int layer, int pos) {
             float* ctx_h = context + qh * HEAD_DIM;
 
             float scores[MAX_SEQ_LEN];
-            for (int p = 0; p <= pos; p++) {
-                float* k_cached = g_k_cache[layer][p] + kv * HEAD_DIM;
-                scores[p] = 0;
-                for (int d = 0; d < HEAD_DIM; d++) {
-                    scores[p] += qh_data[d] * k_cached[d];
+            for (int p = 0; p <= pos; p++) scores[p] = 0;
+            for (int d = 0; d < HEAD_DIM; d++) {
+                float q_val = qh_data[d];
+                for (int p = 0; p <= pos; p++) {
+                    float* k_cached = g_k_cache[layer][p] + kv * HEAD_DIM;
+                    scores[p] += q_val * k_cached[d];
                 }
-                scores[p] /= sqrtf((float)HEAD_DIM);
             }
+            for (int p = 0; p <= pos; p++) scores[p] /= sqrtf((float)HEAD_DIM);
 
             float max_score = scores[0];
             for (int p = 1; p <= pos; p++) if (scores[p] > max_score) max_score = scores[p];
