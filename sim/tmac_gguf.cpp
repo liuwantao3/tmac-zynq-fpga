@@ -438,13 +438,19 @@ void silu(float* y, const float* x, int n) {
 // ===========================================================================
 void matmul_fpga_int16(const Tensor* A, const float* x, float* y, int rows, int cols);
 void matmul_fpga_q8(const Tensor* A, const float* x, float* y, int rows, int cols, const float* row_max_abs = nullptr);
-void matmul_fpga_q4k(const Tensor* A, const float* x, float* y, int rows, int cols);
+void matmul_fpga_q4_k(const Tensor* A, const float* x, float* y, int rows, int cols);
+void matmul_fpga_q5_0(const Tensor* A, const float* x, float* y, int rows, int cols);
+void matmul_fpga_q6_k(const Tensor* A, const float* x, float* y, int rows, int cols);
 void get_logits_q8(float* logits, const float* hidden);
 
 void matmul(const Tensor* A, const float* x, float* y, int rows, int cols) {
     if (g_use_fpga) {
-        if (g_fpga_q4k && A->type == TENSOR_Q4_K) {
-            matmul_fpga_q4k(A, x, y, rows, cols);
+        if (g_fpga_q4k && A->type == TENSOR_Q5_0) {
+            matmul_fpga_q5_0(A, x, y, rows, cols);
+        } else if (g_fpga_q4k && A->type == TENSOR_Q6_K) {
+            matmul_fpga_q6_k(A, x, y, rows, cols);
+        } else if (g_fpga_q4k && A->type == TENSOR_Q4_K) {
+            matmul_fpga_q4_k(A, x, y, rows, cols);
         } else if (g_fpga_q8 && A->type == TENSOR_Q8_0) {
             matmul_fpga_q8(A, x, y, rows, cols);
         } else {
@@ -675,8 +681,92 @@ void matmul_fpga_q8(const Tensor* A, const float* x, float* y, int rows, int col
 // ===========================================================================
 // Q4_K FPGA PATH — FPGA receives Q4_K blocks, does Q4_K→INT16 internally.
 // Uses per-element dequant to extract 64×64 tiles from Q4_K tensor.
+// Uses raw Q4_K block path: CPU sends Q4_K blocks to FPGA, FPGA does block
+// decode + row-normalized INT16 matmul internally.
+// Tile structure: 896 rows × 64 cols = 224 blocks (stride 76 in tensor)
+// row_scale[row] = UQ16.8 = round(32767 / row_max_abs * 256)
 // ===========================================================================
-void matmul_fpga_q4k(const Tensor* A, const float* x, float* y, int rows, int cols) {
+// Q4_K down_proj path: [56 rows × 256 cols], 144-byte blocks.
+// ===========================================================================
+void matmul_fpga_q4_k(const Tensor* A, const float* x, float* y, int rows, int cols) {
+    auto t0 = std::chrono::high_resolution_clock::now();
+    memset(y, 0, rows * sizeof(float));
+
+    float x_scale = 0;
+    for (int j = 0; j < cols; j++) x_scale = fmaxf(x_scale, fabsf(x[j]));
+    x_scale = (x_scale < 1e-10f) ? 1.0f : x_scale / 32767.0f;
+
+    std::vector<fpga_sim::in16_t> x_q(cols);
+    for (int j = 0; j < cols; j++)
+        x_q[j] = (fpga_sim::in16_t)roundf(x[j] / x_scale);
+
+    fpga_sim::g_timing.total_mac_ops += (int64_t)rows * cols;
+    // == 896×256 Path: for tensors with cols >= 1024 (down_proj [896, 4864]) ==
+        // == 896×256 Path: for tensors with cols >= 1024 (down_proj [896, 4864]) ==
+        // Each Q4_K block covers 1 row × 256 cols, stride = cols/256 = 19.
+        // Tile: 56 rows × 256 cols = 56 blocks × 144 = 8064 bytes (fits in 8192 weight_buf).
+        // 16 row-batches × 19 column-groups = 304 tiles.
+
+        float row_inv[896];
+        for (int row = 0; row < rows; row++) {
+            float max_abs = 0.0f;
+            uint64_t nblocks = ((uint64_t)cols + 255) / 256;
+            uint64_t base_block = (uint64_t)row * cols / 256;
+            uint64_t row_start_flat = (uint64_t)row * cols;
+            float block_f32[256];
+            for (uint64_t b = 0; b < nblocks; b++) {
+                fpga_sim::dequant_q4k_block_to_float(
+                    A->data + (base_block + b) * 144, block_f32);
+                for (int i = 0; i < 256; i++) {
+                    uint64_t flat_idx = (base_block + b) * 256 + i;
+                    uint64_t rel_idx = flat_idx - row_start_flat;
+                    if (rel_idx >= (uint64_t)cols) break;
+                    float absv = fabsf(block_f32[i]);
+                    if (absv > max_abs) max_abs = absv;
+                }
+            }
+            max_abs = (max_abs < 1e-10f) ? 1.0f : max_abs;
+            row_inv[row] = 32767.0f / max_abs;
+        }
+
+        int64_t tile_result[896] = {0};
+        int block_stride = cols / 256;
+
+        for (int c = 0; c < cols; c += 256) {
+            int block_base_offset = c / 256;
+
+            for (int row0 = 0; row0 < rows; row0 += 56) {
+                int nblocks = std::min(56, rows - row0);
+
+                uint8_t blocks[56 * fpga_sim::Q4K_BLOCK_BYTES];
+                for (int bi = 0; bi < nblocks; bi++) {
+                    uint64_t block_idx = (uint64_t)(row0 + bi) * block_stride + block_base_offset;
+                    memcpy(blocks + bi * fpga_sim::Q4K_BLOCK_BYTES,
+                           A->data + block_idx * fpga_sim::Q4K_BLOCK_BYTES,
+                           fpga_sim::Q4K_BLOCK_BYTES);
+                }
+
+                fpga_sim::axi_vecmul_tile_q4k_axilite(
+                    blocks, nblocks, x_q.data() + c, 256, row_inv, tile_result, row0);
+
+                fpga_sim::g_timing.total_tiles++;
+            }
+        }
+
+        for (int i = 0; i < rows; i++) {
+            y[i] += (double)tile_result[i] * x_scale / (double)row_inv[i];
+        }
+
+    auto t1 = std::chrono::high_resolution_clock::now();
+    double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    fpga_sim::g_timing.cpu_ms += ms;
+}
+
+// ===========================================================================
+// Q5_0 path: [8 rows × 896 cols], 22-byte blocks (32 vals/block).
+// Handles all Q5_0 tensors (FFN gate/up, attn Q/K/O) where cols=896.
+// ===========================================================================
+void matmul_fpga_q5_0(const Tensor* A, const float* x, float* y, int rows, int cols) {
     auto t0 = std::chrono::high_resolution_clock::now();
     memset(y, 0, rows * sizeof(float));
 
@@ -690,54 +780,155 @@ void matmul_fpga_q4k(const Tensor* A, const float* x, float* y, int rows, int co
 
     fpga_sim::g_timing.total_mac_ops += (int64_t)rows * cols;
 
-    for (int r = 0; r < rows; r += fpga_sim::N) {
-        int r_size = std::min(fpga_sim::N, rows - r);
+    constexpr int TILE_ROWS = 8;
+    constexpr int BLOCKS_PER_ROW = 28;     // 896 / 32 = 28 blocks per row
+    constexpr int BLOCKS_PER_TILE = 224;   // 8 rows × 28
 
-        // Pre-compute per-row max-abs for output dequant
-        float row_scale_fp[fpga_sim::N];
-        for (int i = 0; i < r_size; i++) {
-            float max_abs = 0.0f;
-            for (int j = 0; j < cols; j++) {
-                uint64_t idx = (uint64_t)(r + i) * cols + j;
-                float val = dequant_q4_k(A->data, idx);
-                max_abs = fmaxf(max_abs, fabsf(val));
+    uint64_t row_stride_blocks = (uint64_t)cols / fpga_sim::Q5_0_BLOCK_SIZE;  // 28
+
+    // Pre-compute row_inv (FP32) for all rows
+    std::vector<float> row_inv(rows);
+    for (int row = 0; row < rows; row++) {
+        float max_abs = 0.0f;
+        uint64_t base_block = (uint64_t)row * row_stride_blocks;
+        for (uint64_t b = 0; b < BLOCKS_PER_ROW; b++) {
+            const uint8_t* blk = A->data + (base_block + b) * fpga_sim::Q5_0_BLOCK_BYTES;
+            float d = fpga_sim::read_f16(blk);
+            uint32_t qh = (uint32_t)blk[2] | ((uint32_t)blk[3] << 8) |
+                          ((uint32_t)blk[4] << 16) | ((uint32_t)blk[5] << 24);
+            for (int wi = 0; wi < 32; wi++) {
+                uint64_t j = wi < 16 ? wi : wi - 16;
+                uint8_t qs_byte = blk[6 + j];
+                uint8_t ql = (wi < 16) ? (qs_byte & 0xF) : (qs_byte >> 4);
+                uint8_t qh_bit = (qh >> wi) & 1;
+                int q = ((qh_bit << 4) | ql) - 16;
+                float ab = fabsf(d * (float)q);
+                if (ab > max_abs) max_abs = ab;
             }
-            row_scale_fp[i] = (max_abs < 1e-10f) ? 1.0f : max_abs / 32767.0f;
         }
-        for (int i = r_size; i < fpga_sim::N; i++) row_scale_fp[i] = 1.0f;
+        max_abs = (max_abs < 1e-10f) ? 1.0f : max_abs;
+        row_inv[row] = 32767.0f / max_abs;
+    }
 
-        for (int c = 0; c < cols; c += fpga_sim::N) {
-            int c_size = std::min(fpga_sim::N, cols - c);
+    std::vector<int64_t> tile_result(rows, 0);
 
-            // Simpler approach: dequantize per-element using existing function
-            fpga_sim::in16_t tile_w[fpga_sim::N][fpga_sim::N];
-            memset(tile_w, 0, sizeof(tile_w));
-            for (int i = 0; i < r_size; i++) {
-                float row_s = row_scale_fp[i];
-                float row_inv = (row_s < 1e-10f) ? 0.0f : (1.0f / row_s);
-                for (int k = 0; k < c_size; k++) {
-                    uint64_t idx = (uint64_t)(r + i) * cols + (c + k);
-                    // Q4_K dequant → float → INT16 (scaled by row_scale for FPGA INT16 matmul)
-                    float val = dequant_q4_k(A->data, idx) * row_inv;
-                    tile_w[k][i] = (fpga_sim::in16_t)roundf(val);  // tile[col][row]
-                }
+    for (int row0 = 0; row0 < rows; row0 += TILE_ROWS) {
+        int r_size = std::min(TILE_ROWS, rows - row0);
+
+        // Load 224 Q5_0 blocks
+        uint8_t blocks[fpga_sim::Q5_0_224BLOCK_BYTES];
+        uint64_t tile_base_block = (uint64_t)row0 * row_stride_blocks;
+        for (int bi = 0; bi < BLOCKS_PER_TILE; bi++) {
+            memcpy(blocks + bi * fpga_sim::Q5_0_BLOCK_BYTES,
+                   A->data + (tile_base_block + bi) * fpga_sim::Q5_0_BLOCK_BYTES,
+                   fpga_sim::Q5_0_BLOCK_BYTES);
+        }
+
+        fpga_sim::axi_vecmul_tile_q5_0_8x896_axilite(
+            blocks, x_q.data(), row_inv.data() + row0, tile_result.data(), row0);
+
+        fpga_sim::g_timing.total_tiles++;
+    }
+
+    for (int i = 0; i < rows; i++) {
+        y[i] += (double)tile_result[i] * x_scale / (double)row_inv[i];
+    }
+
+    auto t1 = std::chrono::high_resolution_clock::now();
+    double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    fpga_sim::g_timing.cpu_ms += ms;
+}
+
+// ===========================================================================
+// Q6_K down_proj path: [32 rows × 256 cols], 210-byte blocks.
+// ===========================================================================
+void matmul_fpga_q6_k(const Tensor* A, const float* x, float* y, int rows, int cols) {
+    auto t0 = std::chrono::high_resolution_clock::now();
+    memset(y, 0, rows * sizeof(float));
+
+    float x_scale = 0;
+    for (int j = 0; j < cols; j++) x_scale = fmaxf(x_scale, fabsf(x[j]));
+    x_scale = (x_scale < 1e-10f) ? 1.0f : x_scale / 32767.0f;
+
+    std::vector<fpga_sim::in16_t> x_q(cols);
+    for (int j = 0; j < cols; j++)
+        x_q[j] = (fpga_sim::in16_t)roundf(x[j] / x_scale);
+
+    fpga_sim::g_timing.total_mac_ops += (int64_t)rows * cols;
+
+    // Pre-compute row_inv (FP32) for all rows
+    float row_inv[896];
+    int block_stride = cols / fpga_sim::Q6_K_BLOCK_SIZE;  // = 19 for [896, 4864]
+
+    for (int row = 0; row < rows; row++) {
+        float max_abs = 0.0f;
+        uint64_t nblocks = ((uint64_t)cols + fpga_sim::Q6_K_BLOCK_SIZE - 1) / fpga_sim::Q6_K_BLOCK_SIZE;
+        uint64_t base_block = (uint64_t)row * cols / fpga_sim::Q6_K_BLOCK_SIZE;
+        uint64_t row_start_flat = (uint64_t)row * cols;
+
+        for (uint64_t b = 0; b < nblocks; b++) {
+            const uint8_t* blk = A->data + (base_block + b) * fpga_sim::Q6_K_BLOCK_BYTES;
+            float super_scale = fpga_sim::read_f16(blk + 208);
+            for (int wi = 0; wi < fpga_sim::Q6_K_BLOCK_SIZE; wi++) {
+                uint64_t flat_idx = (base_block + b) * fpga_sim::Q6_K_BLOCK_SIZE + wi;
+                uint64_t rel_idx = flat_idx - row_start_flat;
+                if (rel_idx >= (uint64_t)cols) break;
+
+                int half = wi / 128;
+                int pos = wi % 128;
+                int l = pos % 32;
+                int sub = pos / 32;
+
+                int L_off = half * 64 + l + (sub % 2) * 32;
+                uint8_t ql_byte = blk[L_off];
+                uint8_t ql_nibble = (sub < 2) ? (ql_byte & 0xF) : (ql_byte >> 4);
+
+                int H_off = 128 + half * 32 + l;
+                int qh_shift = sub * 2;
+                uint8_t qh_bits = (blk[H_off] >> qh_shift) & 0x3;
+
+                int q6 = ((qh_bits << 4) | ql_nibble) - 32;
+
+                int sc_off = 192 + half * 8 + (l / 16) + sub * 2;
+                float scale_f = (float)(int8_t)blk[sc_off];
+
+                float absv = fabsf(super_scale * scale_f * (float)q6);
+                if (absv > max_abs) max_abs = absv;
+            }
+        }
+
+        max_abs = (max_abs < 1e-10f) ? 1.0f : max_abs;
+        row_inv[row] = 32767.0f / max_abs;
+    }
+
+    int64_t tile_result[896] = {0};
+    constexpr int TILE_ROWS = 32;
+    constexpr int BLOCKS_PER_TILE = 32;
+
+    for (int c = 0; c < cols; c += fpga_sim::Q6_K_BLOCK_SIZE) {
+        int block_base_offset = c / fpga_sim::Q6_K_BLOCK_SIZE;
+
+        for (int row0 = 0; row0 < rows; row0 += TILE_ROWS) {
+            int nblocks = std::min(TILE_ROWS, rows - row0);
+
+            uint8_t blocks[TILE_ROWS * fpga_sim::Q6_K_BLOCK_BYTES];
+            for (int bi = 0; bi < nblocks; bi++) {
+                uint64_t block_idx = (uint64_t)(row0 + bi) * block_stride + block_base_offset;
+                memcpy(blocks + bi * fpga_sim::Q6_K_BLOCK_BYTES,
+                       A->data + block_idx * fpga_sim::Q6_K_BLOCK_BYTES,
+                       fpga_sim::Q6_K_BLOCK_BYTES);
             }
 
-            // Build activation vector for this column block
-            fpga_sim::in16_t vec[fpga_sim::N];
-            for (int k = 0; k < c_size; k++) vec[k] = x_q[c + k];
-            for (int k = c_size; k < fpga_sim::N; k++) vec[k] = 0;
-
-            // Run INT16 matmul (simulated)
-            fpga_sim::acc16_t result[fpga_sim::N];
-            fpga_sim::vecmul_1x64_int16(vec, tile_w, result);
-
-            // Dequantize results to FP32
-            for (int i = 0; i < r_size; i++)
-                y[r + i] += (double)result[i] * x_scale * row_scale_fp[i];
+            fpga_sim::axi_vecmul_tile_q6_k_axilite(
+                blocks, nblocks, x_q.data() + c, fpga_sim::Q6_K_BLOCK_SIZE,
+                row_inv, tile_result, row0);
 
             fpga_sim::g_timing.total_tiles++;
         }
+    }
+
+    for (int i = 0; i < rows; i++) {
+        y[i] += (double)tile_result[i] * x_scale / (double)row_inv[i];
     }
 
     auto t1 = std::chrono::high_resolution_clock::now();

@@ -42,8 +42,32 @@ sim_cosim: $(COSIM_SRC)
 	$(IVERILOG) $(FLAGS) -o $(COSIM_TOP).vvp $(COSIM_SRC)
 	$(VVP) $(COSIM_TOP).vvp
 
+# ---- Co-simulation Q4_K (requires /tmp/cosim_tiles_q4k.bin) ----
+COSIM_Q4K_TOP = tb_cosim_q4k
+COSIM_Q4K_SRC = tb_cosim_q4k.v matmul_q4k_core.v
+
+sim_cosim_q4k: $(COSIM_Q4K_SRC)
+	$(IVERILOG) $(FLAGS) -o $(COSIM_Q4K_TOP).vvp $(COSIM_Q4K_SRC)
+	$(VVP) $(COSIM_Q4K_TOP).vvp
+
+# ---- INT16 core smoke test ----
+INT16_SRC  = matmul_int16_core.v tb_int16_smoke.v
+INT16_TOP  = tb_int16_smoke
+
+sim_int16: $(INT16_SRC)
+	$(IVERILOG) $(FLAGS) -o $(INT16_TOP).vvp $(INT16_SRC)
+	$(VVP) $(INT16_TOP).vvp
+
+# ---- Q4_K 2x896 core test ----
+Q4K_2x896_SRC  = matmul_q4k_2x896_core.v tb_matmul_q4k_2x896.v
+Q4K_2x896_TOP  = tb_matmul_q4k_2x896
+
+sim_q4k_2x896: $(Q4K_2x896_SRC)
+	$(IVERILOG) $(FLAGS) -o $(Q4K_2x896_TOP).vvp $(Q4K_2x896_SRC)
+	$(VVP) $(Q4K_2x896_TOP).vvp
+
 # ---- Run all tests ----
-all: sim_q8 sim_q4k sim_q4k_min
+all: sim_q8 sim_q4k sim_q4k_min sim_int16 sim_q4k_2x896
 
 # ---- Waveform viewing ----
 waves-q8:
@@ -55,7 +79,10 @@ waves-q4k:
 waves-cosim:
 	gtkwave tb_cosim.vcd
 
+waves-q4k-2x896:
+	gtkwave tb_q4k_2x896.vcd
+
 clean:
 	rm -f *.vvp *.vcd
 
-.PHONY: all sim_q8 sim_q4k sim_q4k_min sim_cosim waves-q8 waves-q4k waves-cosim clean
+.PHONY: all sim_q8 sim_q4k sim_q4k_min sim_cosim sim_cosim_q4k waves-q8 waves-q4k waves-cosim clean

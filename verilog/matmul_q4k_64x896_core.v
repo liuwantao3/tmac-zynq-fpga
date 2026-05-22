@@ -1,6 +1,6 @@
 `timescale 1ns / 1ps
 
-module matmul_q4k_core (
+module matmul_q4k_64x896_core (
     input  wire         clk,
     input  wire         rst_n,
     input  wire         start,
@@ -9,7 +9,7 @@ module matmul_q4k_core (
     output reg          busy,
     input  wire         wt_we,
     input  wire [12:0]  wt_addr,
-    input  wire  [7:0]  wt_din,
+    input  wire  [7:0]   wt_din,
     input  wire         sc_we,
     input  wire [9:0]   sc_addr,
     input  wire [15:0]  sc_din,
@@ -30,43 +30,42 @@ module matmul_q4k_core (
     localparam DRAIN  = 3'd5;
     localparam DRAIN2 = 3'd6;
 
-    localparam NUM_BLOCKS = 224;  // 896 rows / 4 rows per block
-    localparam BLOCKS_PER_GROUP = 2;  // 2 blocks per row group (8 rows)
-    localparam NUM_ROW_GROUPS = 112;  // 896 rows / 8 rows per group
+    localparam TILE_ROWS = 64;
+    localparam TILE_COLS = 896;
+    localparam NUM_BLOCKS = 224;
+    localparam NUM_ROW_GROUPS = 8;
+    localparam COLS_PER_GROUP = 64;
 
     reg [2:0] state;
-    reg [5:0] k;
-    reg [6:0] g;  // 0-111 for 112 row groups
+    reg [9:0] k;
+    reg [2:0] g;
     integer wi_i;
 
-    // blk_load_ptr: 0 to 32255 (224 blocks × 144 bytes)
     reg [14:0] blk_load_ptr;
-    // blk_idx: 0-223 (224 blocks in sequence, stride 76 in original tensor)
-    reg [7:0]  blk_idx;
-    // blk_w_idx: 0-255 (256 weights per block)
-    reg [7:0]  blk_w_idx;
-
-    // Block buffer: 224 blocks × 144 bytes = 32256 bytes
-    reg [7:0] block_buf [0:32255];
+    reg [7:0] blk_idx;
+    reg [7:0] blk_w_idx;
 
     always @(posedge clk) begin
-        if (wt_we && mode_block_load && blk_load_ptr < 32256)
-            block_buf[blk_load_ptr[14:0]] <= wt_din;
-        if (wt_we && mode_block_load)
+        if (!rst_n) begin
+            blk_load_ptr <= 0;
+        end else if (wt_we && blk_load_ptr < 32256) begin
             blk_load_ptr <= blk_load_ptr + 1;
+        end
     end
 
-    reg signed [15:0] act_reg [0:63];
+    reg [7:0] block_buf [0:32255];
+    always @(posedge clk) begin
+        if (wt_we && blk_load_ptr < 32256)
+            block_buf[blk_load_ptr[14:0]] <= wt_din;
+    end
 
+    reg [15:0] act_reg [0:895];
     always @(posedge clk) begin
         if (act_we)
             act_reg[act_addr] <= act_din;
     end
 
-    // Row normalization scales: 896 entries (UQ16.8 fixed-point)
-    // row_scale[row] = round(32767 / row_max_abs * 256)
-    // Applied in decode_one: val_norm = (a * q4 - b) * row_scale[row] >> 16
-    reg [15:0] row_scale [0:895];
+    reg [15:0] row_scale [0:63];
     always @(posedge clk) begin
         if (sc_we) row_scale[sc_addr] <= sc_din;
     end
@@ -74,88 +73,67 @@ module matmul_q4k_core (
     (* ram_style = "block" *) reg [63:0] wmem_lo [0:511];
     (* ram_style = "block" *) reg [63:0] wmem_hi [0:511];
 
-    // wmem is driven only by the state machine always block.
-    // AXI writes (wt_we && !mode_block_load) are handled in IDLE+DW states.
-    reg        wmem_we_int;
-    reg [12:0] wmem_addr_int;
-    reg [7:0]  wmem_din_int;
-
-    reg [3:0]  dec_byte_lane;
-    reg [8:0]  dec_entry;
-    reg [15:0] dec_computed_val;
-
     reg [127:0] wmem_rdata;
     always @(posedge clk) begin
-        wmem_rdata <= {wmem_hi[{k[5:0], g[2:0]}], wmem_lo[{k[5:0], g[2:0]}]};
+        wmem_rdata <= {wmem_hi[{(k[9:6]), g[2:0]}], wmem_lo[{(k[9:6]), g[2:0]}]};
     end
 
     reg signed [47:0] acc [0:63];
     assign res_dout = acc[res_addr];
 
-    reg [6:0]  p1_g;
-    reg [5:0]  p1_k;
-    reg [6:0]  p1_row_base;
+    reg [2:0] p1_g;
+    reg [9:0] p1_k;
+    reg [5:0] p1_row_base;
     reg signed [15:0] p1_act;
     reg        p1_valid;
 
     reg signed [31:0] p2_partial [0:7];
-    reg [6:0]  p2_row_base;
+    reg [5:0]  p2_row_base;
     reg        p2_valid;
+
+    reg [3:0] dec_byte_lane;
+    reg [8:0] dec_entry;
+    reg [15:0] dec_computed_val;
+    reg dec_done;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            state <= IDLE;
-            k <= 0; g <= 0; done <= 0; busy <= 0;
+            state <= IDLE;  k <= 0; g <= 0; done <= 0; busy <= 0;
             p1_valid <= 0; p2_valid <= 0;
             blk_load_ptr <= 0; blk_idx <= 0; blk_w_idx <= 0;
-            decode_busy <= 0; dec_computed_val <= 0;
-            dec_byte_lane <= 0; dec_entry <= 0;
+            decode_busy <= 0;
         end else begin
-            // AXI weight write (direct to wmem, mode_block_load=0)
-            if (wt_we && !mode_block_load) begin
-                case (wt_addr[12:9])
-                    4'd0: wmem_lo[wt_addr[8:0]][7:0]   <= wt_din;
-                    4'd1: wmem_lo[wt_addr[8:0]][15:8]  <= wt_din;
-                    4'd2: wmem_lo[wt_addr[8:0]][23:16] <= wt_din;
-                    4'd3: wmem_lo[wt_addr[8:0]][31:24] <= wt_din;
-                    4'd4: wmem_lo[wt_addr[8:0]][39:32] <= wt_din;
-                    4'd5: wmem_lo[wt_addr[8:0]][47:40] <= wt_din;
-                    4'd6: wmem_lo[wt_addr[8:0]][55:48] <= wt_din;
-                    4'd7: wmem_lo[wt_addr[8:0]][63:56] <= wt_din;
-                    4'd8: wmem_hi[wt_addr[8:0]][7:0]   <= wt_din;
-                    4'd9: wmem_hi[wt_addr[8:0]][15:8]  <= wt_din;
-                    4'd10: wmem_hi[wt_addr[8:0]][23:16] <= wt_din;
-                    4'd11: wmem_hi[wt_addr[8:0]][31:24] <= wt_din;
-                    4'd12: wmem_hi[wt_addr[8:0]][39:32] <= wt_din;
-                    4'd13: wmem_hi[wt_addr[8:0]][47:40] <= wt_din;
-                    4'd14: wmem_hi[wt_addr[8:0]][55:48] <= wt_din;
-                    4'd15: wmem_hi[wt_addr[8:0]][63:56] <= wt_din;
-                endcase
-            end
-
             case (state)
                 IDLE: begin
                     done <= 0; busy <= 0; decode_busy <= 0;
                     p1_valid <= 0; p2_valid <= 0;
-                    if (start) begin
+                    blk_load_ptr <= 0;
+                    if (start && op_vecmul) begin
                         for (wi_i = 0; wi_i < 64; wi_i = wi_i + 1) acc[wi_i] <= 0;
                         busy <= 1;
-                        if (mode_block_load) begin
-                            blk_idx <= 0; blk_w_idx <= 0; blk_load_ptr <= 0;
-                            decode_busy <= 1; state <= DECODE;
-                        end else begin
-                            k <= 0; g <= 0; state <= COMPUTE;
-                        end
+                        blk_idx <= 0; blk_w_idx <= 0;
+                        decode_busy <= 1;
+                        state <= DECODE;
                     end
                 end
 
                 DECODE: begin
-                    if (!decode_busy) begin
-                        k <= 0; g <= 0; state <= COMPUTE;
+                    if (blk_w_idx == 255) begin
+                        blk_w_idx <= 0;
+                        if (blk_idx == NUM_BLOCKS - 1) begin
+                            decode_busy <= 0;
+                            k <= 0; g <= 0;
+                            state <= COMPUTE;
+                        end else begin
+                            blk_idx <= blk_idx + 1;
+                        end
                     end else begin
-                        dec_computed_val <= decode_one(blk_idx, blk_w_idx);
-                        dec_byte_lane <= dec_byte_lane_val(blk_idx, blk_w_idx);
-                        dec_entry <= dec_entry_val(blk_idx, blk_w_idx);
+                        if (blk_idx == 0 && blk_w_idx < 3) begin
+                            $display("DECODE->DW0: bi=%d wi=%d", blk_idx, blk_w_idx);
+                        end
+                        dec_computed_val <= decode_one_64x896(blk_idx, blk_w_idx);
+                        dec_byte_lane <= dec_byte_lane_val_64x896(blk_idx, blk_w_idx);
+                        dec_entry <= dec_entry_val_64x896(blk_idx, blk_w_idx);
                         state <= DW0;
                     end
                 end
@@ -201,21 +179,14 @@ module matmul_q4k_core (
                         4'd14: wmem_hi[dec_entry][55:48] <= dec_computed_val[15:8];
                         4'd15: wmem_hi[dec_entry][63:56] <= dec_computed_val[15:8];
                     endcase
-                    if (blk_w_idx == 255) begin
-                        blk_w_idx <= 0;
-                        if (blk_idx == NUM_BLOCKS - 1) begin
-                            decode_busy <= 0; state <= DECODE;
-                        end else begin
-                            blk_idx <= blk_idx + 1;
-                            state <= DECODE;
-                        end
-                    end else begin
-                        blk_w_idx <= blk_w_idx + 1;
-                        state <= DECODE;
-                    end
+                    blk_w_idx <= blk_w_idx + 1;
+                    state <= DECODE;
                 end
 
                 COMPUTE: begin
+                    if (k == 0 && g == 0 && state != DRAIN) begin
+                        $display("COMPUTE: k=%d g=%d p1_valid=%d p2_valid=%d act=%d at %t", k, g, p1_valid, p2_valid, p1_act, $time);
+                    end
                     if (p2_valid) begin
                         for (wi_i = 0; wi_i < 8; wi_i = wi_i + 1)
                             acc[p2_row_base + wi_i] <= acc[p2_row_base + wi_i] + p2_partial[wi_i];
@@ -224,17 +195,16 @@ module matmul_q4k_core (
                         for (wi_i = 0; wi_i < 8; wi_i = wi_i + 1)
                             p2_partial[wi_i] <= p1_act * $signed(wmem_rdata[wi_i*16 +: 16]);
                         p2_row_base <= p1_row_base; p2_valid <= 1;
-
                     end else begin
                         p2_valid <= 0;
                     end
                     p1_g <= g; p1_k <= k;
-                    p1_row_base <= {g[6:3], 3'b0};
+                    p1_row_base <= {g, 3'b0};
                     p1_act <= act_reg[k]; p1_valid <= 1;
-
                     if (g == NUM_ROW_GROUPS - 1) begin
                         g <= 0;
-                        if (k == 63) state <= DRAIN; else k <= k + 1;
+                        if (k == TILE_COLS - 1) state <= DRAIN;
+                        else k <= k + 1;
                     end else begin
                         g <= g + 1;
                     end
@@ -258,50 +228,46 @@ module matmul_q4k_core (
                     if (p2_valid)
                         for (wi_i = 0; wi_i < 8; wi_i = wi_i + 1)
                             acc[p2_row_base + wi_i] <= acc[p2_row_base + wi_i] + p2_partial[wi_i];
-                    p2_valid <= 0; busy <= 0; done <= 1; state <= IDLE;
-                    $display("DRAIN2: acc[0..7]=%d %d %d %d %d %d %d %d p2_partial[0]=%d",
-                        acc[0], acc[1], acc[2], acc[3], acc[4], acc[5], acc[6], acc[7],
-                        p2_partial[0]);
+                    p2_valid <= 0; 
+                    $display("FSM: entering IDLE (done)");
+                    busy <= 0; done <= 1; state <= IDLE;
                 end
             endcase
         end
     end
 
-    // decode_one row calculation:
-    // blk_idx = 0..223 (consecutive blocks at stride 76 in original tensor)
-    // blk_idx / 2 = block_row within the 224-block sequence (0..111)
-    // block_row * 4 = base row
-    // blk_w_idx / 64 = which sub-row within block (0,1,2,3)
-    // row = block_row * 4 + sub_row = (blk_idx / 2) * 4 + (blk_w_idx / 64)
-    function automatic [3:0] dec_byte_lane_val;
+    function automatic [3:0] dec_byte_lane_val_64x896;
         input [7:0] bi;
         input [7:0] w_idx;
-        reg [5:0] ri;
-        reg [6:0] block_row;
-        reg [3:0] sub_row;
+        reg [9:0] flat_idx;
+        reg [5:0] tile_row;
         begin
-            ri = w_idx / 64;
-            block_row = bi / 2;
-            sub_row = (block_row * 4 + ri) % 8;
-            dec_byte_lane_val = sub_row * 2;
+            flat_idx = bi * 256 + w_idx;
+            tile_row = flat_idx / TILE_COLS;
+            dec_byte_lane_val_64x896 = (tile_row % 8) * 2;
         end
     endfunction
 
-    function automatic [8:0] dec_entry_val;
+    function automatic [8:0] dec_entry_val_64x896;
         input [7:0] bi;
         input [7:0] w_idx;
-        reg [5:0] col;
-        reg [6:0] g_row;
+        reg [9:0] flat_idx;
+        reg [9:0] tile_col;
+        reg [5:0] tile_row;
         begin
-            col = w_idx % 64;
-            g_row = (bi / 2) * 4 + (w_idx / 64);
-            dec_entry_val = col * 8 + g_row[2:0];
+            flat_idx = bi * 256 + w_idx;
+            tile_col = flat_idx % TILE_COLS;
+            tile_row = flat_idx / TILE_COLS;
+            dec_entry_val_64x896 = (tile_col / COLS_PER_GROUP) * 8 + (tile_row % 8);
         end
     endfunction
 
-    function automatic signed [15:0] decode_one;
+    function automatic signed [15:0] decode_one_64x896;
         input [7:0] bi;
         input [7:0] wi;
+        reg [9:0] flat_idx;
+        reg [9:0] tile_col;
+        reg [5:0] tile_row;
         reg [3:0] sub;
         reg [4:0] j;
         reg [15:0] f16_d, f16_dmin;
@@ -314,9 +280,11 @@ module matmul_q4k_core (
         reg signed [47:0] val;
         reg signed [47:0] val_norm;
         integer base;
-        reg [6:0] block_row;
-        reg [9:0] out_row;
         begin
+            flat_idx = bi * 256 + wi;
+            tile_col = flat_idx % TILE_COLS;
+            tile_row = flat_idx / TILE_COLS;
+
             sub = wi / 32;
             j = wi % 32;
             base = bi * 144;
@@ -348,15 +316,12 @@ module matmul_q4k_core (
             b = dmin_fp * m_used;
             val = (a * q4 - b) >>> 8;
 
-            block_row = bi / 2;
-            out_row = block_row * 4 + (wi / 64);
-
-            val_norm = val * $signed(row_scale[out_row]);
+            val_norm = val * $signed(row_scale[tile_row]);
             val_norm = val_norm >>> 8;
 
-            if (val_norm > 32767) decode_one = 32767;
-            else if (val_norm < -32768) decode_one = -32768;
-            else decode_one = val_norm[15:0];
+            if (val_norm > 32767) decode_one_64x896 = 32767;
+            else if (val_norm < -32768) decode_one_64x896 = -32768;
+            else decode_one_64x896 = val_norm[15:0];
         end
     endfunction
 

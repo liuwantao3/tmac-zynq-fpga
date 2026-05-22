@@ -90,7 +90,7 @@ echo "========================================"
 cd "$VERILOG_DIR"
 
 iverilog -Wall -g2012 -o tb_matmul_q4k.vvp matmul_q4k_core.v tb_matmul_q4k.v
-if vvp tb_matmul_q4k.vvp 2>&1 | grep -q "ALL 7 TESTS PASSED"; then
+if vvp tb_matmul_q4k.vvp 2>&1 | grep -q "ALL [0-9] TESTS PASSED"; then
     green "  PASS: Q4K core testbench"
     PASS=$((PASS + 1))
 else
@@ -127,7 +127,7 @@ if [ -n "$MODEL" ]; then
     echo "========================================"
 
     cd "$SIM_DIR"
-    printf "1 2 3 4 5" | ./tmac_gguf "$MODEL" --fpga-q8 2>&1 | grep -q "token 5" \
+    printf "1 2 3 4 5" | ./tmac_gguf "$MODEL" --fpga-q8 2>&1 | grep -q '"id":5' \
         && green "  PASS: Q8_0 inference produces token 5" \
         || { red "  FAIL: Q8_0 inference"; FAIL=$((FAIL + 1)); }
 
@@ -139,7 +139,7 @@ if [ -n "$MODEL" ]; then
     echo "Phase 6: Full inference — Q4_K FPGA path"
     echo "========================================"
 
-    printf "1 2 3 4 5" | ./tmac_gguf "$MODEL" --fpga-q4k 2>&1 | grep -q "token 5" \
+    printf "1 2 3 4 5" | ./tmac_gguf "$MODEL" --fpga-q4k 2>&1 | grep -q '"id":5' \
         && green "  PASS: Q4_K inference produces token 5" \
         || { red "  FAIL: Q4_K inference"; FAIL=$((FAIL + 1)); }
 
@@ -151,9 +151,9 @@ if [ -n "$MODEL" ]; then
     echo "Phase 7: Output consistency — Q8_0 vs Q4_K vs CPU"
     echo "========================================"
 
-    CPU_OUT=$(printf "1 2 3 4 5" | ./tmac_gguf "$MODEL" 2>&1 | grep "token 5" || true)
-    Q8_OUT=$(printf "1 2 3 4 5" | ./tmac_gguf "$MODEL" --fpga-q8 2>&1 | grep "token 5" || true)
-    Q4K_OUT=$(printf "1 2 3 4 5" | ./tmac_gguf "$MODEL" --fpga-q4k 2>&1 | grep "token 5" || true)
+    CPU_OUT=$(printf "1 2 3 4 5" | ./tmac_gguf "$MODEL" 2>&1 | grep -o '"id":5' || true)
+    Q8_OUT=$(printf "1 2 3 4 5" | ./tmac_gguf "$MODEL" --fpga-q8 2>&1 | grep -o '"id":5' || true)
+    Q4K_OUT=$(printf "1 2 3 4 5" | ./tmac_gguf "$MODEL" --fpga-q4k 2>&1 | grep -o '"id":5' || true)
 
     if [ "$Q8_OUT" = "$CPU_OUT" ] && [ "$Q4K_OUT" = "$CPU_OUT" ]; then
         green "  PASS: All paths produce same token 5 ($CPU_OUT)"

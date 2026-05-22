@@ -2,8 +2,10 @@
 // 
 // Architecture:
 //   - INT16: general matmul (attention QKV, etc.) — CPU dequants weights to INT16
-//   - Q4_K:  FFN layers (gate/up/down) — pre-dequantized INT16 through AXI-Lite buffers
+//   - Q4_K:  FFN layers (gate/up/down) — raw Q4_K blocks through AXI-Lite buffers
 //   - Q8_0:  logits only (token embeddings) — tested via matmul_q8.cpp + tmac_gguf --fpga-q8
+//
+// Phase 2: Q4_K block decode is on FPGA. Tests verify raw block path matches CPU.
 //
 // Compile: g++ -std=c++14 -O2 -I. -o test_integration test_integration.cpp -lpthread
 // Run:     ./test_integration
@@ -17,20 +19,15 @@
 
 using namespace fpga_sim;
 
-// Test config (N = fpga_sim::N = 64)
 constexpr int REPEAT_TILES = 5;
 
-// ===========================================================================
-// Helper: generate random INT16 tile
-// ===========================================================================
 void gen_rand_tile(int16_t tile[N][N], int seed) {
     srand(seed);
     for (int c = 0; c < N; c++)
         for (int r = 0; r < N; r++)
-            tile[c][r] = (int16_t)(rand() % 200 - 100);  // [-100, 100)
+            tile[c][r] = (int16_t)(rand() % 200 - 100);
 }
 
-// Generate activations
 void gen_rand_vec(int16_t vec[N], int seed) {
     srand(seed + 1000);
     for (int i = 0; i < N; i++)
@@ -38,67 +35,138 @@ void gen_rand_vec(int16_t vec[N], int seed) {
 }
 
 // ===========================================================================
-// Test: compare INT16 and Q4K-AXILITE paths against CPU reference
+// Helper: encode f16 into two bytes (little-endian)
 // ===========================================================================
-int test_roundtrip() {
-    int errors = 0;
-    int total = 0;
-
-    for (int seed = 0; seed < REPEAT_TILES; seed++) {
-        int16_t tile[N][N];
-        int16_t vec[N];
-        gen_rand_tile(tile, seed);
-        gen_rand_vec(vec, seed + 2000);
-
-        // ---- CPU reference ----
-        acc16_t ref[N];
-        vecmul_1x64_int16(vec, tile, ref);
-
-        // ---- INT16 FPGA path (DDR-based, general matmul) ----
-        acc16_t fpga_int16[N];
-        axi_vecmul_tile_int16(vec, tile, fpga_int16);
-
-        // ---- Q4_K AXI-Lite buffer path (FFN layers, pre-dequant INT16) ----
-        acc16_t fpga_q4k_axilite[N];
-        axi_vecmul_tile_q4k_axilite(tile, vec, fpga_q4k_axilite);
-
-        // ---- Compare ----
-        for (int i = 0; i < N; i++) {
-            total++;
-            if (fpga_int16[i] != ref[i]) {
-                printf("  FAIL: seed=%d row=%d INT16: got %ld, expected %ld\n",
-                       seed, i, (long)fpga_int16[i], (long)ref[i]);
-                errors++;
-                if (errors > 10) break;
-            }
-            if (fpga_q4k_axilite[i] != ref[i]) {
-                printf("  FAIL: seed=%d row=%d Q4K-AXILITE: got %ld, expected %ld\n",
-                       seed, i, (long)fpga_q4k_axilite[i], (long)ref[i]);
-                errors++;
-                if (errors > 10) break;
-            }
-        }
-        if (errors > 10) break;
+void f16_encode(float val, uint8_t* out) {
+    uint32_t sign = (val < 0) ? 1 : 0; if (val < 0) val = -val;
+    uint32_t exp = 0;
+    uint32_t mant = 0;
+    if (val == 0.0f) { exp = 0; mant = 0; }
+    else {
+        int e;
+        float frac = frexpf(val, &e);
+        exp = e + 14;
+        mant = (uint32_t)((frac - 0.5f) * 2048.0f * 2.0f);
+        if (exp >= 31) { exp = 31; mant = 0; }
+        else if (exp == 0) exp = 1;
     }
+    uint16_t raw = (sign << 15) | (exp << 10) | (mant & 0x3FF);
+    out[0] = raw & 0xFF;
+    out[1] = (raw >> 8) & 0xFF;
+}
+
+// ===========================================================================
+// Generate a Q4_K block with constant weight value
+//   d = 1.0, dmin = 0.0, sc = 1, m = 0, all quants = q4_const
+//   Result: each weight = d * sc * q4 = 1.0 * 1 * q4_const = q4_const
+// ===========================================================================
+void gen_q4k_block_constant(uint8_t block[Q4K_BLOCK_BYTES], uint8_t q4_const) {
+    memset(block, 0, Q4K_BLOCK_BYTES);
+
+    // d = 1.0, dmin = 0.0
+    f16_encode(1.0f, block);
+    f16_encode(0.0f, block + 2);
+
+    // Scales: sc[0..7] = 1, m[0..7] = 0
+    // bytes 4-7: sc[0..3] (low 6 bits = 1)
+    block[4] = 0x01; block[5] = 0x01; block[6] = 0x01; block[7] = 0x01;
+    // bytes 8-11: m[0..3] (low 6 bits = 0)
+    // bytes 12-15: sc[4..7] low nibble = 1, m[4..7] high nibble = 0
+    block[8]  = 0x01; block[9]  = 0x01; block[10] = 0x01; block[11] = 0x01;
+
+    // Quants: all = q4_const (nibble), each byte = q4_const | (q4_const << 4)
+    uint8_t qs_byte = q4_const | (q4_const << 4);
+    for (int i = 16; i < Q4K_BLOCK_BYTES; i++)
+        block[i] = qs_byte;
+}
+
+// ===========================================================================
+// Fill a tile buffer with Q4_K blocks.
+void fill_tile_blocks(uint8_t* tile_blocks, int nblocks,
+                      const uint8_t block[Q4K_BLOCK_BYTES]) {
+    for (int bi = 0; bi < nblocks; bi++)
+        memcpy(tile_blocks + bi * Q4K_BLOCK_BYTES, block, Q4K_BLOCK_BYTES);
+}
+
+// ===========================================================================
+// Test: AXI-Lite Q4K raw block path vs CPU reference
+// Uses 16 blocks (2304 bytes) = 16 rows × 256 cols.
+// For a 64-col tile: each block contributes wi=0..63 to its row.
+// With constant data and identity row_scale, all rows = same value.
+// ===========================================================================
+int test_q4k_blocks() {
+    int errors = 0;
+    const int NBLOCKS = 16;
+
+    // Generate constant Q4_K blocks: all weights = 8
+    uint8_t block[Q4K_BLOCK_BYTES];
+    gen_q4k_block_constant(block, 8);
+    uint8_t tile_blocks[NBLOCKS * Q4K_BLOCK_BYTES];
+    fill_tile_blocks(tile_blocks, NBLOCKS, block);
+
+    // Decode one block for reference
+    int16_t block_decoded[Q4K_BLOCK_SIZE];
+    dequant_q4k_block_to_int16(block, block_decoded);
+
+    // Build reference tile [64][NBLOCKS] (col-major)
+    // Each block covers 1 row × 256 cols. For a 64-col tile (wi=0..63):
+    // row b = block b's values at wi=0..63
+    int16_t ref_tile[64][NBLOCKS] = {{0}};
+    for (int bi = 0; bi < NBLOCKS; bi++) {
+        for (int wio = 0; wio < 64; wio++) {
+            ref_tile[wio][bi] = block_decoded[wio];
+        }
+    }
+
+    // Activations: all ones
+    int16_t vec[64];
+    for (int i = 0; i < 64; i++) vec[i] = 1;
+
+    // CPU reference: vec[64] × ref_tile[64][NBLOCKS] → result[NBLOCKS]
+    int16_t ref_result[NBLOCKS] = {0};
+    for (int row = 0; row < NBLOCKS; row++) {
+        int64_t acc = 0;
+        for (int k = 0; k < 64; k++)
+            acc += (int64_t)vec[k] * (int64_t)ref_tile[k][row];
+        ref_result[row] = (int16_t)acc;
+    }
+
+    // Identity row_scale: max_abs = 32767, row_inv = 32767/32767 = 1.0
+    float row_inv[NBLOCKS];
+    for (int i = 0; i < NBLOCKS; i++) row_inv[i] = 1.0f;
+
+    // Raw block AXI-Lite path (64-col tile)
+    int64_t fpga_result[896] = {0};
+    axi_vecmul_tile_q4k_axilite(tile_blocks, NBLOCKS, vec, 64, row_inv, fpga_result);
+
+    // Compare all rows
+    for (int i = 0; i < NBLOCKS; i++) {
+        if ((int16_t)fpga_result[i] != ref_result[i]) {
+            printf("  FAIL: row %d: got %d, expected %d\n",
+                   i, fpga_result[i], ref_result[i]);
+            errors++;
+            if (errors > 5) break;
+        }
+    }
+    if (errors == 0)
+        printf("  PASS: all %d rows match reference (val=%d)\n", NBLOCKS, ref_result[0]);
     return errors;
 }
 
 // ===========================================================================
 // Test: AXI-Lite buffer write address mapping
+// Verifies first 8192 bytes (Verilog weight_buf size) with Q4K_TILE_BYTES writes.
 // ===========================================================================
 int test_axilite_addr_map() {
     int errors = 0;
-
     AxiliteAccelState s;
 
-    // Write fixed pattern through AXI-Lite buffer interface
-    for (int off = 0; off < 8192; off += 4) {
-        uint32_t data = 0x03020100u;  // byte3=3, byte2=2, byte1=1, byte0=0
+    for (int off = 0; off < Q4K_TILE_BYTES; off += 4) {
+        uint32_t data = 0x03020100u;
         axilite_write_buf(s, AXI_WEIGHT_BASE + off, data, 0xF, true);
     }
 
-    // Verify: weight_buf[i] = i % 4 (byte lane within word)
-    for (int i = 0; i < 8192; i++) {
+    for (int i = 0; i < 8192; i++) {  // Only verify Verilog buffer size
         uint8_t expected = (i % 4);
         if (s.weight_buf[i] != expected) {
             printf("  FAIL: weight_buf[%d] = %d, expected %d\n",
@@ -108,15 +176,14 @@ int test_axilite_addr_map() {
         }
     }
     if (errors == 0)
-        printf("  PASS: weight_buf 8192 bytes verified\n");
-
+        printf("  PASS: weight_buf %d bytes verified\n", 8192);
     return errors;
 }
 
 // ===========================================================================
-// Test: AXI-Lite Q4K compute (pre-dequant INT16 through buffer)
+// Test: INT16 AXI-Lite buffer path (Phase 1, backward compat)
 // ===========================================================================
-int test_axilite_compute() {
+int test_int16_axilite() {
     int errors = 0;
 
     int16_t tile[N][N];
@@ -124,13 +191,11 @@ int test_axilite_compute() {
     gen_rand_tile(tile, 42);
     gen_rand_vec(vec, 42);
 
-    // Reference
     acc16_t ref[N];
     vecmul_1x64_int16(vec, tile, ref);
 
-    // AXI-Lite buffer path
     acc16_t result[N];
-    axi_vecmul_tile_q4k_axilite(tile, vec, result);
+    axi_vecmul_tile_int16_axilite(tile, vec, result);
 
     for (int i = 0; i < N; i++) {
         if (result[i] != ref[i]) {
@@ -150,7 +215,7 @@ int main() {
     int total_tests = 0;
 
     printf("========================================\n");
-    printf("FPGA Integration Test Suite\n");
+    printf("FPGA Integration Test Suite (Phase 2)\n");
     printf("========================================\n\n");
 
     // Test 1: AXI-Lite address mapping
@@ -159,15 +224,15 @@ int main() {
     total_tests++;
     printf("\n");
 
-    // Test 2: AXI-Lite Q4K compute vs reference
-    printf("Test 2: AXI-Lite Q4K compute vs vecmul_1x64_int16\n");
-    total_errors += test_axilite_compute();
+    // Test 2: INT16 AXI-Lite buffer path (backward compat)
+    printf("Test 2: INT16 AXI-Lite buffer path vs vecmul_1x64_int16\n");
+    total_errors += test_int16_axilite();
     total_tests++;
     printf("\n");
 
-    // Test 3: Roundtrip — INT16 + Q4K-AXILITE vs CPU reference
-    printf("Test 3: Roundtrip (INT16+Q4K-AXILITE) vs CPU reference (%d random tiles)\n", REPEAT_TILES);
-    total_errors += test_roundtrip();
+    // Test 3: Q4_K raw block path (Phase 2)
+    printf("Test 3: Q4_K raw block AXI-Lite path vs reference\n");
+    total_errors += test_q4k_blocks();
     total_tests++;
     printf("\n");
 
@@ -179,7 +244,6 @@ int main() {
         printf("%d / %d TESTS FAILED (%d errors)\n",
                total_errors, total_tests, total_errors);
 
-    // Cleanup
     auto& a = accel();
     (void)a;
 

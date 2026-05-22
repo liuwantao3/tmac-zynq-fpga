@@ -109,7 +109,7 @@ constexpr uint32_t CTRL_MODE_Q4K = 1u << 6;
 // Matches actual Verilog timing: 1 IDLE exit + 512 COMPUTE + 1 DRAIN + 1 DRAIN2
 constexpr uint32_t CYCLES_PER_TILE = 515;
 
-// FP16→FP32 conversion (shared across simulation files)
+// FP32↔FP16 conversion (shared across simulation files)
 inline float read_f16(const uint8_t* data) {
     uint16_t raw = (uint16_t)data[0] | ((uint16_t)data[1] << 8);
     uint32_t sign = (raw >> 15) & 0x1;
@@ -122,8 +122,22 @@ inline float read_f16(const uint8_t* data) {
     return (sign ? -1.0f : 1.0f) * (1.0f + mant / 1024.0f) * powf(2.0f, (int)exp - 15);
 }
 
-
-
+// FP32→FP16 (standard round-to-nearest-even, truncates mantissa)
+inline uint16_t write_f16(float f) {
+    uint32_t u;
+    memcpy(&u, &f, sizeof(u));
+    uint32_t sign = (u >> 31) & 0x1;
+    int32_t exp = ((int32_t)((u >> 23) & 0xFF)) - 127;
+    uint32_t mant = u & 0x7FFFFF;
+    if (exp >= 16) return (sign << 15) | (0x1F << 10);
+    if (exp < -14) return sign << 15;
+    uint32_t f16_exp = exp + 15;
+    uint32_t f16_mant = mant >> 13;
+    uint32_t rbit = (mant >> 12) & 0x1;
+    if (rbit && (f16_mant & 0x1) == 0) f16_mant++; // round to nearest even
+    if (f16_mant >= 0x400) { f16_mant = 0; f16_exp++; }
+    return (sign << 15) | ((f16_exp & 0x1F) << 10) | (f16_mant & 0x3FF);
+}
 
 
 
@@ -488,8 +502,21 @@ inline void axi_vecmul_tile_q8(const uint8_t* q8_W,                // 64×64 pur
 // Q4_K block constants
 constexpr int Q4K_BLOCK_SIZE = 256;           // 256 weights per block
 constexpr int Q4K_BLOCK_BYTES = 144;          // 144 bytes per block
-constexpr int Q4K_TILE_BLOCKS = 16;           // 16 blocks per 64×64 tile
-constexpr int Q4K_TILE_BYTES = Q4K_TILE_BLOCKS * Q4K_BLOCK_BYTES;  // 2304
+constexpr int Q4K_TILE_BLOCKS_OLD = 16;       // old 64×64 tile: 16 blocks
+// New tile: 896 rows × 64 cols = 224 blocks (224 × 144 = 32256 bytes)
+// 224 = 896 / 4 rows per block, 1 column group of 64 cols
+constexpr int Q4K_TILE_BLOCKS = 224;          // 224 blocks per 896×64 tile
+constexpr int Q4K_TILE_BYTES = Q4K_TILE_BLOCKS * Q4K_BLOCK_BYTES;  // 32256
+
+// Q5_0 block constants (32 values/block, 22 bytes)
+constexpr int Q5_0_BLOCK_SIZE = 32;
+constexpr int Q5_0_BLOCK_BYTES = 22;
+constexpr int Q5_0_224BLOCK_BYTES = 224 * Q5_0_BLOCK_BYTES;  // 4928
+
+// Q6_K block constants (256 values/block, 210 bytes)
+constexpr int Q6_K_BLOCK_SIZE = 256;
+constexpr int Q6_K_BLOCK_BYTES = 210;
+constexpr int Q6_K_32BLOCK_BYTES = 32 * Q6_K_BLOCK_BYTES;    // 6720
 
 // Dequantize a single Q4_K block (144 bytes) → INT16[256]
 // Block layout: 4 rows × 64 cols in column-major order within the tile
@@ -569,7 +596,7 @@ inline void dequant_q4k_tile(const uint8_t q4k_blocks[Q4K_TILE_BYTES],
 
 // AXI-Lite buffer address constants (matches Verilog localparams)
 constexpr uint32_t AXI_WEIGHT_BASE  = 0x1000;  // weight_buf start
-constexpr uint32_t AXI_WEIGHT_Q4K_MAX = 0x3000; // weight_buf end (exclusive)
+constexpr uint32_t AXI_WEIGHT_Q4K_MAX = 0x9000; // weight_buf end (0x1000 + 32768)
 constexpr uint32_t AXI_SCALE_BASE   = 0x2000;  // scale_buf start
 constexpr uint32_t AXI_ACT_BASE     = 0x2100;  // act_buf start
 constexpr uint32_t AXI_RES_BASE     = 0x4000;  // result_buf lower 32b
@@ -588,8 +615,9 @@ inline uint32_t AXI_RES_HI_ADDR(int i) {
 // Simulated AXI-Lite buffer accelerator state
 struct AxiliteAccelState {
     // Internal buffers (match Verilog exactly)
-    uint8_t  weight_buf[8192] = {0};  // 0x1000-0x2FFF
-    uint16_t scale_buf[128]   = {0};  // 0x2000-0x20FF (Q8 only)
+    // Q4K mode needs 32256 bytes (224 blocks × 144 bytes), 32768 provides margin
+    uint8_t  weight_buf[32768] = {0}; // 0x1000-0x9FFF (Q4K: 32256 bytes used)
+    uint16_t scale_buf[896]   = {0};  // Q8: 128 entries, Q4K: 896 entries for row_scale
     uint16_t act_buf[64]      = {0};  // 0x2100-0x217F
     uint64_t result_buf[64]   = {0};  // 0x4000-0x41FF (48-bit results)
 
@@ -626,7 +654,8 @@ inline void axilite_write_buf(AxiliteAccelState& s, uint32_t addr, uint32_t data
         bool skip = false;
         if (!mode_q4k && (is_scale_region || is_act_region)) skip = true;
         if (!skip) {
-            for (int b = 0; b < 4 && (off + b) < 8192; b++)
+            int wb_max = mode_q4k ? 32768 : 8192;
+            for (int b = 0; b < 4 && (off + b) < wb_max; b++)
                 if (strb & (1u << b)) s.weight_buf[off + b] = (data >> (b * 8)) & 0xFF;
         }
     }
@@ -645,51 +674,34 @@ inline uint32_t axilite_read_buf(const AxiliteAccelState& s, uint32_t addr) {
     return 0;
 }
 
-// Simulate the loading FSM + Q4K core compute in one step.
-// This mirrors the Verilog: loading FSM → core start → compute → drain.
-inline void axilite_q4k_run(AxiliteAccelState& s) {
-    // Phase 1: Loading FSM — copy weight_buf → wmem, act_buf → cmem
-    // Simulate Q4K core's wmem as int16_t[512][8] = 4096 INT16 values
-    int16_t wmem[512][8] = {{0}};  // 512 entries × 8 INT16s
+// Phase 1 INT16 run: reassemble pre-dequant INT16 from byte-serialized weight_buf,
+// then matmul. This matches the Phase 1 Verilog loading FSM (LP_WEIGHT).
+inline void axilite_int16_run(AxiliteAccelState& s) {
+    int16_t wmem[512][8] = {{0}};
     for (int load_addr = 0; load_addr < 8192; load_addr++) {
-        // Address format matches Verilog loading FSM:
-        //   entry = load_addr / 16  (0-511)
-        //   byte_lane = load_addr % 16  (0-15)
-        //   byte_lane 0-7 → wmem_lo, 8-15 → wmem_hi
-        //   Within each 64-bit half: byte_lane[2:0] selects byte position
         int entry = load_addr / 16;
         int byte_lane = load_addr % 16;
-        int half = (byte_lane >= 8) ? 1 : 0;    // lo/hi 64-bit half
-        int byte_in_half = byte_lane % 8;         // byte within 64-bit half
-        int int16_idx = byte_in_half / 2;         // which INT16 in the half
-        int byte_in_int16 = byte_in_half % 2;     // lo/hi byte of INT16
-
+        int half = (byte_lane >= 8) ? 1 : 0;
+        int byte_in_half = byte_lane % 8;
+        int int16_idx = byte_in_half / 2;
+        int byte_in_int16 = byte_in_half % 2;
         uint8_t val = s.weight_buf[load_addr];
-        int16_t entry_arr[8];  // 8 INT16s per wmem entry
+        int16_t entry_arr[8];
         memcpy(entry_arr, &wmem[entry], 16);
-
-        // Build the INT16 at position int16_idx within the half
-        int idx_in_entry = half * 4 + int16_idx;  // 0-7
+        int idx_in_entry = half * 4 + int16_idx;
         if (byte_in_int16 == 0)
             entry_arr[idx_in_entry] = (entry_arr[idx_in_entry] & 0xFF00) | val;
         else
             entry_arr[idx_in_entry] = (entry_arr[idx_in_entry] & 0x00FF) | ((int16_t)val << 8);
-
         memcpy(&wmem[entry], entry_arr, 16);
     }
 
-    // Phase 2: Compute — vecmul_1x64_int16 with wmem rearranged
-    // wmem[entry][8] holds 8 INT16s per entry.
-    // The tile is 64×64, col-major: tile[col][row] = wmem[(col*64+row)/8][(col*64+row)%8]
     int16_t mat[N][N] = {{0}};
-    for (int c = 0; c < N; c++) {
+    for (int c = 0; c < N; c++)
         for (int r = 0; r < N; r++) {
             int idx = c * N + r;
-            int entry = idx / 8;
-            int pos = idx % 8;
-            mat[c][r] = wmem[entry][pos];
+            mat[c][r] = wmem[idx / 8][idx % 8];
         }
-    }
 
     int16_t vec[N] = {0};
     for (int i = 0; i < N; i++) vec[i] = s.act_buf[i];
@@ -697,7 +709,6 @@ inline void axilite_q4k_run(AxiliteAccelState& s) {
     acc16_t result[N] = {0};
     vecmul_1x64_int16(vec, mat, result);
 
-    // Phase 3: Drain — write results to result_buf
     for (int i = 0; i < N; i++)
         s.result_buf[i] = (uint64_t)(int64_t)result[i];
 
@@ -705,47 +716,91 @@ inline void axilite_q4k_run(AxiliteAccelState& s) {
     s.reg_status = STATUS_DONE;
 }
 
-// High-level Q4K tile function using AXI-Lite buffer interface.
-// Writes INT16 pre-dequant tile data via simulated buffer writes,
-// triggers compute, reads results.
-// This exactly mirrors the Verilog data flow in matmul_top.v + matmul_q4k_core.v.
-//
-// tile_int16: 64×64 INT16 matrix, col-major: tile_int16[col][row]
-// vec:        64 INT16 activation vector
-// result:     64 INT64 output
-inline void axi_vecmul_tile_q4k_axilite(const int16_t tile_int16[N][N],
-                                         const in16_t vec[N],
-                                         acc16_t result[N]) {
-    AxiliteAccelState s;
+// Phase 2 raw block run: decode Q4_K blocks from weight_buf, apply row normalization
+// via row_scale, then matmul.
+// Each block covers 256 flat values = 1 row x 256 cols (for cols >= 256).
+// act = activation vector (length ncols), ncols = number of columns to process per block.
+//   ncols=64 for 64-col tiles (wi_offset selects which 64), ncols=256 for full-block tiles.
+inline void axilite_q4k_run(AxiliteAccelState& s, const float* row_inv,
+                            const int16_t* act, int ncols,
+                            int nblocks = 56,
+                            int64_t* tile_result = nullptr, int row_base = 0,
+                            int wi_offset = 0) {
+    int64_t tile_result_local[896] = {0};
+    int64_t* result_out = tile_result ? tile_result : tile_result_local;
 
-    // Write activation vector directly to act_buf (bypass axilite_write_buf
-    // to avoid overwrite by weight writes at the same 0x2100-0x217F address range)
+    for (int bi = 0; bi < nblocks; bi++) {
+        const uint8_t* block_start = s.weight_buf + bi * Q4K_BLOCK_BYTES;
+
+        float d = read_f16(block_start);
+        float dmin = read_f16(block_start + 2);
+        const uint8_t* scales = block_start + 4;
+        const uint8_t* qs = block_start + 16;
+
+        int out_row = row_base + bi;
+        float inv = row_inv[out_row];
+
+        int64_t acc = 0;
+        for (int wio = 0; wio < ncols; wio++) {
+            int wi = wi_offset + wio;
+            if (wi >= 256) break;
+            int sub = wi / 32;
+            int j = wi % 32;
+
+            int sc, m;
+            if (sub < 4) {
+                sc = scales[sub] & 63;
+                m = scales[sub + 4] & 63;
+            } else {
+                sc = (scales[sub + 4] & 0xF) | ((scales[sub - 4] >> 6) << 4);
+                m = (scales[sub + 4] >> 4) | ((scales[sub] >> 6) << 4);
+            }
+            sc = std::min(sc, 63);
+            m = std::min(m, 63);
+
+            uint64_t qs_byte_idx = (sub / 2) * 32 + j;
+            uint8_t q4 = (sub % 2 == 0) ? (qs[qs_byte_idx] & 0xF) : (qs[qs_byte_idx] >> 4);
+
+            float val = (d * (float)sc * (float)q4 - dmin * (float)m) * inv;
+            int16_t val_i16;
+            if (val > 32767.0f) val_i16 = 32767;
+            else if (val < -32768.0f) val_i16 = -32768;
+            else val_i16 = (int16_t)roundf(val);
+
+            acc += (int64_t)act[wio] * (int64_t)val_i16;
+        }
+
+        if (out_row < 896)
+            result_out[out_row] += acc;
+    }
+
+    for (int i = 0; i < 64 && (row_base + i) < 896; i++)
+        s.result_buf[i] = (uint64_t)(int64_t)result_out[row_base + i];
+
+    s.done_flag = true;
+    s.reg_status = STATUS_DONE;
+}
+
+// Phase 1 INT16 tile path: sends pre-dequant INT16 weights through AXI-Lite buffer.
+// Used for backward compatibility testing.
+inline void axi_vecmul_tile_int16_axilite(const int16_t tile_int16[N][N],
+                                           const in16_t vec[N],
+                                           acc16_t result[N]) {
+    AxiliteAccelState s;
     for (int i = 0; i < N; i += 2) {
         s.act_buf[i]     = vec[i];
         s.act_buf[i + 1] = vec[i + 1];
     }
-
-    // Write weight data: 64×64 INT16 = 4096 values × 2 bytes = 8192 bytes
-    // AXI addresses: 0x1000-0x2FFF (contiguous, passes through scale/act hole in Q4K mode)
-    // This overwrites weight_buf at 0x2100-0x217F (col 34) but act_buf retains activations
-    // Write 2 INT16s per 32-bit word for efficiency:
-    //   addr = 0x1000 + col*128 + row*2  (row even → word-aligned)
-    //   data = tile_int16[col][row] (16b) | tile_int16[col][row+1] << 16 (16b)
-    //   strb = 0xF  (write all 4 bytes)
     for (int c = 0; c < N; c++) {
         for (int r = 0; r < N; r += 2) {
-            int byte_off = c * N * 2 + r * 2;  // 2 bytes per INT16, 2 INT16s per word
+            int byte_off = c * N * 2 + r * 2;
             uint32_t w0 = (uint16_t)(tile_int16[c][r]);
             uint32_t w1 = (uint16_t)(tile_int16[c][r + 1]);
             uint32_t data_word = w0 | (w1 << 16);
             axilite_write_buf(s, AXI_WEIGHT_BASE + byte_off, data_word, 0xF, true);
         }
     }
-
-    // Run compute (simulates loading FSM + core)
-    axilite_q4k_run(s);
-
-    // Read results from result buffer
+    axilite_int16_run(s);
     for (int i = 0; i < N; i++) {
         uint32_t lo = axilite_read_buf(s, AXI_RES_ADDR(i));
         uint32_t hi = axilite_read_buf(s, AXI_RES_HI_ADDR(i));
@@ -753,6 +808,371 @@ inline void axi_vecmul_tile_q4k_axilite(const int16_t tile_int16[N][N],
     }
 }
 
+// Phase 2 raw Q4_K block path: sends Q4_K blocks via simulated buffer writes,
+// then runs FPGA internal block decode + row normalization + matmul.
+// act = activation vector (length ncols), ncols = number of columns per tile (64 or 256).
+// Produces nblocks output values per invocation.
+inline void axi_vecmul_tile_q4k_axilite(const uint8_t* q4k_blocks,
+                                         int nblocks,
+                                         const in16_t* act, int ncols,
+                                         const float* row_inv,
+                                         int64_t* result,
+                                         int row_base = 0) {
+    AxiliteAccelState s;
 
+    int tile_bytes = nblocks * Q4K_BLOCK_BYTES;
+    for (int off = 0; off < tile_bytes; off += 4) {
+        uint32_t data_word = (uint32_t)q4k_blocks[off]
+                           | ((uint32_t)q4k_blocks[off + 1] << 8)
+                           | ((uint32_t)q4k_blocks[off + 2] << 16)
+                           | ((uint32_t)q4k_blocks[off + 3] << 24);
+        axilite_write_buf(s, AXI_WEIGHT_BASE + off, data_word, 0xF, true);
+    }
+
+    axilite_q4k_run(s, row_inv, act, ncols, nblocks, result, row_base, 0);
+}
+
+// Overload: 16-block tile variant, 64 cols (backward compat for tests)
+inline void axi_vecmul_tile_q4k_axilite(const uint8_t q4k_blocks[2304],
+                                         const in16_t vec[64],
+                                         acc16_t result[64]) {
+    float row_inv[16];
+    for (int i = 0; i < 16; i++) row_inv[i] = 1.0f;
+
+    int64_t result_full[896] = {0};
+    axi_vecmul_tile_q4k_axilite(q4k_blocks, 16, vec, 64, row_inv, result_full);
+
+    for (int i = 0; i < 16; i++) result[i] = (int16_t)result_full[i];
+}
+
+// Overload: 16-block tile variant with row_scale, 64 cols
+inline void axi_vecmul_tile_q4k_axilite(const uint8_t q4k_blocks[2304],
+                                         const in16_t vec[64],
+                                         const uint16_t row_scale_uq[64],
+                                         acc16_t result[64]) {
+    float row_inv[16];
+    for (int i = 0; i < 16; i++) row_inv[i] = (float)row_scale_uq[i] / 256.0f;
+
+    int64_t result_full[896] = {0};
+    axi_vecmul_tile_q4k_axilite(q4k_blocks, 16, vec, 64, row_inv, result_full);
+
+    for (int i = 0; i < 16; i++) result[i] = (int16_t)result_full[i];
+}
+
+
+
+// ===========================================================================
+// Q4_K ROW2 Path — Direct 2-row Q4_K block decode + matmul with row_scale.
+//
+// Q4_K block-dequant values are very small (order 0.001-0.1), so direct
+// INT16 rounding loses all precision (every value rounds to 0).
+// Solution: 2-pass row_scale normalization.
+//
+// Pass 1: decode each block to float, find max_abs per row → row_scale
+// Pass 2: decode each block, normalize by row_scale→INT16, MAC with xq
+//
+// Row normalization: y[i] = sum_k round(W_ik * 32767/row_max) * x_q_k
+//                       ≈ (sum_k W_ik * x_k) * x_scale / row_scale  (after dequant)
+// (The old pre-tiling path used same row_scale technique but with 64×64 tiles)
+// ===========================================================================
+
+// 2x896 tile: 7 Q4_K blocks → 1792 elements → 2 accumulator rows
+// Matches matmul_q4k_2x896_core.v exactly.
+constexpr int Q4K_7BLOCK_BYTES = 7 * Q4K_BLOCK_BYTES;  // 1008
+constexpr int Q4K_28BLOCK_BYTES = 28 * Q4K_BLOCK_BYTES; // 4032
+
+inline void axi_vecmul_tile_q4k_2x896_axilite(
+    const uint8_t blocks_7[Q4K_7BLOCK_BYTES],
+    const in16_t act_reg[896],
+    const uint16_t row_scale[2],
+    acc16_t result[2]) {
+    constexpr int TILE_COLS = 896;
+    int64_t acc[2] = {0};
+
+    for (int bi = 0; bi < 7; bi++) {
+        const uint8_t* blk = blocks_7 + bi * Q4K_BLOCK_BYTES;
+
+        // S24.8 fixed-point decode
+        int d_int = (int)roundf(read_f16(blk) * 256.0f);
+        int dmin_int = (int)roundf(read_f16(blk + 2) * 256.0f);
+
+        const uint8_t* scales = blk + 4;
+        const uint8_t* qs = blk + 16;
+
+        for (int wi = 0; wi < 256; wi++) {
+            int sub = wi / 32;
+            int j = wi % 32;
+
+            int sc_used, m_used;
+            if (sub < 4) {
+                sc_used = scales[sub] & 63;
+                m_used  = scales[sub + 4] & 63;
+            } else {
+                sc_used = (scales[sub - 4] >> 6) | ((scales[sub + 4] & 0xF) << 2);
+                m_used  = (scales[sub] >> 6) | ((scales[sub + 4] >> 4) << 2);
+            }
+
+            int qs_idx = (sub / 2) * 32 + j;
+            int q4 = (sub % 2 == 0) ? (qs[qs_idx] & 0xF) : (qs[qs_idx] >> 4);
+
+            int a = d_int * sc_used;
+            int b = dmin_int * m_used;
+            int val = (a * q4 - b) >> 8;
+
+            int flat = bi * 256 + wi;
+            int row = flat / TILE_COLS;
+            int col = flat % TILE_COLS;
+
+            int val_norm = val * (int)row_scale[row] >> 8;
+            if (val_norm > 32767) val_norm = 32767;
+            else if (val_norm < -32768) val_norm = -32768;
+
+            acc[row] += (int64_t)val_norm * (int64_t)act_reg[col];
+        }
+    }
+
+    result[0] = acc[0];
+    result[1] = acc[1];
+}
+
+// 8×896 variant: 28 blocks, 8-row accumulator. Same block decode logic.
+inline void axi_vecmul_tile_q4k_8x896_axilite(
+    const uint8_t blocks_28[Q4K_28BLOCK_BYTES],
+    const in16_t act_reg[896],
+    const uint16_t row_scale[8],
+    acc16_t result[8]) {
+    constexpr int TILE_COLS = 896;
+    constexpr int NBLOCKS = 28;
+    constexpr int NROWS = 8;
+    int64_t acc[NROWS] = {0};
+
+    for (int bi = 0; bi < NBLOCKS; bi++) {
+        const uint8_t* blk = blocks_28 + bi * Q4K_BLOCK_BYTES;
+
+        int d_int = (int)roundf(read_f16(blk) * 256.0f);
+        int dmin_int = (int)roundf(read_f16(blk + 2) * 256.0f);
+
+        const uint8_t* scales = blk + 4;
+        const uint8_t* qs = blk + 16;
+
+        for (int wi = 0; wi < 256; wi++) {
+            int sub = wi / 32;
+            int j = wi % 32;
+
+            int sc_used, m_used;
+            if (sub < 4) {
+                sc_used = scales[sub] & 63;
+                m_used  = scales[sub + 4] & 63;
+            } else {
+                sc_used = (scales[sub - 4] >> 6) | ((scales[sub + 4] & 0xF) << 2);
+                m_used  = (scales[sub] >> 6) | ((scales[sub + 4] >> 4) << 2);
+            }
+
+            int qs_idx = (sub / 2) * 32 + j;
+            int q4 = (sub % 2 == 0) ? (qs[qs_idx] & 0xF) : (qs[qs_idx] >> 4);
+
+            int a = d_int * sc_used;
+            int b = dmin_int * m_used;
+            int val = (a * q4 - b) >> 8;
+
+            int flat = bi * 256 + wi;
+            int row = flat / TILE_COLS;
+            int col = flat % TILE_COLS;
+
+            int val_norm = val * (int)row_scale[row] >> 8;
+            if (val_norm > 32767) val_norm = 32767;
+            else if (val_norm < -32768) val_norm = -32768;
+
+            acc[row] += (int64_t)val_norm * (int64_t)act_reg[col];
+        }
+    }
+
+    for (int i = 0; i < NROWS; i++) result[i] = acc[i];
+}
+
+// =======================================================================
+// Q5_0 8×896 core: 224 blocks (8 rows × 896 cols), 5-bit block decode.
+// Each Q5_0 block = 32 vals, 22 bytes: FP16 d + 4B high bits + 16B nibbles.
+// row_inv = FP32, 32767/max_abs per row.
+// =======================================================================
+inline void axi_vecmul_tile_q5_0_8x896_axilite(
+    const uint8_t blocks_224[Q5_0_224BLOCK_BYTES],
+    const in16_t act_reg[896],
+    const float row_inv[8],
+    int64_t* result,
+    int row_base) {
+    constexpr int TILE_COLS = 896;
+    constexpr int NBLOCKS = 224;
+    constexpr int NROWS = 8;
+    int64_t acc[NROWS] = {0};
+
+    for (int bi = 0; bi < NBLOCKS; bi++) {
+        const uint8_t* blk = blocks_224 + bi * Q5_0_BLOCK_BYTES;
+
+        float d = read_f16(blk);
+        uint32_t qh = (uint32_t)blk[2] | ((uint32_t)blk[3] << 8) |
+                      ((uint32_t)blk[4] << 16) | ((uint32_t)blk[5] << 24);
+
+        for (int wi = 0; wi < 32; wi++) {
+            int flat = bi * 32 + wi;
+            int row = flat / TILE_COLS;
+            int col = flat % TILE_COLS;
+
+            uint64_t j = wi < 16 ? wi : wi - 16;
+            uint8_t qs_byte = blk[6 + j];
+            uint8_t ql = (wi < 16) ? (qs_byte & 0xF) : (qs_byte >> 4);
+            uint8_t qh_bit = (qh >> wi) & 1;
+            int q = ((qh_bit << 4) | ql) - 16;
+
+            float val_f = d * (float)q;
+            float norm = val_f * row_inv[row];
+            int16_t val_i16;
+            if (norm > 32767.0f) val_i16 = 32767;
+            else if (norm < -32768.0f) val_i16 = -32768;
+            else val_i16 = (int16_t)roundf(norm);
+
+            acc[row] += (int64_t)val_i16 * (int64_t)act_reg[col];
+        }
+    }
+
+    for (int i = 0; i < NROWS; i++) {
+        int r = row_base + i;
+        result[r] += acc[i];
+    }
+}
+
+// =======================================================================
+// Q6_K axilite path: decode Q6_K blocks, normalize by FP32 row_inv, MAC.
+// Blocks cover 256 values each, block stride = cols/256.
+// =======================================================================
+inline void axi_vecmul_tile_q6_k_axilite(const uint8_t* blocks,
+                                          int nblocks,
+                                          const in16_t* act, int ncols,
+                                          const float* row_inv,
+                                          int64_t* result,
+                                          int row_base) {
+    constexpr int BLOCK_VALS = 256;
+
+    for (int bi = 0; bi < nblocks; bi++) {
+        const uint8_t* blk = blocks + bi * Q6_K_BLOCK_BYTES;
+
+        float super_scale = read_f16(blk + 208);
+
+        int out_row = row_base + bi;
+        float inv = row_inv[out_row];
+        int64_t acc = 0;
+
+        for (int wi = 0; wi < BLOCK_VALS; wi++) {
+            if (wi >= ncols) break;
+            int half = wi / 128;
+            int pos = wi % 128;
+            int l = pos % 32;
+            int sub = pos / 32;
+
+            // L: bytes [0-127] — low 4 bits of each value
+            //   half 0: blk[0..63], half 1: blk[64..127]
+            //   sub 0,2: l, sub 1,3: l+32 within the half
+            int L_off = half * 64 + l + (sub % 2) * 32;
+            uint8_t ql_byte = blk[L_off];
+            uint8_t ql_nibble = (sub < 2) ? (ql_byte & 0xF) : (ql_byte >> 4);
+
+            // H: bytes [128-191] — high 2 bits, 4 sub-blocks × 2 bits per byte
+            //   half 0: blk[128..159], half 1: blk[160..191]
+            int H_off = 128 + half * 32 + l;
+            int qh_shift = sub * 2;
+            uint8_t qh_bits = (blk[H_off] >> qh_shift) & 0x3;
+
+            int q6 = ((qh_bits << 4) | ql_nibble) - 32;
+
+            // Scales: bytes [192-207] — int8, 16 per block (2 per sub-block)
+            //   half 0: blk[192..199], half 1: blk[200..207]
+            //   sub 0,1: (l/16), sub 2,3: (l/16) + offset by sub*2
+            int sc_off = 192 + half * 8 + (l / 16) + sub * 2;
+            float scale_f = (float)(int8_t)blk[sc_off];
+
+            float val = super_scale * scale_f * (float)q6 * inv;
+            int16_t val_i16;
+            if (val > 32767.0f) val_i16 = 32767;
+            else if (val < -32768.0f) val_i16 = -32768;
+            else val_i16 = (int16_t)roundf(val);
+
+            acc += (int64_t)act[wi] * (int64_t)val_i16;
+        }
+
+        if (out_row < 896)
+            result[out_row] += acc;
+    }
+}
+
+// Decode a Q4_K block to float array (no rounding, unlike block_to_int16)
+inline void dequant_q4k_block_to_float(const uint8_t block[Q4K_BLOCK_BYTES],
+                                        float out[Q4K_BLOCK_SIZE]) {
+    float d = read_f16(block);
+    float dmin = read_f16(block + 2);
+    const uint8_t* scales = block + 4;
+    const uint8_t* qs = block + 16;
+    for (int sub = 0; sub < 8; sub++) {
+        int sc, m;
+        if (sub < 4) {
+            sc = scales[sub] & 63;
+            m = scales[sub + 4] & 63;
+        } else {
+            sc = (scales[sub + 4] & 0xF) | ((scales[sub - 4] >> 6) << 4);
+            m = (scales[sub + 4] >> 4) | ((scales[sub] >> 6) << 4);
+        }
+        sc = std::min(sc, 63);
+        m = std::min(m, 63);
+        for (int j = 0; j < 32; j++) {
+            uint64_t qs_byte_idx = (sub / 2) * 32 + j;
+            uint8_t q4 = (sub % 2 == 0) ? (qs[qs_byte_idx] & 0xF) : (qs[qs_byte_idx] >> 4);
+            int idx = sub * 32 + j;
+            out[idx] = d * (float)sc * (float)q4 - dmin * (float)m;
+        }
+    }
+}
+
+// Simulate FPGA Q4_K → row-normalized INT16 decode + matmul for a 2-row chunk.
+// Uses row_scale normalization: each weight is quantized as round(val * 32767/row_scale[row].
+// Single-pass decode+normalize+MAC (row_scale precomputed externally in matmul_fpga_q4k).
+// tensor_data: pointer to tensor's raw Q4_K block data
+// cols: number of columns per row (hidden dim or intermediate dim)
+// row_start: starting row index (must be even)
+// xq: quantized activation vector (length cols)
+// result: output [result[row_start], result[row_start+1]]
+// row_scale: max_abs per row from external pass-1 scan
+inline void axi_vecmul_q4k_row2(const uint8_t* tensor_data, int cols,
+                                 int row_start,
+                                 const int16_t* xq,
+                                 acc16_t result[2],
+                                 const float row_scale[2]) {
+    uint64_t nblocks = ((uint64_t)cols * 2 + Q4K_BLOCK_SIZE - 1) / Q4K_BLOCK_SIZE;
+    uint64_t base_block = (uint64_t)row_start * cols / Q4K_BLOCK_SIZE;
+    uint64_t row_start_flat = (uint64_t)row_start * cols;
+
+    float row_inv[2];
+    for (int i = 0; i < 2; i++) {
+        float rs = (row_scale[i] < 1e-10f) ? 1.0f : row_scale[i] / 32767.0f;
+        row_inv[i] = (rs < 1e-10f) ? 0.0f : 1.0f / rs;
+    }
+
+    int64_t acc[2] = {0};
+    float block_f32[Q4K_BLOCK_SIZE];
+
+    for (uint64_t b = 0; b < nblocks; b++) {
+        dequant_q4k_block_to_float(tensor_data + (base_block + b) * Q4K_BLOCK_BYTES, block_f32);
+        for (int i = 0; i < Q4K_BLOCK_SIZE; i++) {
+            uint64_t flat_idx = (base_block + b) * Q4K_BLOCK_SIZE + i;
+            uint64_t rel_idx = flat_idx - row_start_flat;
+            if (rel_idx >= (uint64_t)cols * 2) break;
+            int row = (int)(rel_idx / cols);
+            int col = (int)(rel_idx % cols);
+            int16_t w_i16 = (int16_t)roundf(block_f32[i] * row_inv[row]);
+            acc[row] += (int64_t)w_i16 * (int64_t)xq[col];
+        }
+    }
+
+    result[0] = acc[0];
+    result[1] = acc[1];
+}
 
 } // namespace fpga_sim

@@ -7,12 +7,14 @@ module tb_minimal_q4k;
     reg act_we; reg [5:0] act_addr; reg [15:0] act_din;
     reg [5:0] res_addr; wire [47:0] res_dout;
     wire sc_we = 0; wire [6:0] sc_addr = 0; wire [15:0] sc_din = 0;
+    wire mode_block_load = 0; wire decode_busy;
 
     matmul_q4k_core uut(.clk(clk),.rst_n(rst_n),.start(start),.op_vecmul(1),.done(done),.busy(busy),
         .wt_we(wt_we),.wt_addr(wt_addr),.wt_din(wt_din),
         .sc_we(sc_we),.sc_addr(sc_addr),.sc_din(sc_din),
         .act_we(act_we),.act_addr(act_addr),.act_din(act_din),
-        .res_addr(res_addr),.res_dout(res_dout));
+        .res_addr(res_addr),.res_dout(res_dout),
+        .mode_block_load(mode_block_load),.decode_busy(decode_busy));
 
     always #5 clk = ~clk;
     integer i, k;
