@@ -50,6 +50,14 @@ sim_cosim_q4k: $(COSIM_Q4K_SRC)
 	$(IVERILOG) $(FLAGS) -o $(COSIM_Q4K_TOP).vvp $(COSIM_Q4K_SRC)
 	$(VVP) $(COSIM_Q4K_TOP).vvp
 
+# ---- Q5_0 core test ----
+Q5_0_SRC  = matmul_q5_0_core.v tb_matmul_q5_0.v
+Q5_0_TOP  = tb_matmul_q5_0
+
+sim_q5_0: $(Q5_0_SRC)
+	$(IVERILOG) $(FLAGS) -o $(Q5_0_TOP).vvp $(Q5_0_SRC)
+	$(VVP) $(Q5_0_TOP).vvp
+
 # ---- INT16 core smoke test ----
 INT16_SRC  = matmul_int16_core.v tb_int16_smoke.v
 INT16_TOP  = tb_int16_smoke
@@ -58,16 +66,24 @@ sim_int16: $(INT16_SRC)
 	$(IVERILOG) $(FLAGS) -o $(INT16_TOP).vvp $(INT16_SRC)
 	$(VVP) $(INT16_TOP).vvp
 
-# ---- Q4_K 2x896 core test ----
-Q4K_2x896_SRC  = matmul_q4k_2x896_core.v tb_matmul_q4k_2x896.v
-Q4K_2x896_TOP  = tb_matmul_q4k_2x896
+# ---- Q6_K cosim ----
+COSIM_Q6K_TOP = tb_cosim_q6_k
+COSIM_Q6K_SRC = tb_cosim_q6_k.v matmul_q6_k_core.v
 
-sim_q4k_2x896: $(Q4K_2x896_SRC)
-	$(IVERILOG) $(FLAGS) -o $(Q4K_2x896_TOP).vvp $(Q4K_2x896_SRC)
-	$(VVP) $(Q4K_2x896_TOP).vvp
+sim_cosim_q6k: $(COSIM_Q6K_SRC)
+	$(IVERILOG) $(FLAGS) -o $(COSIM_Q6K_TOP).vvp $(COSIM_Q6K_SRC)
+	$(VVP) $(COSIM_Q6K_TOP).vvp
+
+# ---- Q5_0 cosim ----
+COSIM_Q5_0_TOP = tb_cosim_q5_0
+COSIM_Q5_0_SRC = tb_cosim_q5_0.v matmul_q5_0_core.v
+
+sim_cosim_q5_0: $(COSIM_Q5_0_SRC)
+	$(IVERILOG) $(FLAGS) -o $(COSIM_Q5_0_TOP).vvp $(COSIM_Q5_0_SRC)
+	$(VVP) $(COSIM_Q5_0_TOP).vvp
 
 # ---- Run all tests ----
-all: sim_q8 sim_q4k sim_q4k_min sim_int16 sim_q4k_2x896
+all: sim_q8 sim_q4k sim_q4k_min sim_int16 sim_q5_0
 
 # ---- Waveform viewing ----
 waves-q8:
@@ -78,9 +94,6 @@ waves-q4k:
 
 waves-cosim:
 	gtkwave tb_cosim.vcd
-
-waves-q4k-2x896:
-	gtkwave tb_q4k_2x896.vcd
 
 clean:
 	rm -f *.vvp *.vcd

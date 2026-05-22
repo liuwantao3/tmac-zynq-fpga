@@ -1,5 +1,5 @@
 #!/bin/bash
-# System integration test: exercises Q8_0 + Q4_K FPGA paths
+# System integration test: exercises Q8_0, Q5_0, Q6_K, Q4_K FPGA paths
 # Usage: ./scripts/test_integration.sh [--model /path/to/model.tmac]
 #
 # Prerequisites:
@@ -117,75 +117,104 @@ else
     FAIL=$((FAIL + 1))
 fi
 
-# ===========================================================================
-# Phase 5: Full inference — Q8_0 path
-# ===========================================================================
-if [ -n "$MODEL" ]; then
-    echo ""
-    echo "========================================"
-    echo "Phase 5: Full inference — Q8_0 FPGA path"
-    echo "========================================"
-
-    cd "$SIM_DIR"
-    printf "1 2 3 4 5" | ./tmac_gguf "$MODEL" --fpga-q8 2>&1 | grep -q '"id":5' \
-        && green "  PASS: Q8_0 inference produces token 5" \
-        || { red "  FAIL: Q8_0 inference"; FAIL=$((FAIL + 1)); }
-
     # ===========================================================================
-    # Phase 6: Full inference — Q4_K path
+    # Phase 5: Full inference — Q8_0 path
     # ===========================================================================
-    echo ""
-    echo "========================================"
-    echo "Phase 6: Full inference — Q4_K FPGA path"
-    echo "========================================"
+    if [ -n "$MODEL" ]; then
+        echo ""
+        echo "========================================"
+        echo "Phase 5: Full inference — Q8_0 FPGA path"
+        echo "========================================"
 
-    printf "1 2 3 4 5" | ./tmac_gguf "$MODEL" --fpga-q4k 2>&1 | grep -q '"id":5' \
-        && green "  PASS: Q4_K inference produces token 5" \
-        || { red "  FAIL: Q4_K inference"; FAIL=$((FAIL + 1)); }
+        cd "$SIM_DIR"
+        printf "1 2 3 4 5" | ./tmac_gguf "$MODEL" --fpga-q8 2>&1 | grep -q '"id":5' \
+            && green "  PASS: Q8_0 inference produces token 5" \
+            || { red "  FAIL: Q8_0 inference"; FAIL=$((FAIL + 1)); }
 
-    # ===========================================================================
-    # Phase 7: Output consistency check
-    # ===========================================================================
-    echo ""
-    echo "========================================"
-    echo "Phase 7: Output consistency — Q8_0 vs Q4_K vs CPU"
-    echo "========================================"
+        # ===========================================================================
+        # Phase 6: Full inference — Q5_0 path (attn Q/K/O, ffn gate/up)
+        # ===========================================================================
+        echo ""
+        echo "========================================"
+        echo "Phase 6: Full inference — Q5_0 FPGA path"
+        echo "========================================"
 
-    CPU_OUT=$(printf "1 2 3 4 5" | ./tmac_gguf "$MODEL" 2>&1 | grep -o '"id":5' || true)
-    Q8_OUT=$(printf "1 2 3 4 5" | ./tmac_gguf "$MODEL" --fpga-q8 2>&1 | grep -o '"id":5' || true)
-    Q4K_OUT=$(printf "1 2 3 4 5" | ./tmac_gguf "$MODEL" --fpga-q4k 2>&1 | grep -o '"id":5' || true)
+        printf "1 2 3 4 5" | ./tmac_gguf "$MODEL" --fpga-q5-0 2>&1 | grep -q '"id":5' \
+            && green "  PASS: Q5_0 inference produces token 5" \
+            || { red "  FAIL: Q5_0 inference"; FAIL=$((FAIL + 1)); }
 
-    if [ "$Q8_OUT" = "$CPU_OUT" ] && [ "$Q4K_OUT" = "$CPU_OUT" ]; then
-        green "  PASS: All paths produce same token 5 ($CPU_OUT)"
-        PASS=$((PASS + 3))
+        # ===========================================================================
+        # Phase 7: Full inference — Q6_K path (FFN down proj even layers)
+        # ===========================================================================
+        echo ""
+        echo "========================================"
+        echo "Phase 7: Full inference — Q6_K FPGA path"
+        echo "========================================"
+
+        printf "1 2 3 4 5" | ./tmac_gguf "$MODEL" --fpga-q6-k 2>&1 | grep -q '"id":5' \
+            && green "  PASS: Q6_K inference produces token 5" \
+            || { red "  FAIL: Q6_K inference"; FAIL=$((FAIL + 1)); }
+
+        # ===========================================================================
+        # Phase 8: Full inference — Q4_K path (FFN down proj odd layers)
+        # ===========================================================================
+        echo ""
+        echo "========================================"
+        echo "Phase 8: Full inference — Q4_K FPGA path"
+        echo "========================================"
+
+        printf "1 2 3 4 5" | ./tmac_gguf "$MODEL" --fpga-q4k 2>&1 | grep -q '"id":5' \
+            && green "  PASS: Q4_K inference produces token 5" \
+            || { red "  FAIL: Q4_K inference"; FAIL=$((FAIL + 1)); }
+
+        # ===========================================================================
+        # Phase 9: Full inference — Q5_0 + Q6_K + Q4_K combined path
+        # ===========================================================================
+        echo ""
+        echo "========================================"
+        echo "Phase 9: Full inference — Q5_0 + Q6_K + Q4_K combined"
+        echo "========================================"
+
+        printf "1 2 3 4 5" | ./tmac_gguf "$MODEL" --fpga-q5-0 --fpga-q6-k --fpga-q4k 2>&1 | grep -q '"id":5' \
+            && green "  PASS: Q5_0+Q6_K+Q4_K combined inference produces token 5" \
+            || { red "  FAIL: Q5_0+Q6_K+Q4_K combined inference"; FAIL=$((FAIL + 1)); }
+
+        # ===========================================================================
+        # Phase 10: Output consistency check
+        # ===========================================================================
+        echo ""
+        echo "========================================"
+        echo "Phase 10: Output consistency — all paths vs CPU"
+        echo "========================================"
+
+        CPU_OUT=$(printf "1 2 3 4 5" | ./tmac_gguf "$MODEL" 2>&1 | grep -o '"id":5' || true)
+        Q8_OUT=$(printf "1 2 3 4 5" | ./tmac_gguf "$MODEL" --fpga-q8 2>&1 | grep -o '"id":5' || true)
+        Q5_OUT=$(printf "1 2 3 4 5" | ./tmac_gguf "$MODEL" --fpga-q5-0 2>&1 | grep -o '"id":5' || true)
+        Q6_OUT=$(printf "1 2 3 4 5" | ./tmac_gguf "$MODEL" --fpga-q6-k 2>&1 | grep -o '"id":5' || true)
+        Q4_OUT=$(printf "1 2 3 4 5" | ./tmac_gguf "$MODEL" --fpga-q4k 2>&1 | grep -o '"id":5' || true)
+        ALL_OUT=$(printf "1 2 3 4 5" | ./tmac_gguf "$MODEL" --fpga-q5-0 --fpga-q6-k --fpga-q4k 2>&1 | grep -o '"id":5' || true)
+
+        echo "  CPU:   $CPU_OUT"
+        echo "  Q8:    $Q8_OUT"
+        echo "  Q5_0:  $Q5_OUT"
+        echo "  Q6_K:  $Q6_OUT"
+        echo "  Q4_K:  $Q4_OUT"
+        echo "  All:   $ALL_OUT"
+
+        [ "$Q8_OUT" = "$CPU_OUT" ] && green "  PASS: Q8_0 matches CPU" || { red "  FAIL: Q8_0 differs from CPU"; FAIL=$((FAIL + 1)); }
+        [ "$Q5_OUT" = "$CPU_OUT" ] && green "  PASS: Q5_0 matches CPU" || { red "  FAIL: Q5_0 differs from CPU"; FAIL=$((FAIL + 1)); }
+        [ "$Q6_OUT" = "$CPU_OUT" ] && green "  PASS: Q6_K matches CPU" || { red "  FAIL: Q6_K differs from CPU"; FAIL=$((FAIL + 1)); }
+        [ "$Q4_OUT" = "$CPU_OUT" ] && green "  PASS: Q4_K matches CPU" || { red "  FAIL: Q4_K differs from CPU"; FAIL=$((FAIL + 1)); }
+        [ "$ALL_OUT" = "$CPU_OUT" ] && green "  PASS: Q5_0+Q6_K+Q4_K combined matches CPU" || { red "  FAIL: Q5_0+Q6_K+Q4_K combined differs from CPU"; FAIL=$((FAIL + 1)); }
     else
-        echo "  CPU:  $CPU_OUT"
-        echo "  Q8:   $Q8_OUT"
-        echo "  Q4K:  $Q4K_OUT"
-        if [ "$Q8_OUT" = "$CPU_OUT" ]; then
-            green "  PASS: Q8_0 matches CPU"
-            PASS=$((PASS + 1))
-        else
-            red "  FAIL: Q8_0 differs from CPU"
-            FAIL=$((FAIL + 1))
-        fi
-        if [ "$Q4K_OUT" = "$CPU_OUT" ]; then
-            green "  PASS: Q4_K matches CPU"
-            PASS=$((PASS + 1))
-        else
-            red "  FAIL: Q4_K differs from CPU"
-            FAIL=$((FAIL + 1))
-        fi
+        echo ""
+        echo "========================================"
+        echo "Phases 5-10: SKIPPED (no model file)"
+        echo "========================================"
     fi
-else
-    echo ""
-    echo "========================================"
-    echo "Phases 5-7: SKIPPED (no model file)"
-    echo "========================================"
-fi
 
 # ===========================================================================
-# Phase 8: Cleanup
+# Phase 11: Cleanup
 # ===========================================================================
 cd "$VERILOG_DIR"
 rm -f tb_matmul_q4k.vvp tb_matmul_q4k.vcd tb_matmul_q8.vvp tb_matmul_q8.vcd 2>/dev/null || true

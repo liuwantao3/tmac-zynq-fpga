@@ -62,12 +62,12 @@ For square matrices this is irrelevant because `i*N + j == j + i*N` is false—w
 
 ```
 [d: f16][qh: u32][qs: u8×16]
- 0      1-2     3-6     7-22
+  0      1-4     5-20
 ```
 
-- `d` = f16 scale factor
-- `qh` = 32-bit mask (high bit for each element)
-- `qs` = 16 bytes = 32 nibbles (low 4 bits of each element)
+- `d` = f16 scale factor (bytes 0-1)
+- `qh` = 32-bit high bits, 1 bit per element (bytes 1-4)
+- `qs` = 16 bytes = 32 nibbles, low 4 bits of each element (bytes 5-20)
 
 **Element layout:**
 - j=0..15: `qs[j]` lower nibble, `qh` bit j
@@ -107,10 +107,64 @@ For element within half (pos=0..127):
 
 ```
 [d: f16][q: i8×32]
- 0-1     2-33
+  0-1     2-33
 ```
 
 Straightforward: `val = d * q`
+
+---
+
+## 2b. Tile Sizes & Implementation Reference
+
+### Cross-Reference: GGUF Format vs. Implementation Decisions
+
+| Type | Block | Block Bytes | Tensor Shape | Tile | Blocks/Tile | Bytes/Tile | weight_buf | Status |
+|------|-------|-------------|--------------|------|-------------|------------|------------|--------|
+| Q8_0 | 32 | 34 | 151936×896, 128×896 | 64×896 | — | 4100 | 4096 | ✅ `matmul_q8_core.v` |
+| Q5_0 | 32 | 22 | 896×896, 4864×896 | 8×896 | 224 | 4928 | 8192 | ✅ `matmul_q5_0_core.v` |
+| Q6_K | 256 | 210 | 896×4864 (even layers) | 32×256 | 32 | 6720 | 8192 | ✅ `matmul_q6_k_core.v` |
+| Q4_K | 256 | 144 | 896×4864 (odd layers) | 56×256 | 56 | 8064 | 8192 | ✅ `matmul_q4k_core.v` |
+| INT16 | — | — | any | 64×64 | — | 8192 | 8192 | ✅ `matmul_int16_core.v` |
+
+### Q5_0 Block Layout (22 bytes)
+```
+[d: f16][qh: u32][qs: u8×16]
+  0      1-4     5-20
+```
+- `d` = f16 scale factor
+- `qh` = 32-bit high bits (1 bit per element)
+- `qs` = 16 bytes = 32 nibbles (low 4 bits)
+
+**Decode:** `q = ((qh_bit << 4) | ql_nibble) - 16; val = d * q`
+
+### Q6_K Block Layout (210 bytes)
+```
+[ql: u8×128][qh: u8×64][scales: i8×16][d: f16]
+  0         127  128     191  192       207  208-209
+```
+Two 128-element halves. Each half has 64 ql nibbles + 32 qh bits + 8 scales.
+
+**Decode:** `q = ((qh_bits << 4) | ql_nibble) - 32; val = d * scales[scale_idx] * q`
+
+### Implementation Reference
+
+| New Core | Reference Implementation | Key Similarities |
+|----------|-------------------------|------------------|
+| `matmul_q5_0_core.v` | `matmul_q4k_2x896_core.v` (git history) | No wmem, block buffer, direct decode-to-accumulate, S24.8 fixed-point |
+| `matmul_q6_k_core.v` | `matmul_q4k_core.v` | Has wmem, DEC→DW0→DW1→COMPUTE pipeline, decode to INT16 then MAC |
+
+**Q5_0 vs Q4_K_2x896 differences:**
+- Block size: Q5_0 = 32 elements (not 256)
+- Block layout: Q5_0 = f16 + u32 + qs×16 (not f16 + f16 + scales×8 + qs×128)
+- No dmin in Q5_0 (single scale factor d only)
+- High bits: Q5_0 uses bit-mask qh (1 bit per element), not 2-bit per element
+- Tile: 224 blocks × 22B = 4928B (7 blocks × 144B = 1008B for Q4_K_2x896)
+
+**Q6_K vs Q4_K_core differences:**
+- Block layout: Q6_K = ql[128]+qh[64]+scales[16]+d (vs Q4_K = f16+f16+scales[8]+qs[128])
+- Two-half structure: Q6_K has explicit halves (0-127, 128-255) with scale indices per sub-block
+- No dmin in Q6_K (single d at bytes 208-209)
+- Tile: 32 blocks × 210B = 6720B (56 blocks × 144B = 8064B for Q4_K)
 
 ---
 

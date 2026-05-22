@@ -177,10 +177,16 @@ static int g_seq_len = 0;
 static bool g_use_fpga = false;
 static bool g_fpga_q8 = false;
 static bool g_fpga_q4k = false;
+static bool g_fpga_q5_0 = false;
+static bool g_fpga_q6_k = false;
 
 // Cosimulation tile dump
 static FILE* g_dump_file = nullptr;
+static FILE* g_dump_q6k_file = nullptr;
+static FILE* g_dump_q5_0_file = nullptr;
 static int g_dump_tiles_remaining = 0;
+static int g_dump_q6k_tiles_remaining = 0;
+static int g_dump_q5_0_tiles_remaining = 0;
 static constexpr int COSIM_TILE_SIZE = 4096 + 256 + 128 + 512; // weights + scales + vec + result
 
 // ===========================================================================
@@ -445,9 +451,9 @@ void get_logits_q8(float* logits, const float* hidden);
 
 void matmul(const Tensor* A, const float* x, float* y, int rows, int cols) {
     if (g_use_fpga) {
-        if (g_fpga_q4k && A->type == TENSOR_Q5_0) {
+        if (g_fpga_q5_0 && A->type == TENSOR_Q5_0) {
             matmul_fpga_q5_0(A, x, y, rows, cols);
-        } else if (g_fpga_q4k && A->type == TENSOR_Q6_K) {
+        } else if (g_fpga_q6_k && A->type == TENSOR_Q6_K) {
             matmul_fpga_q6_k(A, x, y, rows, cols);
         } else if (g_fpga_q4k && A->type == TENSOR_Q4_K) {
             matmul_fpga_q4_k(A, x, y, rows, cols);
@@ -824,10 +830,28 @@ void matmul_fpga_q5_0(const Tensor* A, const float* x, float* y, int rows, int c
                    fpga_sim::Q5_0_BLOCK_BYTES);
         }
 
-        fpga_sim::axi_vecmul_tile_q5_0_8x896_axilite(
-            blocks, x_q.data(), row_inv.data() + row0, tile_result.data(), row0);
+            fpga_sim::axi_vecmul_tile_q5_0_8x896_axilite(
+                blocks, x_q.data(), row_inv.data() + row0, tile_result.data(), row0);
 
-        fpga_sim::g_timing.total_tiles++;
+            // Cosimulation tile dump for Q5_0
+            if (g_dump_q5_0_file && g_dump_q5_0_tiles_remaining > 0) {
+                // Dump: blocks (4928) + activations (896) + row_inv (8*4) + expected result (8*8)
+                fwrite(blocks, 1, fpga_sim::Q5_0_224BLOCK_BYTES, g_dump_q5_0_file);
+                fwrite(x_q.data(), 2, 896, g_dump_q5_0_file);
+                fwrite(row_inv.data() + row0, 4, 8, g_dump_q5_0_file);
+                int64_t ref_result[8] = {0};
+                fpga_sim::axi_vecmul_tile_q5_0_8x896_axilite(
+                    blocks, x_q.data(), row_inv.data() + row0, ref_result, row0);
+                fwrite(ref_result, 8, 8, g_dump_q5_0_file);
+                g_dump_q5_0_tiles_remaining--;
+                if (g_dump_q5_0_tiles_remaining == 0) {
+                    fclose(g_dump_q5_0_file);
+                    g_dump_q5_0_file = nullptr;
+                    printf("[COSIM] Dumped all Q5_0 tiles to /tmp/cosim_tiles_q5_0.bin\n");
+                }
+            }
+
+            fpga_sim::g_timing.total_tiles++;
     }
 
     for (int i = 0; i < rows; i++) {
@@ -922,6 +946,25 @@ void matmul_fpga_q6_k(const Tensor* A, const float* x, float* y, int rows, int c
             fpga_sim::axi_vecmul_tile_q6_k_axilite(
                 blocks, nblocks, x_q.data() + c, fpga_sim::Q6_K_BLOCK_SIZE,
                 row_inv, tile_result, row0);
+
+            // Cosimulation tile dump for Q6_K
+            if (g_dump_q6k_file && g_dump_q6k_tiles_remaining > 0) {
+                // Dump: blocks (6720) + activations (256) + row_inv (32*4) + expected result (32*8)
+                fwrite(blocks, 1, fpga_sim::Q6_K_32BLOCK_BYTES, g_dump_q6k_file);
+                fwrite(x_q.data() + c, 2, fpga_sim::Q6_K_BLOCK_SIZE, g_dump_q6k_file);
+                fwrite(row_inv + row0, 4, 32, g_dump_q6k_file);
+                int64_t ref_result[32] = {0};
+                fpga_sim::axi_vecmul_tile_q6_k_axilite(
+                    blocks, nblocks, x_q.data() + c, fpga_sim::Q6_K_BLOCK_SIZE,
+                    row_inv, ref_result, row0);
+                fwrite(ref_result, 8, 32, g_dump_q6k_file);
+                g_dump_q6k_tiles_remaining--;
+                if (g_dump_q6k_tiles_remaining == 0) {
+                    fclose(g_dump_q6k_file);
+                    g_dump_q6k_file = nullptr;
+                    printf("[COSIM] Dumped all Q6_K tiles to /tmp/cosim_tiles_q6_k.bin\n");
+                }
+            }
 
             fpga_sim::g_timing.total_tiles++;
         }
@@ -1463,14 +1506,18 @@ void generate(float* hidden, float* logits, int prompt_len, int n_tokens, int to
 // ===========================================================================
 int main(int argc, char** argv) {
     if (argc < 2) {
-        printf("Usage: %s <model.tmac> [--generate N] [--dump-layers] [--fpga] [--fpga-int16] [--fpga-q8] [--fpga-q4k] [--perf] [--dump-tiles N]\n", argv[0]);
+        printf("Usage: %s <model.tmac> [--generate N] [--dump-layers] [--fpga] [--fpga-int16] [--fpga-q8] [--fpga-q4k] [--fpga-q5-0] [--fpga-q6-k] [--perf] [--dump-tiles N] [--dump-tiles-q6-k N] [--dump-tiles-q5-0 N]\n", argv[0]);
         printf("  Prompt tokens read from stdin, generated tokens printed to stdout\n");
         printf("  --fpga:       Same as --fpga-int16 (recommended path)\n");
         printf("  --fpga-int16: Pre-dequant all tensors to INT16 on CPU, INT16×INT16 FPGA path\n");
         printf("  --fpga-q8:    Q8_0 FPGA path for Q8_0 tensors (token embeddings), INT16 fallback\n");
-        printf("  --fpga-q4k:   INT16 FPGA path for Q4_K tensors (FFN layers), INT16 fallback for others\n");
+        printf("  --fpga-q4k:   Q4_K FPGA path for Q4_K tensors (FFN down proj odd), INT16 fallback\n");
+        printf("  --fpga-q5-0: Q5_0 FPGA path for Q5_0 tensors (attn Q/K/O, ffn gate/up), INT16 fallback\n");
+        printf("  --fpga-q6-k: Q6_K FPGA path for Q6_K tensors (FFN down proj even), INT16 fallback\n");
         printf("  --perf:       Enable pipeline profiling (Chrome trace JSON + bottleneck analysis)\n");
         printf("  --dump-tiles N: Dump first N Q8 tiles for Verilog cosimulation\n");
+        printf("  --dump-tiles-q6-k N: Dump first N Q6_K tiles for Verilog cosimulation\n");
+        printf("  --dump-tiles-q5-0 N: Dump first N Q5_0 tiles for Verilog cosimulation\n");
         return 1;
     }
 
@@ -1493,6 +1540,8 @@ int main(int argc, char** argv) {
         if (strcmp(argv[i], "--fpga-int16") == 0) { g_use_fpga = true; }
         if (strcmp(argv[i], "--fpga-q8") == 0) { g_use_fpga = true; g_fpga_q8 = true; }
         if (strcmp(argv[i], "--fpga-q4k") == 0) { g_use_fpga = true; g_fpga_q4k = true; }
+        if (strcmp(argv[i], "--fpga-q5-0") == 0) { g_use_fpga = true; g_fpga_q5_0 = true; }
+        if (strcmp(argv[i], "--fpga-q6-k") == 0) { g_use_fpga = true; g_fpga_q6_k = true; }
         if (strcmp(argv[i], "--perf") == 0) g_perf_enabled = true;
         if (strcmp(argv[i], "--dump-tiles") == 0 && i + 1 < argc) {
             int n = atoi(argv[++i]);
@@ -1503,6 +1552,30 @@ int main(int argc, char** argv) {
                     fwrite(header, 4, 4, g_dump_file);
                     g_dump_tiles_remaining = n;
                     printf("[COSIM] Dumping first %d Q8 tiles to /tmp/cosim_tiles.bin\n", n);
+                }
+            }
+        }
+        if (strcmp(argv[i], "--dump-tiles-q6-k") == 0 && i + 1 < argc) {
+            int n = atoi(argv[++i]);
+            if (n > 0) {
+                g_dump_q6k_file = fopen("/tmp/cosim_tiles_q6_k.bin", "wb");
+                if (g_dump_q6k_file) {
+                    uint32_t header[4] = {(uint32_t)n, 0, 0, 0};
+                    fwrite(header, 4, 4, g_dump_q6k_file);
+                    g_dump_q6k_tiles_remaining = n;
+                    printf("[COSIM] Dumping first %d Q6_K tiles to /tmp/cosim_tiles_q6_k.bin\n", n);
+                }
+            }
+        }
+        if (strcmp(argv[i], "--dump-tiles-q5-0") == 0 && i + 1 < argc) {
+            int n = atoi(argv[++i]);
+            if (n > 0) {
+                g_dump_q5_0_file = fopen("/tmp/cosim_tiles_q5_0.bin", "wb");
+                if (g_dump_q5_0_file) {
+                    uint32_t header[4] = {(uint32_t)n, 0, 0, 0};
+                    fwrite(header, 4, 4, g_dump_q5_0_file);
+                    g_dump_q5_0_tiles_remaining = n;
+                    printf("[COSIM] Dumping first %d Q5_0 tiles to /tmp/cosim_tiles_q5_0.bin\n", n);
                 }
             }
         }
