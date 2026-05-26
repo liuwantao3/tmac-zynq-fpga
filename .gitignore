@@ -28,6 +28,19 @@ vivado/vivado_project/
 vivado/*.jou
 vivado/*.str
 
+# Vivado projects & logs (any location)
+.Xil/
+**/proj_synth*/
+matmul_proj/
+vivado_*.jou
+vivado_*.backup.jou
+vivado.jou
+
+# Vivado local test files
+verilog/matmul_top_int16_only.v
+verilog/*.tcl
+verilog/*.xdc
+
 # Logs
 logs/
 *.log
