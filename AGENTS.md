@@ -152,3 +152,46 @@ python3 scripts/extract_tmac.py models/qwen2-0_5b-instruct-q4_k_m.gguf /tmp/mode
 - `docs/architecture.md` — Model, quantization formats
 - `docs/FPGA_PERFORMANCE_ANALYSIS.md` — Performance analysis
 - `docs/Q4_K_IMPLEMENTATION_PLAN.md` — Original plan (outdated)
+
+## Project State
+
+### Done
+
+- ✅ ~~`--dump-tiles` for Q4K AXI-Lite path~~
+- ✅ ~~`tb_cosim.v` for Q4_K~~
+- ✅ **`matmul_q4k_2x896_core.v`** — Verilog core + testbench done (8/8 tests pass)
+- ✅ **C++ dispatch** — `axi_vecmul_tile_q4k_2x896_axilite()` in `fpga_sim.hpp`, shape-based dispatch in `matmul_fpga_q4k()`
+- **INT16 core standalone P&R complete**: 3954 SLICE_LUTX, 2121 SLICE_FFX, 8 DSP48E1, 2 BRAM36, 1 BUFG — all 88 IOs routed on xc7z010clg400-1
+- **Bitstream generated**: valid Xilinx BIT data (2 MB) at `oss-tools/workspace/build/results/synth_top_int16.bit`
+- **Output register optimization**: removed async reset from output FFs to enable IOB OLOGIC packing, resolving previous `busy` routing failure
+- **JSON post-processing**: `$scopeinfo` cell removed via `clean -purge` in Yosys script (previously caused nextpnr `no BELs remaining` error)
+- **IOSTANDARD constraints**: per-bit XDC generation script for 88 pins solves previous P&R IOSTANDARD requirement
+- **`oss-tools/workspace/build/synth.ys`**: Yosys synthesis script with `clean -purge` to remove `$scopeinfo`
+- **`oss-tools/workspace/build/filter_json.py`**: JSON filter for scopeinfo removal (currently redundant with `clean -purge`)
+- **`axi_wrap_int16.v` BRAM inference fixed**: reworked weight_buf write port (single full-word write, no byte enables), removed async reset from load_addr, added pipelined read register — now infers 4 × RAMB36E1 (2 for core wmem + 2 for weight_buf) with 8 DSP48E1, 4277 FFs, 0 errors
+- **AXI address map refactored**: weights at 0x2000-0x3FFF (8 KB, 2048 × 32-bit), acts at 0x1000-0x107C, results at 0x4000-0x40FC/0x4200-0x427C, act readback at 0x5000-0x507C — no address conflicts
+- **ARM bare-metal toolchain installed**: `arm-none-eabi-gcc` 16.1.0 via Homebrew
+- **PS7 bare-metal C test program** at `oss-tools/workspace/sw/`: self-checking INT16 matmul test with UART output, embedded golden reference, verified packing logic
+
+### In Progress
+
+- **PS7 integration test**: needs Vivado block design (PS7 + AXI interconnect + axi_wrap_int16) to generate full bitstream; current PL-only bitstream has 117 AXI pins exceeding 100 IO limit (expected — AXI-Lite is internal to PS7)
+
+### Blocked
+
+- (none)
+
+### Next Steps
+
+1. Create Vivado block design integrating PS7, AXI interconnect, and `axi_wrap_int16.v`
+2. Import `sw/` bare-metal C code into Vitis, build, and run on Zynq hardware via JTAG
+3. Verify matmul results match `11 358 3003` inference output
+4. Synthesize and P&R the full `matmul_top.v` (quad-core) once the standalone flow is proven on hardware
+
+### Relevant Files
+
+- `oss-tools/workspace/rtl/synth_top_int16.v`: Standalone AXI4-Lite wrapper for INT16 core synthesis
+- `oss-tools/workspace/rtl/axi_wrap_int16.v`: Full AXI4-Lite INT16 wrapper (4 BRAM, 8 DSP, PS7-ready)
+- `oss-tools/workspace/Makefile`: synth/pnr/bit targets
+- `oss-tools/workspace/build/synth.ys`: Yosys synthesis script
+- `oss-tools/workspace/sw/`: Bare-metal PS7 C test code (main.c, uart.c, startup.s, link.ld, Makefile)

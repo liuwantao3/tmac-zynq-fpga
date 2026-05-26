@@ -3,6 +3,9 @@
 Thumbs.db
 
 # Compiled binaries (host)
+
+# OSS toolchain (synthesis, P&R, bitstream)
+oss-tools/
 sim/tmac_gguf
 sim/tmac_gguf_asan
 sim/tmac_gguf_dbg
