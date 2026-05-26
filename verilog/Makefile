@@ -58,6 +58,14 @@ sim_q5_0: $(Q5_0_SRC)
 	$(IVERILOG) $(FLAGS) -o $(Q5_0_TOP).vvp $(Q5_0_SRC)
 	$(VVP) $(Q5_0_TOP).vvp
 
+# ---- Q6_K core test ----
+Q6_K_SRC  = matmul_q6_k_core.v tb_matmul_q6_k.v
+Q6_K_TOP  = tb_matmul_q6_k
+
+sim_q6_k: $(Q6_K_SRC)
+	$(IVERILOG) $(FLAGS) -o $(Q6_K_TOP).vvp $(Q6_K_SRC)
+	$(VVP) $(Q6_K_TOP).vvp
+
 # ---- INT16 core smoke test ----
 INT16_SRC  = matmul_int16_core.v tb_int16_smoke.v
 INT16_TOP  = tb_int16_smoke
@@ -83,7 +91,7 @@ sim_cosim_q5_0: $(COSIM_Q5_0_SRC)
 	$(VVP) $(COSIM_Q5_0_TOP).vvp
 
 # ---- Run all tests ----
-all: sim_q8 sim_q4k sim_q4k_min sim_int16 sim_q5_0
+all: sim_q8 sim_q4k sim_int16 sim_q5_0 sim_q6_k
 
 # ---- Waveform viewing ----
 waves-q8:
