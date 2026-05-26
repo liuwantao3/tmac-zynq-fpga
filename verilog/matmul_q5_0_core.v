@@ -61,6 +61,22 @@ module matmul_q5_0_core (
     reg signed [31:0] r_prod;
     reg [2:0] r_prow;
 
+    // NOTE: All reg declarations must be at module level, NOT inside
+    // named begin..end blocks in case arms. Vivado (and most real
+    // tools) reject reg declarations inside case block bodies, even
+    // inside an explicit begin..end. Only some simulators (old
+    // iVerilog) accept it. This rule applies to ALL Verilog files in
+    // this project — keep regs at the top level.
+    reg [4:0]  exp_d;
+    reg [9:0]  mant_d;
+    reg signed [31:0] d_fp;
+    reg signed [15:0] q5;
+    reg signed [47:0] val_norm;
+    reg signed [15:0] dec;
+    reg qh_bit;
+    reg [3:0] ql_nibble;
+    reg [7:0] qs_byte;
+
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             state <= IDLE; ei <= 0;
@@ -93,16 +109,6 @@ module matmul_q5_0_core (
                 end
 
                 DEC: begin
-                    reg [4:0] exp_d;
-                    reg [9:0] mant_d;
-                    reg signed [31:0] d_fp;
-                    reg signed [15:0] q5;
-                    reg signed [47:0] val_norm;
-                    reg signed [15:0] dec;
-                    reg qh_bit;
-                    reg [3:0] ql_nibble;
-                    reg [7:0] qs_byte;
-
                     qs_byte = block_buf[(ei/32)*BLOCK_BYTES + 6 + r_wi[3:0]];
 
                     exp_d = r_f16_d[14:10];
