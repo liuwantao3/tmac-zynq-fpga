@@ -90,7 +90,18 @@ sim_cosim_q5_0: $(COSIM_Q5_0_SRC)
 	$(IVERILOG) $(FLAGS) -o $(COSIM_Q5_0_TOP).vvp $(COSIM_Q5_0_SRC)
 	$(VVP) $(COSIM_Q5_0_TOP).vvp
 
-# ---- Run all tests ----
+# ---- Phase B descriptor chain test ----
+PHASEB_TOP = tb_phaseb
+PHASEB_SRC = tb_phaseb.v matmul_top.v sim_ddr_axi_hp.v \
+             matmul_int16_core.v matmul_q8_core.v \
+             matmul_q4k_core.v matmul_q5_0_core.v matmul_q6_k_core.v \
+             axihp_read_master.v axihp_write_master.v
+
+sim_phaseb: $(PHASEB_SRC)
+	$(IVERILOG) $(FLAGS) -pARRAY_SIZE_LIMIT=268435456 -o $(PHASEB_TOP).vvp $(PHASEB_SRC)
+	$(VVP) $(PHASEB_TOP).vvp
+
+# ---- Run all tests (core unit tests only — phaseb requires C++ dump) ----
 all: sim_q8 sim_q4k sim_int16 sim_q5_0 sim_q6_k
 
 # ---- Waveform viewing ----
@@ -106,4 +117,4 @@ waves-cosim:
 clean:
 	rm -f *.vvp *.vcd
 
-.PHONY: all sim_q8 sim_q4k sim_q4k_min sim_cosim sim_cosim_q4k waves-q8 waves-q4k waves-cosim clean
+.PHONY: all sim_q8 sim_q4k sim_q4k_min sim_cosim sim_cosim_q4k sim_phaseb waves-q8 waves-q4k waves-cosim clean

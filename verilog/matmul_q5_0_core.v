@@ -115,7 +115,7 @@ module matmul_q5_0_core (
                     mant_d = r_f16_d[9:0];
                     if (exp_d == 0 || exp_d == 31) d_fp = 0;
                     else if (exp_d >= 17) d_fp = (32'd1024 + mant_d) << (exp_d - 17);
-                    else d_fp = (32'd1024 + mant_d) >> (17 - exp_d);
+                    else d_fp = ({1'b0, 32'd1024 + mant_d} + (1 << (17 - exp_d - 1))) >> (17 - exp_d);
 
                     qh_bit = r_qh[r_wi];
 
@@ -123,7 +123,8 @@ module matmul_q5_0_core (
 
                     q5 = ((qh_bit << 4) | ql_nibble) - 16;
 
-                    val_norm = d_fp * q5 * $signed(row_scale[r_row]);
+                    val_norm = d_fp * q5;
+                    val_norm = val_norm * $signed({1'b0, row_scale[r_row]});
                     val_norm = val_norm >>> 8;
 
                     if (val_norm > 32767) dec = 32767;
@@ -131,9 +132,13 @@ module matmul_q5_0_core (
                     else dec = val_norm[15:0];
 
                     r_prod <= $signed(dec) * $signed(act_reg[r_col]);
-                    r_prow <= r_row;
 
-                    acc[r_prow] <= acc[r_prow] + r_prod;
+                    acc[r_row] <= acc[r_row] + r_prod;
+
+                    if (ei < 5) begin
+                        $display("[CORE] ei=%0d row=%0d col=%0d d_fp=%0d q5=%0d val_norm=%0d dec=%0d act=%0d prod=%0d acc[%0d]=%0d",
+                                 ei, r_row, r_col, d_fp, q5, val_norm, dec, act_reg[r_col], r_prod, r_row, acc[r_row]);
+                    end
 
                     if (ei == TOTAL_ELTS - 1) begin
                         state <= DRAIN;
@@ -144,7 +149,6 @@ module matmul_q5_0_core (
                 end
 
                 DRAIN: begin
-                    acc[r_prow] <= acc[r_prow] + r_prod;
                     done <= 1; busy <= 0;
                     state <= IDLE;
                 end

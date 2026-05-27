@@ -24,11 +24,39 @@ module matmul_top (
     output reg  [1:0]   s_axil_rresp,
 
     // Interrupt
-    output reg          interrupt
+    output reg          interrupt,
+
+    // AXI HP read master (DDR → PL)
+    output wire [31:0]  m_axi_araddr,
+    output wire         m_axi_arvalid,
+    input  wire         m_axi_arready,
+    output wire [7:0]   m_axi_arlen,
+    output wire [2:0]   m_axi_arsize,
+    output wire [1:0]   m_axi_arburst,
+    input  wire [63:0]  m_axi_rdata,
+    input  wire         m_axi_rvalid,
+    output wire         m_axi_rready,
+    input  wire         m_axi_rlast,
+
+    // AXI HP write master (PL → DDR)
+    output wire [31:0]  m_axi_awaddr,
+    output wire         m_axi_awvalid,
+    input  wire         m_axi_awready,
+    output wire [7:0]   m_axi_awlen,
+    output wire [2:0]   m_axi_awsize,
+    output wire [1:0]   m_axi_awburst,
+    output wire [63:0]  m_axi_wdata,
+    output wire         m_axi_wvalid,
+    input  wire         m_axi_wready,
+    output wire         m_axi_wlast,
+    output wire [7:0]   m_axi_wstrb,
+    input  wire         m_axi_bvalid,
+    output wire         m_axi_bready,
+    input  wire  [1:0]  m_axi_bresp
 );
 
     // ======================================================================
-    // Parameters
+    // Parameters — register addresses
     // ======================================================================
     localparam REG_AP_CTRL   = 16'h0000;
     localparam REG_GIE       = 16'h0004;
@@ -36,19 +64,10 @@ module matmul_top (
     localparam REG_ISR       = 16'h000C;
     localparam REG_CTRL_USER = 16'h0010;
     localparam REG_STATUS    = 16'h0014;
-
-    // Data buffer base addresses (word-aligned)
-    localparam BUF_WEIGHT_BASE    = 16'h0400;  // AXI addr 0x1000 >> 2
-    localparam BUF_WEIGHT_END     = 16'h07FF;  // AXI addr 0x1FFF >> 2 (Q8: 4KB)
-    localparam BUF_WEIGHT_EXT_END = 16'h0BFF;  // AXI addr 0x2FFF >> 2 (INT16: 8192 bytes)
-    localparam BUF_SCALE_BASE  = 16'h0800;  // AXI addr 0x2000 >> 2
-    localparam BUF_SCALE_END   = 16'h0803;  // 128 entries = 64 words
-    localparam BUF_ACT_BASE    = 16'h0840;  // AXI addr 0x2100 >> 2
-    localparam BUF_ACT_END     = 16'h0847;  // 64 entries = 32 words
-    localparam BUF_RES_BASE    = 16'h1000;  // AXI addr 0x4000 >> 2
-    localparam BUF_RES_END     = 16'h103F;  // 64 entries = 64 words (lower 32b)
-    localparam BUF_RES_HI_BASE = 16'h1080;  // AXI addr 0x4200 >> 2
-    localparam BUF_RES_HI_END  = 16'h109F;  // upper 16b of 64 entries
+    localparam REG_DESC_BASE = 16'h0018;
+    localparam REG_DESC_TAIL = 16'h001C;
+    localparam REG_DESC_HEAD = 16'h0020;
+    localparam REG_CHAIN_CTRL= 16'h0024;
 
     // ======================================================================
     // Register file
@@ -59,76 +78,61 @@ module matmul_top (
     reg [31:0] reg_isr;
     reg [31:0] reg_ctrl_user;
     reg [31:0] reg_status;
+    reg [31:0] reg_desc_base;
+    reg [31:0] reg_desc_tail;
+    reg [31:0] reg_desc_head;
+    reg [31:0] reg_chain_ctrl;
 
     // ======================================================================
-    // Mode selection (mutually exclusive in practice)
-    //   bit 4 = CTRL_MODE_INT16, bit 5 = CTRL_MODE_Q8PATH, bit 6 = CTRL_MODE_Q4K
-    //   Default (no bits) = Q8 for backward compat
+    // Mode wires  — bit[8:4] of reg_ctrl_user
+    //   4=INT16, 5=Q8_0, 6=Q4_K, 7=Q5_0, 8=Q6_K
+    //   Default (none set) = Q8 for backward compat
     // ======================================================================
-    wire mode_int16;
-    wire mode_q8;
-    wire mode_q4k;
-    assign mode_q4k   = reg_ctrl_user[6];
-    assign mode_q8    = reg_ctrl_user[5] || (!reg_ctrl_user[4] && !reg_ctrl_user[6]);
-    assign mode_int16 = reg_ctrl_user[4];
+    wire mode_int16 = reg_ctrl_user[4];
+    wire mode_q8    = reg_ctrl_user[5] || (!reg_ctrl_user[4] && !reg_ctrl_user[6]
+                                        && !reg_ctrl_user[7] && !reg_ctrl_user[8]);
+    wire mode_q4k   = reg_ctrl_user[6];
+    wire mode_q5_0  = reg_ctrl_user[7];
+    wire mode_q6_k  = reg_ctrl_user[8];
 
     // ======================================================================
-    // Data buffer memories
+    // Internal buffers
     // ======================================================================
-    reg [7:0]  weight_buf [0:8191];  // Shared: INT16=8192B, Q8=4096B, Q4K=32256B
-    reg [15:0] scale_buf  [0:895];  // Q8: 128 entries, Q4K: 896 entries for row_scale
-    reg [15:0] act_buf    [0:63];
+    reg [15:0] act_buf    [0:895];  // max columns (Q5_0)
     reg [47:0] result_buf [0:63];
 
-    integer bi;
-
     // ======================================================================
-    // Core connections
+    // Core shared signals
     // ======================================================================
     wire        core_start;
-    wire        core_op_vecmul;
     wire        core_done;
     wire        core_busy;
-
-    // INT16 core signals
-    reg         int16_wt_we;
-    reg [12:0]  int16_wt_addr;
-    reg [7:0]   int16_wt_din;
-    wire        int16_done, int16_busy;
-    wire [47:0] int16_res_dout;
-
-    // Q8 core signals
-    wire        q8_done, q8_busy;
-    wire [47:0] q8_res_dout;
-
-    // Q4K core signals
-    reg         q4k_wt_we;
-    reg [12:0]  q4k_wt_addr;
-    reg [7:0]   q4k_wt_din;
-    wire        q4k_done, q4k_busy, q4k_decode_busy;
-    wire [47:0] q4k_res_dout;
-
-    // Core shared interfaces (Q8 core uses these directly; INT16/Q4K use dedicated signals)
+    reg  [7:0]  wt_din;
+    reg  [12:0] wt_addr;
     reg         wt_we;
-    reg [11:0]  wt_addr;
-    reg [7:0]   wt_din;
+    reg  [15:0] sc_din;
+    reg  [9:0]  sc_addr;
     reg         sc_we;
-    reg [6:0]   sc_addr;
-    reg [15:0]  sc_din;
+    reg  [15:0] act_din;
+    reg  [9:0]  act_addr;
     reg         act_we;
-    reg [5:0]   act_addr;
-    reg [15:0]  act_din;
     wire [5:0]  res_addr;
     wire [47:0] res_dout;
 
     // ======================================================================
-    // Core instantiation 1: matmul_int16_core — general INT16×INT16
+    // INT16 core signals
     // ======================================================================
+    reg  [12:0] int16_wt_addr;
+    reg  [7:0]  int16_wt_din;
+    reg         int16_wt_we;
+    wire        int16_done, int16_busy;
+    wire [47:0] int16_res_dout;
+
     matmul_int16_core u_core_int16 (
         .clk       (clk),
         .rst_n     (rst_n),
         .start     (core_start & mode_int16),
-        .op_vecmul (core_op_vecmul),
+        .op_vecmul (1'b1),
         .done      (int16_done),
         .busy      (int16_busy),
         .wt_we     (int16_wt_we),
@@ -138,43 +142,52 @@ module matmul_top (
         .sc_addr   (7'd0),
         .sc_din    (16'd0),
         .act_we    (act_we),
-        .act_addr  (act_addr),
+        .act_addr  (act_addr[5:0]),
         .act_din   (act_din),
-        .res_addr  (res_addr),
+        .res_addr  (res_addr[5:0]),
         .res_dout  (int16_res_dout)
     );
 
     // ======================================================================
-    // Core instantiation 2: matmul_q8_core — Q8_0 dequant + INT16 compute
+    // Q8 core signals
     // ======================================================================
+    wire        q8_done, q8_busy;
+    wire [47:0] q8_res_dout;
+
     matmul_q8_core u_core_q8 (
         .clk       (clk),
         .rst_n     (rst_n),
         .start     (core_start & mode_q8),
-        .op_vecmul (core_op_vecmul),
+        .op_vecmul (1'b1),
         .done      (q8_done),
         .busy      (q8_busy),
         .wt_we     (wt_we),
-        .wt_addr   (wt_addr),
+        .wt_addr   (wt_addr[11:0]),
         .wt_din    (wt_din),
         .sc_we     (sc_we),
-        .sc_addr   (sc_addr),
+        .sc_addr   (sc_addr[6:0]),
         .sc_din    (sc_din),
         .act_we    (act_we),
-        .act_addr  (act_addr),
+        .act_addr  (act_addr[5:0]),
         .act_din   (act_din),
-        .res_addr  (res_addr),
+        .res_addr  (res_addr[5:0]),
         .res_dout  (q8_res_dout)
     );
 
     // ======================================================================
-    // Core instantiation 3: matmul_q4k_core — Q4_K block decode + INT16 compute
+    // Q4K core signals (byte-wide block_buf, auto-increment write_ptr)
     // ======================================================================
+    reg         q4k_wt_we;
+    reg  [12:0] q4k_wt_addr;
+    reg  [7:0]  q4k_wt_din;
+    wire        q4k_done, q4k_busy, q4k_decode_busy;
+    wire [47:0] q4k_res_dout;
+
     matmul_q4k_core u_core_q4k (
         .clk       (clk),
         .rst_n     (rst_n),
         .start     (core_start & mode_q4k),
-        .op_vecmul (core_op_vecmul),
+        .op_vecmul (1'b1),
         .done      (q4k_done),
         .busy      (q4k_busy),
         .wt_we     (q4k_wt_we),
@@ -184,37 +197,92 @@ module matmul_top (
         .sc_addr   (7'd0),
         .sc_din    (16'd0),
         .act_we    (act_we),
-        .act_addr  (act_addr),
+        .act_addr  (act_addr[7:0]),
         .act_din   (act_din),
-        .res_addr  (res_addr),
+        .res_addr  (res_addr[5:0]),
         .res_dout  (q4k_res_dout),
         .mode_block_load (mode_q4k),
         .decode_busy     (q4k_decode_busy)
     );
 
     // ======================================================================
-    // 3-way mux: select done/busy/results from active core
+    // Q5_0 core  (8×896 tile, 224 × 22-byte blocks)
     // ======================================================================
-    assign core_done = mode_q4k  ? q4k_done  :
-                       mode_q8   ? q8_done   : int16_done;
-    assign core_busy = mode_q4k  ? (q4k_busy | q4k_decode_busy) :
-                       mode_q8   ? q8_busy   : int16_busy;
-    assign res_dout  = mode_q4k  ? q4k_res_dout  :
-                       mode_q8   ? q8_res_dout   : int16_res_dout;
+    wire        q5_0_done, q5_0_busy;
+    wire [47:0] q5_0_res_dout;
+
+    matmul_q5_0_core u_core_q5_0 (
+        .clk       (clk),
+        .rst_n     (rst_n),
+        .start     (core_start & mode_q5_0),
+        .done      (q5_0_done),
+        .busy      (q5_0_busy),
+        .wt_we     (wt_we),
+        .wt_addr   (wt_addr),
+        .wt_din    (wt_din),
+        .sc_we     (sc_we),
+        .sc_addr   (sc_addr[2:0]),
+        .sc_din    (sc_din),
+        .act_we    (act_we),
+        .act_addr  (act_addr),
+        .act_din   (act_din),
+        .res_addr  (res_addr[2:0]),
+        .res_dout  (q5_0_res_dout)
+    );
 
     // ======================================================================
-    // AXI-Lite write transaction
+    // Q6_K core (32×256 tile, 32 × 210-byte blocks, auto-increment write_ptr)
+    // ======================================================================
+    wire        q6_k_done, q6_k_busy, q6_k_decode_busy;
+    wire [47:0] q6_k_res_dout;
+
+    matmul_q6_k_core u_core_q6_k (
+        .clk       (clk),
+        .rst_n     (rst_n),
+        .start     (core_start & mode_q6_k),
+        .op_vecmul (1'b1),
+        .done      (q6_k_done),
+        .busy      (q6_k_busy),
+        .wt_we     (wt_we),
+        .wt_addr   (wt_addr),
+        .wt_din    (wt_din),
+        .sc_we     (sc_we),
+        .sc_addr   (sc_addr[4:0]),
+        .sc_din    (sc_din),
+        .act_we    (act_we),
+        .act_addr  (act_addr[7:0]),
+        .act_din   (act_din),
+        .res_addr  (res_addr[4:0]),
+        .res_dout  (q6_k_res_dout),
+        .mode_block_load (mode_q6_k),
+        .decode_busy     (q6_k_decode_busy)
+    );
+
+    // ======================================================================
+    // 5-way mux: select done/busy/results from active core
+    // ======================================================================
+    assign core_done = mode_q5_0  ? q5_0_done        :
+                       mode_q6_k  ? q6_k_done         :
+                       mode_q4k   ? q4k_done          :
+                       mode_q8    ? q8_done           : int16_done;
+    assign core_busy = mode_q5_0  ? q5_0_busy         :
+                       mode_q6_k  ? (q6_k_busy | q6_k_decode_busy) :
+                       mode_q4k   ? (q4k_busy | q4k_decode_busy) :
+                       mode_q8    ? q8_busy           : int16_busy;
+    assign res_dout  = mode_q5_0  ? q5_0_res_dout     :
+                       mode_q6_k  ? q6_k_res_dout     :
+                       mode_q4k   ? q4k_res_dout      :
+                       mode_q8    ? q8_res_dout       : int16_res_dout;
+
+    // ======================================================================
+    // AXI4-Lite write FSM
     // ======================================================================
     reg [1:0] wstate;
-    localparam W_IDLE = 0, W_WAIT = 1, W_RESP = 2;
-
-    wire is_ctrl_write, is_buf_write;
-    assign is_ctrl_write = (s_axil_awaddr[15:12] == 0);
-    assign is_buf_write  = (s_axil_awaddr[15:12] == 1 || s_axil_awaddr[15:12] == 2);
+    localparam W_IDLE = 0, W_RESP = 1, W_RESP2 = 2;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            wstate <= W_IDLE;
+            wstate         <= W_IDLE;
             s_axil_awready <= 0;
             s_axil_wready  <= 0;
             s_axil_bvalid  <= 0;
@@ -224,6 +292,9 @@ module matmul_top (
             reg_ier        <= 0;
             reg_isr        <= 0;
             reg_ctrl_user  <= 0;
+            reg_desc_base  <= 0;
+            reg_desc_tail  <= 0;
+            reg_chain_ctrl <= 0;
         end else begin
             case (wstate)
                 W_IDLE: begin
@@ -232,33 +303,34 @@ module matmul_top (
                     if (s_axil_awvalid && s_axil_wvalid) begin
                         s_axil_awready <= 0;
                         s_axil_wready  <= 0;
-
-                        // Control register writes
-                        if (is_ctrl_write) begin
-                            case (s_axil_awaddr)
-                                REG_AP_CTRL:   reg_ap_ctrl   <= s_axil_wdata;
-                                REG_GIE:       reg_gie       <= s_axil_wdata;
-                                REG_IER:       reg_ier       <= s_axil_wdata;
-                                REG_CTRL_USER: reg_ctrl_user <= s_axil_wdata;
-                                REG_ISR: begin
-                                    if (s_axil_wdata[0])
-                                        reg_isr[0] <= 0;
+                        case (s_axil_awaddr)
+                            REG_AP_CTRL:   reg_ap_ctrl   <= s_axil_wdata;
+                            REG_GIE:       reg_gie       <= s_axil_wdata;
+                            REG_IER:       reg_ier       <= s_axil_wdata;
+                            REG_CTRL_USER: reg_ctrl_user <= s_axil_wdata;
+                            REG_DESC_BASE: reg_desc_base <= s_axil_wdata;
+                            REG_DESC_TAIL: reg_desc_tail <= s_axil_wdata;
+                            REG_CHAIN_CTRL:begin
+                                reg_chain_ctrl <= s_axil_wdata;
+                                if (s_axil_wdata[1]) begin
+                                    reg_desc_head <= 0;
+                                    reg_chain_ctrl[2] <= 0;
                                 end
-                            endcase
-                        end
-
-                        // Buffer writes (into weight/scale/act memories)
-                        if (is_buf_write) begin
-                            write_buffer(s_axil_awaddr, s_axil_wdata, s_axil_wstrb);
-                        end
-
+                            end
+                            REG_ISR: begin
+                                if (s_axil_wdata[0])
+                                    reg_isr[0] <= 0;
+                            end
+                        endcase
                         wstate <= W_RESP;
                     end
                 end
-
                 W_RESP: begin
                     s_axil_bvalid <= 1;
                     s_axil_bresp  <= 2'b00;
+                    wstate <= W_RESP2;
+                end
+                W_RESP2: begin
                     if (s_axil_bready) begin
                         s_axil_bvalid <= 0;
                         wstate <= W_IDLE;
@@ -269,60 +341,10 @@ module matmul_top (
     end
 
     // ======================================================================
-    // Buffer write helper
-    //   In INT16/Q4K mode the full 0x1000-0x2FFF range maps to weight_buf;
-    //   scale_buf and act_buf at 0x2000-0x217F are unused.
-    //   In Q8 mode (default), 0x2000-0x20FF → scale_buf, 0x2100-0x217F → act_buf.
-    // ======================================================================
-    wire mode_bypass_guard = mode_int16 | mode_q4k;
-
-    task write_buffer(input [15:0] addr, input [31:0] data, input [3:0] strb);
-        reg [11:0] word_off;
-        begin
-            word_off = addr[13:2];
-
-            // Scales: 0x2000-0x23FF (Q8: 128 entries, Q4K: 896 entries for row_scale)
-            if (mode_q8 &&
-                word_off >= BUF_SCALE_BASE && word_off <= BUF_SCALE_END) begin
-                scale_buf[(word_off - BUF_SCALE_BASE) * 2 + 0] <= data[15:0];
-                scale_buf[(word_off - BUF_SCALE_BASE) * 2 + 1] <= data[31:16];
-            end
-            // Q4K row_scale: 896 entries at 0x2000-0x23FF
-            if (mode_q4k &&
-                word_off >= BUF_SCALE_BASE && word_off <= (BUF_SCALE_BASE + 223)) begin
-                scale_buf[(word_off - BUF_SCALE_BASE) * 2 + 0] <= data[15:0];
-                scale_buf[(word_off - BUF_SCALE_BASE) * 2 + 1] <= data[31:16];
-            end
-
-            // Activations: 0x2100-0x217F (Q8 and INT16 modes)
-            if (!(mode_q4k) &&
-                word_off >= BUF_ACT_BASE && word_off <= BUF_ACT_END) begin
-                act_buf[(word_off - BUF_ACT_BASE) * 2 + 0] <= data[15:0];
-                act_buf[(word_off - BUF_ACT_BASE) * 2 + 1] <= data[31:16];
-            end
-
-            // Weights: 0x1000-0x1FFF (Q8) or 0x1000-0x2FFF (INT16/Q4K)
-            if (word_off >= BUF_WEIGHT_BASE && word_off <= BUF_WEIGHT_EXT_END) begin
-                if (mode_bypass_guard ||
-                    !(word_off >= BUF_SCALE_BASE && word_off <= BUF_SCALE_END) &&
-                    !(word_off >= BUF_ACT_BASE && word_off <= BUF_ACT_END)) begin
-                    if (strb[0]) weight_buf[(word_off - BUF_WEIGHT_BASE) * 4 + 0] <= data[7:0];
-                    if (strb[1]) weight_buf[(word_off - BUF_WEIGHT_BASE) * 4 + 1] <= data[15:8];
-                    if (strb[2]) weight_buf[(word_off - BUF_WEIGHT_BASE) * 4 + 2] <= data[23:16];
-                    if (strb[3]) weight_buf[(word_off - BUF_WEIGHT_BASE) * 4 + 3] <= data[31:24];
-                end
-            end
-        end
-    endtask
-
-    // ======================================================================
-    // AXI-Lite read transaction
+    // AXI4-Lite read FSM
     // ======================================================================
     reg [1:0] rstate;
-    localparam R_IDLE = 0, R_DATA = 1;
-
-    wire [11:0] rd_word;
-    assign rd_word = s_axil_araddr[13:2];
+    localparam R_IDLE = 0, R_DATA = 1, R_DATA2 = 2;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -338,7 +360,6 @@ module matmul_top (
                     if (s_axil_arvalid) begin
                         s_axil_arready <= 0;
                         rstate <= R_DATA;
-
                         case (s_axil_araddr)
                             REG_AP_CTRL:   s_axil_rdata <= reg_ap_ctrl;
                             REG_GIE:       s_axil_rdata <= reg_gie;
@@ -346,33 +367,20 @@ module matmul_top (
                             REG_ISR:       s_axil_rdata <= reg_isr;
                             REG_CTRL_USER: s_axil_rdata <= reg_ctrl_user;
                             REG_STATUS:    s_axil_rdata <= reg_status;
-                            default: begin
-                                if (rd_word >= BUF_SCALE_BASE && rd_word <= BUF_SCALE_END) begin
-                                    s_axil_rdata <= {scale_buf[(rd_word - BUF_SCALE_BASE) * 2 + 1],
-                                                     scale_buf[(rd_word - BUF_SCALE_BASE) * 2 + 0]};
-                                end else if (rd_word >= BUF_ACT_BASE && rd_word <= BUF_ACT_END) begin
-                                    s_axil_rdata <= {act_buf[(rd_word - BUF_ACT_BASE) * 2 + 1],
-                                                     act_buf[(rd_word - BUF_ACT_BASE) * 2 + 0]};
-                                end else if (rd_word >= BUF_WEIGHT_BASE && rd_word <= BUF_WEIGHT_EXT_END) begin
-                                    s_axil_rdata <= {weight_buf[(rd_word - BUF_WEIGHT_BASE) * 4 + 3],
-                                                     weight_buf[(rd_word - BUF_WEIGHT_BASE) * 4 + 2],
-                                                     weight_buf[(rd_word - BUF_WEIGHT_BASE) * 4 + 1],
-                                                     weight_buf[(rd_word - BUF_WEIGHT_BASE) * 4 + 0]};
-                                end else if (rd_word >= BUF_RES_BASE && rd_word <= BUF_RES_END) begin
-                                    s_axil_rdata <= result_buf[rd_word - BUF_RES_BASE][31:0];
-                                end else if (rd_word >= BUF_RES_HI_BASE && rd_word <= BUF_RES_HI_END) begin
-                                    s_axil_rdata <= {16'b0, result_buf[rd_word - BUF_RES_HI_BASE][47:32]};
-                                end else begin
-                                    s_axil_rdata <= 32'h0;
-                                end
-                            end
+                            REG_DESC_BASE: s_axil_rdata <= reg_desc_base;
+                            REG_DESC_TAIL: s_axil_rdata <= reg_desc_tail;
+                            REG_DESC_HEAD: s_axil_rdata <= reg_desc_head;
+                            REG_CHAIN_CTRL:s_axil_rdata <= reg_chain_ctrl;
+                            default:       s_axil_rdata <= 32'h0;
                         endcase
                     end
                 end
-
                 R_DATA: begin
                     s_axil_rvalid <= 1;
                     s_axil_rresp  <= 2'b00;
+                    rstate <= R_DATA2;
+                end
+                R_DATA2: begin
                     if (s_axil_rready) begin
                         s_axil_rvalid <= 0;
                         rstate <= R_IDLE;
@@ -383,158 +391,587 @@ module matmul_top (
     end
 
     // ======================================================================
-    // Data loading FSM — copies from weight_buf/scale_buf/act_buf into core
+    // HP Read Master — byte-stream output, one byte per data_valid cycle
     // ======================================================================
-    reg        loading;
-    reg [12:0] load_addr;
-    reg [2:0]  load_phase;
+    wire        hp_read_busy;
+    wire        hp_read_done;
+    reg  [31:0] hp_read_addr;
+    reg  [7:0]  hp_read_len;
+    wire [7:0]  hp_read_data;
+    wire        hp_read_valid;
+    reg         hp_read_ready;
+    reg         hp_read_start_raw;
 
-    localparam LP_IDLE   = 0;
-    localparam LP_WEIGHT = 1;
-    localparam LP_SCALE  = 2;
-    localparam LP_ACT    = 3;
-    localparam LP_DONE   = 4;
+    axihp_read_master u_hp_read (
+        .clk         (clk),
+        .rst_n       (rst_n),
+        .start       (hp_read_start_raw),
+        .src_addr    (hp_read_addr),
+        .burst_len   (hp_read_len),
+        .done        (hp_read_done),
+        .busy        (hp_read_busy),
+        .data_out    (hp_read_data),
+        .data_valid  (hp_read_valid),
+        .data_ready  (hp_read_ready),
+        .m_axi_araddr (m_axi_araddr),
+        .m_axi_arvalid(m_axi_arvalid),
+        .m_axi_arready(m_axi_arready),
+        .m_axi_arlen  (m_axi_arlen),
+        .m_axi_arsize (m_axi_arsize),
+        .m_axi_arburst(m_axi_arburst),
+        .m_axi_rdata  (m_axi_rdata),
+        .m_axi_rvalid (m_axi_rvalid),
+        .m_axi_rready (m_axi_rready),
+        .m_axi_rlast  (m_axi_rlast)
+    );
 
-    // INT16 weight bytes:  8192 (64 cols × 64 rows × 2 bytes)
-    // Q8   weight bytes:  4096 (64 cols × 64 rows × 1 byte)
-    // Q4K  weight bytes: 32256 (224 blocks × 144 bytes = 896 rows × 64 cols)
-    localparam INT16_WEIGHT_BYTES = 14'd8192;
-    localparam Q8_WEIGHT_BYTES    = 13'd4096;
-    localparam Q4K_WEIGHT_BYTES  = 15'd32256;
+    // hp_read_start_raw is a single-cycle pulse from the FSM — connect directly
 
-    assign core_start     = reg_ap_ctrl[0] && !core_busy && !loading;
-    assign core_op_vecmul = reg_ctrl_user[3];
+    // ======================================================================
+    // HP Write Master — 64-bit word input
+    // ======================================================================
+    reg         hp_write_start;
+    reg  [31:0] hp_write_addr;
+    reg  [15:0] hp_write_count;
+    wire        hp_write_busy;
+    wire        hp_write_done;
+    reg  [63:0] hp_write_data;
+    reg         hp_write_valid;
+    wire        hp_write_ready;
+
+    axihp_write_master u_hp_write (
+        .clk          (clk),
+        .rst_n        (rst_n),
+        .start        (hp_write_start),
+        .dst_addr     (hp_write_addr),
+        .word_count   (hp_write_count),
+        .busy         (hp_write_busy),
+        .done         (hp_write_done),
+        .wdata        (hp_write_data),
+        .wvalid       (hp_write_valid),
+        .wready       (hp_write_ready),
+        .m_axi_awaddr (m_axi_awaddr),
+        .m_axi_awvalid(m_axi_awvalid),
+        .m_axi_awready(m_axi_awready),
+        .m_axi_awlen  (m_axi_awlen),
+        .m_axi_awsize (m_axi_awsize),
+        .m_axi_awburst(m_axi_awburst),
+        .m_axi_wdata  (m_axi_wdata),
+        .m_axi_wvalid (m_axi_wvalid),
+        .m_axi_wready (m_axi_wready),
+        .m_axi_wlast  (m_axi_wlast),
+        .m_axi_wstrb  (m_axi_wstrb),
+        .m_axi_bvalid (m_axi_bvalid),
+        .m_axi_bready (m_axi_bready),
+        .m_axi_bresp  (m_axi_bresp)
+    );
+
+    // ======================================================================
+    // Descriptor buffer — 32 bytes, read from DDR
+    // ======================================================================
+    reg [7:0]  desc_buf [0:31];
+    reg [4:0]  desc_byte_idx;
+
+    // Parsed descriptor fields (latched from desc_buf)
+    reg [31:0] desc_next_addr;
+    reg [31:0] desc_weight_addr;
+    reg [31:0] desc_act_addr;
+    reg [31:0] desc_result_addr;
+    reg [15:0] desc_num_tiles;
+    reg [15:0] desc_tile_bytes;
+    reg [7:0]  desc_tensor_type;
+    reg [7:0]  desc_tile_res_rows;
+    reg [7:0]  desc_flags;
+    reg [15:0] desc_act_total_bytes;
+    reg [7:0]  desc_num_col_groups;
+
+    // ======================================================================
+    // Descriptor chain FSM
+    // ======================================================================
+    localparam PH_IDLE          = 5'd0;
+    localparam PH_FETCH_DESC    = 5'd1;
+    localparam PH_FETCH_WAIT    = 5'd2;
+    localparam PH_LOAD_ACT      = 5'd3;
+    localparam PH_LOAD_ACT_WAIT = 5'd4;
+    localparam PH_LOAD_WEIGHT   = 5'd5;
+    localparam PH_WEIGHT_START  = 5'd6;
+    localparam PH_WEIGHT_WAIT   = 5'd7;
+    localparam PH_TILE_START    = 5'd8;
+    localparam PH_TILE_WAIT     = 5'd9;
+    localparam PH_WRITE_ACT     = 5'd10;
+    localparam PH_WRITE_RESULT  = 5'd11;
+    localparam PH_WRITE_WAIT    = 5'd12;
+    localparam PH_ADVANCE_DESC  = 5'd13;
+
+    reg [4:0]  ph_state;
+    reg        desc_chain_busy;
+    reg        desc_chain_enable;
+    reg        desc_irq;
+
+    // Tile tracking
+    reg [15:0] tile_count;        // tile within current descriptor
+    reg [15:0] burst_bytes_rem;   // remaining bytes in current tile's weight
+    reg [31:0] burst_addr;        // current read address for multi-burst transfer
+    reg [15:0] write_count;       // bytes written to weight buffer so far
+    reg        weight_loading;    // in weight-loading phase (vs scale-loading phase)
+    reg [1:0]  scale_byte_cnt;
+    reg [15:0] scale_accum;
+    reg [7:0]  scale_wr_ptr;
+
+    // Result write
+    reg        res_write_active;
+    reg  [5:0] result_wr_idx;
+    reg  [1:0] res_wr_state;
+    reg [63:0] res_write_data_reg;
+    reg  [9:0] draining_result_idx;
+    reg        draining;
+    reg        accumulate;
+
+    // Act loading
+    reg [15:0] act_byte_cnt;
+    reg [9:0]  act_wr_ptr;
+
+    // Misc
+    reg        core_start_pulse;
+    reg        hp_read_done_ff;
+
+    // Tile config per type
+    reg [13:0] tile_block_bytes;  // bytes of block data (excluding scales)
+    reg [9:0]  cols_per_tile;
+    reg [9:0]  act_base;
+
+    // Tile config lookup
+    always @(*) begin
+        case (desc_tensor_type)
+            0: begin  // INT16
+                tile_block_bytes = 14'd8192;
+                cols_per_tile = 10'd64;
+            end
+            8: begin  // Q8_0
+                tile_block_bytes = 14'd4096;
+                cols_per_tile = 10'd64;
+            end
+            12: begin  // Q4_K
+                tile_block_bytes = 14'd8064;
+                cols_per_tile = 10'd256;
+            end
+            6: begin  // Q5_0
+                tile_block_bytes = 14'd4928;
+                cols_per_tile = 10'd896;
+            end
+            14: begin  // Q6_K
+                tile_block_bytes = 14'd6720;
+                cols_per_tile = 10'd256;
+            end
+            default: begin
+                tile_block_bytes = 14'd8192;
+                cols_per_tile = 10'd64;
+            end
+        endcase
+    end
+
+    assign core_start = core_start_pulse;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            loading    <= 0;
-            load_phase <= LP_IDLE;
-            load_addr  <= 0;
-            int16_wt_we <= 0;
-            wt_we      <= 0;
-            q4k_wt_we  <= 0;
-            sc_we      <= 0;
-            act_we     <= 0;
-        end else if (reg_ap_ctrl[0] && !core_busy && !loading) begin
-            reg_ap_ctrl[0] <= 0;
-            loading    <= 1;
-            load_phase <= LP_WEIGHT;
-            load_addr  <= 0;
-        end else if (loading) begin
-            int16_wt_we <= 0;
-            wt_we <= 0;
-            q4k_wt_we <= 0;
-            sc_we <= 0;
-            act_we <= 0;
+            ph_state          <= PH_IDLE;
+            desc_chain_busy   <= 0;
+            desc_chain_enable <= 0;
+            desc_irq          <= 0;
+            hp_read_start_raw <= 0;
+            tile_count        <= 0;
+            write_count       <= 0;
+            weight_loading    <= 0;
+            scale_byte_cnt    <= 0;
+            scale_accum       <= 0;
+            scale_wr_ptr      <= 0;
+            core_start_pulse  <= 0;
+            wt_we             <= 0;
+            sc_we             <= 0;
+            act_we            <= 0;
+            draining          <= 0;
+            draining_result_idx <= 0;
+            accumulate        <= 0;
+            res_write_active  <= 0;
+            result_wr_idx     <= 0;
+            act_wr_ptr        <= 0;
+            act_byte_cnt      <= 0;
+            reg_desc_head     <= 0;
+            burst_bytes_rem   <= 0;
+            desc_byte_idx     <= 0;
+            hp_read_ready     <= 0;
+            hp_write_start    <= 0;
+            hp_write_valid    <= 0;
+        end else begin
+            // Default clears
+            wt_we             <= 0;
+            sc_we             <= 0;
+            act_we            <= 0;
+            hp_read_start_raw <= 0;
+    hp_write_start    <= 0;
+    core_start_pulse  <= 0;
+    desc_irq          <= 0;
 
-            case (load_phase)
-                LP_WEIGHT: begin
-                    if (mode_q4k) begin
-                        if (load_addr < Q4K_WEIGHT_BYTES) begin
-                            q4k_wt_we   <= 1;
-                            q4k_wt_addr <= {5'd0, load_addr[11:0]};
-                            q4k_wt_din  <= weight_buf[load_addr];
-                            load_addr <= load_addr + 1;
+            case (ph_state)
+                // ==========================================================
+                // PH_IDLE: wait for chain enable
+                // ==========================================================
+                PH_IDLE: begin
+                    if (reg_chain_ctrl[0]) begin
+                        $display("[TB] PH_IDLE: chain started head=%0d tail=%0d",
+                            reg_desc_head, reg_desc_tail);
+                        desc_chain_enable <= 1;
+                        reg_chain_ctrl[0] <= 0;
+                        if (reg_desc_head == reg_desc_tail) begin
+                            $display("[TB] PH_IDLE: no descriptors");
                         end else begin
-                            load_addr <= 0;
-                            load_phase <= LP_SCALE;
+                            desc_chain_busy <= 1;
+                            ph_state <= PH_FETCH_DESC;
                         end
-                    end else if (mode_int16) begin
-                        if (load_addr < INT16_WEIGHT_BYTES) begin
-                            int16_wt_we <= 1;
-                            int16_wt_addr <= {load_addr[3:0], load_addr[12:4]};
-                            int16_wt_din <= weight_buf[load_addr];
-                            load_addr <= load_addr + 1;
-                        end else begin
-                            load_addr <= 0;
-                            load_phase <= LP_ACT;
+                    end
+                end
+
+                // ==========================================================
+                // PH_FETCH_DESC: read 32-byte descriptor from DDR
+                // ==========================================================
+                PH_FETCH_DESC: begin
+                    desc_byte_idx <= 0;
+                    hp_read_addr <= reg_desc_base + reg_desc_head * 32;
+                    hp_read_len  <= 8'd3;  // 4 beats = 32 bytes
+                    hp_read_start_raw <= 1;
+                    ph_state <= PH_FETCH_WAIT;
+                end
+
+                // ==========================================================
+                // PH_FETCH_WAIT: drain descriptor bytes from HP read master
+                // ==========================================================
+                PH_FETCH_WAIT: begin
+                    if (hp_read_valid) begin
+                        hp_read_ready <= 1;
+                        if (desc_byte_idx < 32) begin
+                            desc_buf[desc_byte_idx] <= hp_read_data;
+                            desc_byte_idx <= desc_byte_idx + 1;
                         end
                     end else begin
-                        // Q8 mode (default)
-                        if (load_addr < Q8_WEIGHT_BYTES) begin
+                        hp_read_ready <= 0;
+                    end
+                    if (hp_read_done) begin
+                        // Descriptor fully read — parse fields
+                        desc_next_addr <= {desc_buf[3], desc_buf[2], desc_buf[1], desc_buf[0]};
+                        desc_weight_addr <= {desc_buf[7], desc_buf[6], desc_buf[5], desc_buf[4]};
+                        desc_act_addr <= {desc_buf[11],desc_buf[10],desc_buf[9], desc_buf[8]};
+                        desc_result_addr <= {desc_buf[15],desc_buf[14],desc_buf[13],desc_buf[12]};
+                        desc_num_tiles <= {desc_buf[17],desc_buf[16]};
+                        desc_tile_bytes <= {desc_buf[19],desc_buf[18]};
+                        desc_tensor_type <= desc_buf[20];
+                        desc_tile_res_rows <= desc_buf[21];
+                        desc_flags <= desc_buf[22];
+                        desc_act_total_bytes <= {desc_buf[24], desc_buf[23]};
+                        desc_num_col_groups <= desc_buf[25];
+                        tile_count <= 0;
+
+                        $strobe("[TB] DESC %0d: next=0x%08x wt=0x%08x act=0x%08x res=0x%08x tiles=%0d tileB=%0d type=%0d rows=%0d flags=0x%02x actB=%0d colGrp=%0d",
+                            reg_desc_head,
+                            desc_next_addr,
+                            desc_weight_addr,
+                            desc_act_addr,
+                            desc_result_addr,
+                            desc_num_tiles,
+                            desc_tile_bytes,
+                            desc_tensor_type,
+                            desc_tile_res_rows,
+                            desc_flags,
+                            desc_act_total_bytes,
+                            desc_num_col_groups);
+
+                        // Set mode from tensor type (GGML type values)
+                        case (desc_tensor_type)
+                            0:  reg_ctrl_user <= 32'h0000_0010;  // INT16
+                            6:  reg_ctrl_user <= 32'h0000_0080;  // Q5_0
+                            8:  reg_ctrl_user <= 32'h0000_0020;  // Q8_0
+                            12: reg_ctrl_user <= 32'h0000_0040;  // Q4_K
+                            14: reg_ctrl_user <= 32'h0000_0100;  // Q6_K
+                        endcase
+
+                        // Start with activation load
+                        ph_state <= PH_LOAD_ACT;
+                    end
+                end
+
+                // ==========================================================
+                // PH_LOAD_ACT: read activation vector from DDR → act_buf
+                // ==========================================================
+                PH_LOAD_ACT: begin
+                    act_wr_ptr <= 0;
+                    act_byte_cnt <= 0;
+                    if (desc_act_total_bytes > 0) begin
+                        hp_read_addr <= desc_act_addr;
+                        hp_read_len  <= (desc_act_total_bytes >> 3) - 1;
+                        hp_read_start_raw <= 1;
+                        ph_state <= PH_LOAD_ACT_WAIT;
+                    end else begin
+                        ph_state <= PH_LOAD_WEIGHT;
+                    end
+                end
+
+                // ==========================================================
+                // PH_LOAD_ACT_WAIT: drain activation bytes from HP read master
+                // ==========================================================
+                PH_LOAD_ACT_WAIT: begin
+                    if (hp_read_valid) begin
+                        hp_read_ready <= 1;
+                        // Accumulate 2 bytes into 16-bit act value
+                        if (act_byte_cnt[0] == 0) begin
+                            scale_accum[7:0] <= hp_read_data;
+                            act_byte_cnt <= act_byte_cnt + 1;
+                        end else begin
+                            scale_accum[15:8] <= hp_read_data;
+                            act_buf[act_wr_ptr] <= {hp_read_data, scale_accum[7:0]};
+                            act_wr_ptr <= act_wr_ptr + 1;
+                            act_byte_cnt <= act_byte_cnt + 1;
+                        end
+                    end else begin
+                        hp_read_ready <= 0;
+                    end
+                    if (hp_read_done) begin
+                        ph_state <= PH_LOAD_WEIGHT;
+                    end
+                end
+
+                // ==========================================================
+                // PH_LOAD_WEIGHT: start weight burst for current tile
+                // ==========================================================
+                PH_LOAD_WEIGHT: begin
+                    burst_addr <= desc_weight_addr + tile_count * desc_tile_bytes;
+                    burst_bytes_rem <= desc_tile_bytes;
+                    write_count <= 0;
+                    weight_loading <= 1;
+                    scale_wr_ptr <= 0;
+                    scale_byte_cnt <= 0;
+                    ph_state <= PH_WEIGHT_START;
+                end
+
+                // ==========================================================
+                // PH_WEIGHT_START: issue one HP read burst for weight data
+                // ==========================================================
+                PH_WEIGHT_START: begin
+                    if (burst_bytes_rem > 2048) begin
+                        hp_read_addr <= burst_addr;
+                        hp_read_len  <= 8'd255;  // 256 beats = 2048 bytes
+                        burst_addr   <= burst_addr + 2048;
+                        burst_bytes_rem <= burst_bytes_rem - 2048;
+                    end else begin
+                        hp_read_addr <= burst_addr;
+                        hp_read_len  <= (burst_bytes_rem >> 3) - 1;
+                        burst_bytes_rem <= 0;
+                    end
+                    hp_read_start_raw <= 1;
+                    hp_read_ready <= 1;
+                    ph_state <= PH_WEIGHT_WAIT;
+                end
+
+                // ==========================================================
+                // PH_WEIGHT_WAIT: drain weight/scale bytes from HP read master
+                // ==========================================================
+                PH_WEIGHT_WAIT: begin
+                    if (hp_read_valid) begin
+                        hp_read_ready <= 1;
+                        if (weight_loading) begin
+                            // Still in block data phase
                             wt_we   <= 1;
-                            wt_addr <= load_addr[11:0];
-                            wt_din  <= weight_buf[load_addr[11:0]];
-                            load_addr <= load_addr + 1;
+                            wt_addr <= write_count[12:0];
+                            wt_din  <= hp_read_data;
+                            write_count <= write_count + 1;
+                            if (write_count >= tile_block_bytes - 1) begin
+                                weight_loading <= 0;
+                                scale_byte_cnt <= 0;
+                            end
                         end else begin
-                            load_addr <= 0;
-                            load_phase <= LP_SCALE;
-                        end
-                    end
-                end
-
-                LP_SCALE: begin
-                    if (mode_q4k) begin
-                        if (load_addr < 896) begin
-                            sc_we   <= 1;
-                            sc_addr <= load_addr[9:0];
-                            sc_din  <= scale_buf[load_addr[9:0]];
-                            load_addr <= load_addr + 1;
-                        end else begin
-                            load_addr <= 0;
-                            load_phase <= LP_ACT;
-                        end
-                    end else if (!mode_int16) begin
-                        // Q8 mode: load 128 combined scales
-                        if (load_addr < 128) begin
-                            sc_we   <= 1;
-                            sc_addr <= load_addr[6:0];
-                            sc_din  <= scale_buf[load_addr[6:0]];
-                            load_addr <= load_addr + 1;
-                        end else begin
-                            load_addr <= 0;
-                            load_phase <= LP_ACT;
+                            // Scale data phase — accumulate 2 bytes per 16-bit scale
+                            // Only load desc_tile_res_rows scales; skip padding bytes
+                            if (scale_wr_ptr < desc_tile_res_rows) begin
+                                if (scale_byte_cnt == 0) begin
+                                    scale_accum[7:0] <= hp_read_data;
+                                    scale_byte_cnt <= 1;
+                                end else begin
+                                    scale_accum[15:8] <= hp_read_data;
+                                    sc_we   <= 1;
+                                    sc_din  <= {hp_read_data, scale_accum[7:0]};
+                                    sc_addr <= scale_wr_ptr;
+                                    scale_wr_ptr <= scale_wr_ptr + 1;
+                                    scale_byte_cnt <= 0;
+                                end
+                            end
+                            // else: skip padding bytes (discard)
                         end
                     end else begin
-                        load_addr <= 0;
-                        load_phase <= LP_ACT;
+                        hp_read_ready <= 0;
+                    end
+                    if (hp_read_done) begin
+                        if (burst_bytes_rem > 0) begin
+                            // More bursts needed for this tile
+                            ph_state <= PH_WEIGHT_START;
+                        end else begin
+                            // All weight+scale data loaded — write activations to core
+                            act_wr_ptr <= 0;
+                            ph_state <= PH_WRITE_ACT;
+                        end
                     end
                 end
 
-                LP_ACT: begin
-                    if (load_addr < 64) begin
-                        act_we   <= 1;
-                        act_addr <= load_addr[5:0];
-                        act_din  <= act_buf[load_addr[5:0]];
-                        load_addr <= load_addr + 1;
+                // ==========================================================
+                // PH_WRITE_ACT: write activations from act_buf to core
+                // ==========================================================
+                PH_WRITE_ACT: begin
+                    if (act_wr_ptr < cols_per_tile) begin
+                        act_we <= 1;
+                        act_addr <= act_wr_ptr;
+                        act_din  <= act_buf[act_wr_ptr];
+                        act_wr_ptr <= act_wr_ptr + 1;
                     end else begin
-                        load_addr <= 0;
-                        load_phase <= LP_DONE;
+                        core_start_pulse <= 1;
+                        ph_state <= PH_TILE_WAIT;
                     end
                 end
 
-                LP_DONE: begin
-                    loading    <= 0;
-                    load_phase <= LP_IDLE;
+                // ==========================================================
+                // PH_TILE_START: activate core compute
+                // ==========================================================
+                PH_TILE_START: begin
+                    $display("[TB] PH_TILE_START: type=%0d rows=%0d %s",
+                        desc_tensor_type, desc_tile_res_rows,
+                        mode_q5_0 ? "Q5_0" : mode_q6_k ? "Q6_K" :
+                        mode_q4k  ? "Q4_K" : mode_q8 ? "Q8_0" : "INT16");
+                    core_start_pulse <= 1;
+                    ph_state <= PH_TILE_WAIT;
                 end
+
+                // ==========================================================
+                // PH_TILE_WAIT: wait for core done + drain results
+                // ==========================================================
+                PH_TILE_WAIT: begin
+                    if (draining && draining_result_idx >=
+                        (desc_tensor_type == 6  ? 8  :   // Q5_0
+                         desc_tensor_type == 14 ? 32 :   // Q6_K
+                         desc_tensor_type == 12 ? 56 :   // Q4_K
+                         desc_tensor_type == 8  ? 64 :   // Q8_0
+                         64)) begin
+                        // Drain complete — write results in PH_WRITE_RESULT
+                    ph_state <= PH_WRITE_RESULT;
+                    end
+                end
+
+                // ==========================================================
+                // PH_WRITE_RESULT: write result_buf to DDR via HP write master
+                // ==========================================================
+                PH_WRITE_RESULT: begin
+                    $display("[TB] PH_WRITE_RESULT: addr=0x%08x rows=%0d tile=%0d",
+                        desc_result_addr + (tile_count * desc_tile_res_rows * 8),
+                        desc_tile_res_rows, tile_count);
+                    hp_write_addr <= desc_result_addr + (tile_count * desc_tile_res_rows * 8);
+                    hp_write_count <= desc_tile_res_rows;
+                    hp_write_start <= 1;
+                    result_wr_idx <= 0;
+                    res_write_active <= 1;
+                    res_wr_state <= 0;
+                    hp_write_valid <= 0;
+                    ph_state <= PH_WRITE_WAIT;
+                end
+
+                // ==========================================================
+                // PH_WRITE_WAIT: stream results to HP write master
+                // Sub-state machine for reliable handshake:
+                //   0: present data, wait for capture
+                //   1: wait for write master ready, advance to next word
+                // ==========================================================
+                PH_WRITE_WAIT: begin
+                    if (res_write_active) begin
+                        if (result_wr_idx < desc_tile_res_rows) begin
+                            case (res_wr_state)
+                                0: begin
+                                    // Present data word
+                                    res_write_data_reg <= {48'b0, result_buf[result_wr_idx]};
+                                    hp_write_data <= {48'b0, result_buf[result_wr_idx]};
+                                    hp_write_valid <= 1;
+                                    res_wr_state <= 1;
+                                end
+                                1: begin
+                                    // Wait for write master to accept
+                                    hp_write_valid <= 1;
+                                    if (hp_write_ready) begin
+                                        // Master is ready — capture happens next cycle
+                                        // Advance to next word
+                                        hp_write_valid <= 0;
+                                        result_wr_idx <= result_wr_idx + 1;
+                                        res_wr_state <= 0;
+                                    end
+                                end
+                            endcase
+                        end else begin
+                            hp_write_valid <= 0;
+                        end
+                    end else begin
+                        hp_write_valid <= 0;
+                    end
+                    if (hp_write_done) begin
+                        $display("[TB] PH_WRITE_WAIT: done tile=%0d", tile_count);
+                        res_write_active <= 0;
+                        hp_write_valid <= 0;
+                        tile_count <= tile_count + 1;
+                        if (tile_count + 1 >= desc_num_tiles) begin
+                            ph_state <= PH_ADVANCE_DESC;
+                        end else begin
+                            ph_state <= PH_LOAD_WEIGHT;
+                        end
+                    end
+                end
+
+                // ==========================================================
+                // PH_ADVANCE_DESC: advance descriptor chain head
+                // ==========================================================
+                PH_ADVANCE_DESC: begin
+                    reg_desc_head <= reg_desc_head + 1;
+                    if (reg_desc_head + 1 >= reg_desc_tail) begin
+                        // Chain complete
+                        reg_chain_ctrl[2] <= 1;
+                        desc_chain_busy <= 0;
+                        desc_irq <= 1;
+                        ph_state <= PH_IDLE;
+                    end else begin
+                        ph_state <= PH_FETCH_DESC;
+                    end
+                end
+
+                default: ph_state <= PH_IDLE;
             endcase
         end
     end
 
     // ======================================================================
-    // Capture core results
+    // Result drain (from core → result_buf)
     // ======================================================================
-    reg [9:0] result_idx;
-    reg       draining;
-
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             draining   <= 0;
-            result_idx <= 0;
+            draining_result_idx <= 0;
+            accumulate <= 0;
         end else if (core_done && !draining) begin
             draining   <= 1;
-            result_idx <= 0;
+            draining_result_idx <= 0;
         end else if (draining) begin
-            if (result_idx < 64) begin
-                result_buf[result_idx] <= res_dout;
-                result_idx <= result_idx + 1;
+            if ((mode_q5_0 && draining_result_idx < 8) ||
+                (mode_q6_k && draining_result_idx < 32) ||
+                (mode_q4k && draining_result_idx < 56) ||
+                (!mode_q5_0 && !mode_q6_k && !mode_q4k && draining_result_idx < 64)) begin
+                result_buf[draining_result_idx] <= res_dout;
+                draining_result_idx <= draining_result_idx + 1;
             end else begin
                 draining <= 0;
             end
         end
     end
 
-    assign res_addr = draining ? result_idx[5:0] : 0;
+    assign res_addr = draining ? draining_result_idx[5:0] : 0;
 
     // ======================================================================
     // STATUS register
@@ -542,6 +979,8 @@ module matmul_top (
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n)
             reg_status <= 0;
+        else if (desc_chain_busy)
+            reg_status <= 3;
         else if (core_busy)
             reg_status <= 1;
         else if (core_done && !draining)
@@ -551,19 +990,21 @@ module matmul_top (
     end
 
     // ======================================================================
-    // AP_CTRL done/idle/ready bits (read-only)
+    // AP_CTRL done/idle/ready bits
     // ======================================================================
     always @(*) begin
-        reg_ap_ctrl[3:1] = {~core_busy, ~core_busy, core_done};
+        reg_ap_ctrl[3:1] = {~desc_chain_busy && ~core_busy,
+                            ~desc_chain_busy && ~core_busy,
+                            core_done && !draining};
     end
 
     // ======================================================================
-    // Interrupt
+    // Interrupt generation (chain completion)
     // ======================================================================
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n)
             reg_isr <= 0;
-        else if (core_done && reg_gie[0] && reg_ier[0])
+        else if (desc_irq && reg_gie[0] && reg_ier[0])
             reg_isr[0] <= 1;
     end
 

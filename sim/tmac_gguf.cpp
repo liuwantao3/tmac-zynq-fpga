@@ -145,7 +145,7 @@ constexpr int K_DIM = NUM_KV_HEADS * HEAD_DIM;  // 128
 constexpr int V_DIM = K_DIM;
 constexpr int MAX_SEQ_LEN = 256;
 
-constexpr size_t DDR_SIZE = 512 * 1024 * 1024;
+constexpr size_t DDR_SIZE = 1024 * 1024 * 1024;
 
 // Tensor types
 constexpr int TENSOR_F32 = 0;
@@ -179,6 +179,25 @@ static bool g_fpga_q8 = false;
 static bool g_fpga_q4k = false;
 static bool g_fpga_q5_0 = false;
 static bool g_fpga_q6_k = false;
+static bool g_fpga_phaseb = false;
+static bool g_dump_phaseb = false;
+
+// Phase B per-descriptor verification slot — stores expected results + scales
+struct PhaseBVerifySlot {
+    uint32_t result_addr;
+    int nrows;
+    float x_scale;
+    std::vector<float> row_inv;
+    std::vector<float> expected;
+};
+
+// Phase B chain state
+static struct {
+    uint32_t head;                    // first descriptor offset
+    uint32_t tail;                    // last descriptor offset
+    uint32_t next_off;                // bump allocator position
+    std::vector<PhaseBVerifySlot> slots;
+} g_phaseb = {};
 
 // Cosimulation tile dump
 static FILE* g_dump_file = nullptr;
@@ -480,6 +499,357 @@ void matmul_transposed(const Tensor* A, const float* x, float* y, int rows, int 
 }
 
 // ===========================================================================
+// PHASE B DESCRIPTOR CHAIN — DDR-packed tile dispatch
+// ===========================================================================
+
+// Initialize Phase B chain state
+// Use a region of g_ddr far past the model data (model ~374 MB, DDR=512 MB)
+static void phaseb_init() {
+    g_phaseb = {};
+    g_phaseb.next_off = 0x18000000;  // 384 MB — well past any tensor data
+    g_phaseb.slots.reserve(16);
+}
+
+// Bump-allocate from g_ddr
+static uint32_t phaseb_alloc(uint32_t bytes) {
+    uint32_t off = g_phaseb.next_off;
+    g_phaseb.next_off += bytes;
+    if (g_phaseb.next_off > DDR_SIZE) {
+        fprintf(stderr, "[PHASEB] DDR full at %u\n", g_phaseb.next_off);
+        return 0;
+    }
+    return off;
+}
+
+// Append a 32-byte descriptor to the chain, link to previous
+static uint32_t phaseb_add_descriptor(
+    uint32_t weight_addr, uint32_t act_addr, uint32_t result_addr,
+    uint16_t num_tiles, uint16_t tile_bytes,
+    uint8_t tensor_type, uint8_t tile_res_rows,
+    uint8_t flags, uint16_t act_total_bytes, uint8_t num_col_groups)
+{
+    uint32_t off = phaseb_alloc(sizeof(fpga_sim::PhaseBDescriptor));
+    if (!off) return 0;
+    auto* d = (fpga_sim::PhaseBDescriptor*)(g_ddr + off);
+    d->next_desc_addr = 0;
+    d->weight_addr = weight_addr;
+    d->act_addr = act_addr;
+    d->result_addr = result_addr;
+    d->num_tiles = num_tiles;
+    d->tile_bytes = tile_bytes;
+    d->tensor_type = tensor_type;
+    d->tile_res_rows = tile_res_rows;
+    d->flags = flags;
+    d->act_total_bytes = act_total_bytes;
+    d->num_col_groups = num_col_groups;
+    memset(d->reserved, 0, 7);
+    if (g_phaseb.tail) {
+        auto* prev = (fpga_sim::PhaseBDescriptor*)(g_ddr + g_phaseb.tail);
+        prev->next_desc_addr = off;
+    } else {
+        g_phaseb.head = off;
+    }
+    g_phaseb.tail = off;
+    return off;
+}
+
+// Forward declaration
+static int phaseb_run_descriptor(uint32_t desc_off, int64_t* accumulator);
+
+// Dump descriptor chain to stderr (for debugging)
+static void phaseb_dump() {
+    fprintf(stderr, "\n[PHASEB] Descriptor chain (%d descriptors, head 0x%x):\n",
+            (int)g_phaseb.slots.size(), g_phaseb.head);
+    uint32_t off = g_phaseb.head;
+    int idx = 0;
+    while (off) {
+        auto* d = (fpga_sim::PhaseBDescriptor*)(g_ddr + off);
+        fprintf(stderr, "  [%d] @0x%04x: next=0x%04x wt=0x%04x act=0x%04x res=0x%04x "
+                "ntiles=%d tileB=%d type=%d rowsPerTile=%d flags=0x%x actB=%d cg=%d\n",
+                idx, off, d->next_desc_addr, d->weight_addr, d->act_addr, d->result_addr,
+                d->num_tiles, d->tile_bytes, d->tensor_type, d->tile_res_rows,
+                d->flags, d->act_total_bytes, d->num_col_groups);
+        off = d->next_desc_addr;
+        idx++;
+    }
+}
+
+// Write Phase B DDR image + header for iVerilog testbench
+// Reorganizes descriptors into a contiguous array in DDR.
+// .hdr format (fixed-offset for easy Verilog parsing):
+//   [0..3]:    uint32_t magic = 0x50484244 ("PHBD")
+//   [4..7]:    uint32_t ndesc
+//   [8..11]:   uint32_t desc_base_addr (DDR offset of contiguous descriptors)
+//   [12..15]:  uint32_t total_entries  (sum of all nrows)
+//   [16..]:    per-descriptor table: ndesc x 16 bytes each:
+//                uint32_t result_addr, uint32_t nrows, uint32_t reserved, uint32_t expected_offset
+//              then flat int64_t expected[total_entries]
+static void phaseb_dump_files() {
+    if (g_phaseb.slots.empty()) { fprintf(stderr, "[PHASEB] Nothing to dump\n"); return; }
+    int ndesc = (int)g_phaseb.slots.size();
+
+    // 1. Walk linked list to get descriptor offsets in order
+    std::vector<uint32_t> desc_offsets;
+    uint32_t off = g_phaseb.head;
+    while (off) {
+        desc_offsets.push_back(off);
+        auto* d = (fpga_sim::PhaseBDescriptor*)(g_ddr + off);
+        off = d->next_desc_addr;
+    }
+    if ((int)desc_offsets.size() != ndesc) {
+        fprintf(stderr, "[PHASEB] WARNING: slot count %d != chain length %zu\n",
+                ndesc, desc_offsets.size());
+        ndesc = (int)desc_offsets.size();
+    }
+
+    // 2. Place contiguous descriptor array after all allocated data
+    uint32_t contiguous_base = (g_phaseb.next_off + 31) & ~31;
+    uint32_t contiguous_end = contiguous_base + ndesc * (uint32_t)sizeof(fpga_sim::PhaseBDescriptor);
+
+    // 3. Copy descriptors sequentially into the contiguous region
+    for (int i = 0; i < ndesc; i++) {
+        auto* src = (fpga_sim::PhaseBDescriptor*)(g_ddr + desc_offsets[i]);
+        auto* dst = (fpga_sim::PhaseBDescriptor*)(g_ddr + contiguous_base + i * (uint32_t)sizeof(fpga_sim::PhaseBDescriptor));
+        memcpy(dst, src, sizeof(fpga_sim::PhaseBDescriptor));
+        dst->next_desc_addr = (i < ndesc - 1) ? 0xFFFFFFFF : 0;
+    }
+
+    // 4. Compute DDR range for dumping
+    uint32_t ddr_end = contiguous_end;
+    uint32_t bin_off = 0x18000000;
+    uint32_t bin_size = ddr_end - bin_off;
+
+    // 5. Write .bin (DDR image from Phase B base address)
+    FILE* fbin = fopen("/tmp/tb_phaseb.bin", "wb");
+    if (!fbin) { fprintf(stderr, "[PHASEB] Cannot write /tmp/tb_phaseb.bin\n"); return; }
+    fwrite(g_ddr + bin_off, 1, bin_size, fbin);
+    fclose(fbin);
+    fprintf(stderr, "[PHASEB] Wrote %u bytes to /tmp/tb_phaseb.bin (0x%08x-0x%08x)\n",
+            bin_size, bin_off, ddr_end);
+
+    // 6. Write .hdr (fixed-offset format)
+    FILE* fhdr = fopen("/tmp/tb_phaseb.hdr", "wb");
+    if (!fhdr) { fprintf(stderr, "[PHASEB] Cannot write /tmp/tb_phaseb.hdr\n"); return; }
+
+    // First pass: compute expected values and count total entries
+    struct DescInfo {
+        uint32_t result_addr;
+        uint32_t nrows;
+        std::vector<int64_t> accum;
+    };
+    std::vector<DescInfo> dinfo(ndesc);
+    uint32_t total_entries = 0;
+    for (int i = 0; i < ndesc; i++) {
+        auto* d = (fpga_sim::PhaseBDescriptor*)(g_ddr + desc_offsets[i]);
+        int total_rows = (d->tensor_type == fpga_sim::DESC_TYPE_Q5_0)
+            ? d->num_tiles * d->tile_res_rows
+            : (d->num_tiles / d->num_col_groups) * d->tile_res_rows;
+        total_rows = std::max(total_rows, 1);
+        dinfo[i].accum.resize(total_rows, 0);
+        int nrows = phaseb_run_descriptor(desc_offsets[i], dinfo[i].accum.data());
+        dinfo[i].result_addr = d->result_addr;
+        dinfo[i].nrows = (uint32_t)nrows;
+        total_entries += (uint32_t)nrows;
+    }
+
+    // Write header
+    uint32_t magic = 0x50484244;
+    fwrite(&magic, 4, 1, fhdr);
+    uint32_t nd = (uint32_t)ndesc;
+    fwrite(&nd, 4, 1, fhdr);
+    fwrite(&contiguous_base, 4, 1, fhdr);
+    fwrite(&total_entries, 4, 1, fhdr);
+
+    // Write per-descriptor table
+    uint32_t expected_offset = 0;
+    for (int i = 0; i < ndesc; i++) {
+        uint32_t zero = 0;
+        fwrite(&dinfo[i].result_addr, 4, 1, fhdr);
+        fwrite(&dinfo[i].nrows, 4, 1, fhdr);
+        fwrite(&zero, 4, 1, fhdr);  // reserved
+        fwrite(&expected_offset, 4, 1, fhdr);
+        expected_offset += dinfo[i].nrows;
+    }
+
+    // Write flat expected array
+    for (int i = 0; i < ndesc; i++) {
+        fwrite(dinfo[i].accum.data(), 8, dinfo[i].nrows, fhdr);
+    }
+
+    fclose(fhdr);
+    fprintf(stderr, "[PHASEB] Wrote %d descriptors (+%d expected entries) to /tmp/tb_phaseb.hdr\n",
+            ndesc, total_entries);
+}
+
+// Per-tile Q5_0 row_inv from 224 blocks in one tile
+// Each tile has 8 rows × 28 blocks/row. Row_inv = 32767/max_abs per row.
+static void phaseb_q5_0_row_inv(const uint8_t* blocks, float* ri_out) {
+    constexpr int ROW_BLOCKS = 28;  // 896 / 32
+    for (int i = 0; i < 8; i++) {
+        float max_abs = 0.0f;
+        for (int bi = 0; bi < ROW_BLOCKS; bi++) {
+            const uint8_t* blk = blocks + (i * ROW_BLOCKS + bi) * fpga_sim::Q5_0_BLOCK_BYTES;
+            float d = fpga_sim::read_f16(blk);
+            uint32_t qh = (uint32_t)blk[2] | ((uint32_t)blk[3] << 8) |
+                          ((uint32_t)blk[4] << 16) | ((uint32_t)blk[5] << 24);
+            for (int wi = 0; wi < 32; wi++) {
+                uint64_t j = wi < 16 ? wi : wi - 16;
+                uint8_t qs_byte = blk[6 + j];
+                uint8_t ql = (wi < 16) ? (qs_byte & 0xF) : (qs_byte >> 4);
+                uint8_t qh_bit = (qh >> wi) & 1;
+                int q = ((qh_bit << 4) | ql) - 16;
+                float ab = fabsf(d * (float)q);
+                if (ab > max_abs) max_abs = ab;
+            }
+        }
+        max_abs = (max_abs < 1e-10f) ? 1.0f : max_abs;
+        ri_out[i] = 32767.0f / max_abs;
+    }
+}
+
+// Per-tile Q6_K row_inv from 32 block headers (scale data only)
+static void phaseb_q6_k_row_inv(const uint8_t* blocks, int nblocks, float* ri_out) {
+    for (int bi = 0; bi < nblocks; bi++) {
+        const uint8_t* blk = blocks + bi * fpga_sim::Q6_K_BLOCK_BYTES;
+        float super_scale = fpga_sim::read_f16(blk + 208);
+        float max_abs = 0.0f;
+        for (int wi = 0; wi < 256; wi++) {
+            int half = wi / 128, pos = wi % 128, l = pos % 32, sub = pos / 32;
+            int L_off = half * 64 + l + (sub % 2) * 32;
+            uint8_t ql_nibble = (sub < 2) ? (blk[L_off] & 0xF) : (blk[L_off] >> 4);
+            int H_off = 128 + half * 32 + l;
+            uint8_t qh_bits = (blk[H_off] >> (sub * 2)) & 0x3;
+            int q6 = ((qh_bits << 4) | ql_nibble) - 32;
+            int sc_off = 192 + half * 8 + (l / 16) + sub * 2;
+            float scale_f = (float)(int8_t)blk[sc_off];
+            float ab = fabsf(super_scale * scale_f * (float)q6);
+            if (ab > max_abs) max_abs = ab;
+        }
+        max_abs = (max_abs < 1e-10f) ? 1.0f : max_abs;
+        ri_out[bi] = 32767.0f / max_abs;
+    }
+}
+
+// Run a single descriptor through the tile loop, accumulate into accumulator[]
+// Returns number of result rows written to accumulator
+static int phaseb_run_descriptor(uint32_t desc_off, int64_t* accumulator) {
+    auto* d = (fpga_sim::PhaseBDescriptor*)(g_ddr + desc_off);
+    const int cg = d->num_col_groups;
+    const int tr = d->tile_res_rows;
+
+    switch (d->tensor_type) {
+    case fpga_sim::DESC_TYPE_Q5_0: {
+        // Q5_0: 8×896 tile, no column grouping (cg == 1)
+        auto* act = (fpga_sim::in16_t*)(g_ddr + d->act_addr);
+        for (int ti = 0; ti < d->num_tiles; ti++) {
+            uint8_t* blk = g_ddr + d->weight_addr + ti * d->tile_bytes;
+            int row0 = ti * tr;
+            float ri[8];
+            phaseb_q5_0_row_inv(blk, ri);
+            fpga_sim::axi_vecmul_tile_q5_0_8x896_axilite(blk, act, ri, accumulator, row0);
+        }
+        return d->num_tiles * tr;
+    }
+    case fpga_sim::DESC_TYPE_Q6_K: {
+        // Q6_K: 32×256 tile, column groups = cols/256
+        // row_inv is precomputed and stored in tile's scale section (UQ24.8)
+        const int cols_per_tile = fpga_sim::PHASEB_Q6_K_COLS;
+        const int blk_bytes = fpga_sim::PHASEB_Q6_K_BLK_BYTES;
+        float ri_abs[896] = {0};
+        for (int ti = 0; ti < d->num_tiles; ti++) {
+            int cg_idx = ti % cg, rg = ti / cg;
+            int row0 = rg * tr;
+            uint8_t* blk = g_ddr + d->weight_addr + ti * d->tile_bytes;
+            auto* act = (fpga_sim::in16_t*)(g_ddr + d->act_addr + cg_idx * cols_per_tile * 2);
+            // Read row_inv from scale section (UQ24.8 → float)
+            for (int i = 0; i < tr; i++) {
+                uint32_t uq;
+                memcpy(&uq, blk + blk_bytes + i * 4, 4);
+                ri_abs[row0 + i] = (float)uq / 256.0f;
+            }
+            fpga_sim::axi_vecmul_tile_q6_k_axilite(blk, tr, act, cols_per_tile,
+                ri_abs, accumulator, row0);
+        }
+        return (d->num_tiles / cg) * tr;
+    }
+    case fpga_sim::DESC_TYPE_Q4_K: {
+        // Q4_K: 56×256 tile, column groups = cols/256
+        // row_inv is precomputed and stored in tile's scale section (UQ24.8)
+        const int cols_per_tile = fpga_sim::PHASEB_Q4_K_COLS;
+        const int blk_bytes = fpga_sim::PHASEB_Q4_K_BLK_BYTES;
+        float ri_abs[896] = {0};
+        for (int ti = 0; ti < d->num_tiles; ti++) {
+            int cg_idx = ti % cg, rg = ti / cg;
+            int row0 = rg * tr;
+            uint8_t* blk = g_ddr + d->weight_addr + ti * d->tile_bytes;
+            auto* act = (fpga_sim::in16_t*)(g_ddr + d->act_addr + cg_idx * cols_per_tile * 2);
+            // Read row_inv from scale section (UQ24.8 → float)
+            for (int i = 0; i < tr; i++) {
+                uint32_t uq;
+                memcpy(&uq, blk + blk_bytes + i * 4, 4);
+                ri_abs[row0 + i] = (float)uq / 256.0f;
+            }
+            fpga_sim::axi_vecmul_tile_q4k_axilite(blk, tr,
+                act, cols_per_tile, ri_abs, accumulator, row0);
+        }
+        return (d->num_tiles / cg) * tr;
+    }
+    default:
+        fprintf(stderr, "[PHASEB] Unsupported type %d\n", d->tensor_type);
+        return 0;
+    }
+}
+
+// Verify the descriptor chain: run all descriptors, compare with expected results
+static int phaseb_verify() {
+    if (g_phaseb.slots.empty()) return 0;
+    printf("\n[PHASEB] Verifying %zu descriptors, chain head 0x%x...\n",
+           g_phaseb.slots.size(), g_phaseb.head);
+    phaseb_dump();
+
+    int errors = 0;
+    int desc_idx = 0;
+    uint32_t off = g_phaseb.head;
+    const int64_t max_err = 2; // allow ±2 in token output
+
+    while (off && desc_idx < (int)g_phaseb.slots.size()) {
+        auto& slot = g_phaseb.slots[desc_idx];
+        auto* d = (fpga_sim::PhaseBDescriptor*)(g_ddr + off);
+
+        // Allocate accumulator sized to descriptor output rows
+        int max_rows = (d->tensor_type == fpga_sim::DESC_TYPE_Q5_0)
+            ? d->num_tiles * d->tile_res_rows
+            : (d->num_tiles / d->num_col_groups) * d->tile_res_rows;
+        std::vector<int64_t> accumulator(max_rows, 0);
+        int nrows = phaseb_run_descriptor(off, accumulator.data());
+
+        // Write accumulator results to DDR at result_addr
+        for (int i = 0; i < nrows; i++)
+            *(int64_t*)(g_ddr + slot.result_addr + i * 8) = accumulator[i];
+
+        // Dequantize and compare with expected
+        const float x_scale = slot.x_scale;
+        for (int i = 0; i < nrows; i++) {
+            double computed = (double)accumulator[i] * x_scale / slot.row_inv[i];
+            double diff = fabs(computed - slot.expected[i]);
+            if (diff > max_err) {
+                if (errors < 20) {
+                    fprintf(stderr, "[PHASEB] desc %d row %d: expected %.6f got %.6f (err %.6f)\n",
+                            desc_idx, i, slot.expected[i], (float)computed, diff);
+                }
+                errors++;
+            }
+        }
+
+        off = ((fpga_sim::PhaseBDescriptor*)(g_ddr + off))->next_desc_addr;
+        desc_idx++;
+    }
+
+    printf("[PHASEB] %d descriptors verified, %d errors\n", desc_idx, errors);
+    return errors;
+}
+
+// ===========================================================================
 // FPGA MATMUL (SIMULATED INT8 SYSTOLIC ACCELERATOR)
 // ===========================================================================
 // FPGA MATMUL INT16 — CPU quantizes weights to INT16, INT16×INT16 matmul
@@ -738,6 +1108,19 @@ void matmul_fpga_q4_k(const Tensor* A, const float* x, float* y, int rows, int c
         int64_t tile_result[896] = {0};
         int block_stride = cols / 256;
 
+        // Phase B DDR pre-allocation
+        uint32_t phaseb_wt_addr = 0, phaseb_act_addr = 0, phaseb_res_addr = 0;
+        int phaseb_ntiles = 0, phaseb_ncg = 0;
+        if (g_fpga_phaseb) {
+            constexpr int TR = 56;
+            phaseb_ncg = (cols + 255) / 256;
+            int nrow_tiles = (rows + TR - 1) / TR;
+            phaseb_ntiles = phaseb_ncg * nrow_tiles;
+            phaseb_wt_addr = phaseb_alloc(phaseb_ntiles * fpga_sim::PHASEB_Q4_K_TILE_BYTES);
+            phaseb_act_addr = phaseb_alloc(cols * 2);
+            phaseb_res_addr = phaseb_alloc(rows * 8);
+        }
+
         for (int c = 0; c < cols; c += 256) {
             int block_base_offset = c / 256;
 
@@ -752,6 +1135,23 @@ void matmul_fpga_q4_k(const Tensor* A, const float* x, float* y, int rows, int c
                            fpga_sim::Q4K_BLOCK_BYTES);
                 }
 
+                // Phase B: copy tile blocks to DDR
+                if (g_fpga_phaseb && phaseb_wt_addr) {
+                    int cg_idx = c / 256;
+                    int rg = row0 / 56;
+                    int ti = rg * phaseb_ncg + cg_idx;
+                    uint8_t* ddr_tile = g_ddr + phaseb_wt_addr + ti * fpga_sim::PHASEB_Q4_K_TILE_BYTES;
+                    memcpy(ddr_tile, blocks, nblocks * fpga_sim::Q4K_BLOCK_BYTES);
+                    for (int i = 0; i < nblocks; i++) {
+                        uint32_t uq = (uint32_t)(row_inv[row0 + i] * 256.0f + 0.5f);
+                        memcpy(ddr_tile + fpga_sim::PHASEB_Q4_K_BLK_BYTES + i * 4, &uq, 4);
+                    }
+                    for (int i = nblocks; i < 56; i++) {
+                        uint32_t uq = 0;
+                        memcpy(ddr_tile + fpga_sim::PHASEB_Q4_K_BLK_BYTES + i * 4, &uq, 4);
+                    }
+                }
+
                 fpga_sim::axi_vecmul_tile_q4k_axilite(
                     blocks, nblocks, x_q.data() + c, 256, row_inv, tile_result, row0);
 
@@ -761,6 +1161,22 @@ void matmul_fpga_q4_k(const Tensor* A, const float* x, float* y, int rows, int c
 
         for (int i = 0; i < rows; i++) {
             y[i] += (double)tile_result[i] * x_scale / (double)row_inv[i];
+        }
+
+        // Phase B: build descriptor for this Q4_K matmul
+        if (g_fpga_phaseb && phaseb_wt_addr) {
+            constexpr int TILE_ROWS = 56;
+            memcpy(g_ddr + phaseb_act_addr, x_q.data(), cols * 2);
+            phaseb_add_descriptor(phaseb_wt_addr, phaseb_act_addr, phaseb_res_addr,
+                phaseb_ntiles, fpga_sim::PHASEB_Q4_K_TILE_BYTES, fpga_sim::DESC_TYPE_Q4_K,
+                TILE_ROWS, 0, cols * 2, phaseb_ncg);
+            PhaseBVerifySlot vs;
+            vs.result_addr = phaseb_res_addr;
+            vs.nrows = rows;
+            vs.x_scale = x_scale;
+            vs.row_inv.assign(row_inv, row_inv + rows);
+            vs.expected.assign(y, y + rows);
+            g_phaseb.slots.push_back(vs);
         }
 
     auto t1 = std::chrono::high_resolution_clock::now();
@@ -858,6 +1274,58 @@ void matmul_fpga_q5_0(const Tensor* A, const float* x, float* y, int rows, int c
         y[i] += (double)tile_result[i] * x_scale / (double)row_inv[i];
     }
 
+    // Phase B: pack tiles into DDR and build descriptor
+    if (g_fpga_phaseb) {
+        constexpr int TR = fpga_sim::PHASEB_Q5_0_ROWS;
+        constexpr int TILE_BYTES = fpga_sim::PHASEB_Q5_0_TILE_BYTES;
+        constexpr int BLK_BYTES = fpga_sim::PHASEB_Q5_0_BLK_BYTES;
+        int ntiles = (rows + TR - 1) / TR;
+        int num_cg = 1;  // Q5_0 covers full width
+
+        uint32_t wt_addr = phaseb_alloc(ntiles * TILE_BYTES);
+        uint32_t act_addr = phaseb_alloc(cols * 2);
+        uint32_t res_addr = phaseb_alloc(rows * 8);
+        if (wt_addr && act_addr && res_addr) {
+            // Pack each tile's blocks into DDR
+            for (int row0 = 0; row0 < rows; row0 += TR) {
+                int r_size = std::min(TR, rows - row0);
+                int ti = row0 / TR;
+                uint8_t* ddr_tile = g_ddr + wt_addr + ti * TILE_BYTES;
+                uint64_t tile_base_block = (uint64_t)row0 * row_stride_blocks;
+                for (int bi = 0; bi < BLOCKS_PER_TILE; bi++) {
+                    memcpy(ddr_tile + bi * fpga_sim::Q5_0_BLOCK_BYTES,
+                           A->data + (tile_base_block + bi) * fpga_sim::Q5_0_BLOCK_BYTES,
+                           fpga_sim::Q5_0_BLOCK_BYTES);
+                }
+                // Write row_inv UQ16.8 to scale section
+                for (int i = 0; i < r_size; i++) {
+                    uint16_t uq = (uint16_t)(row_inv[row0 + i] * 256.0f + 0.5f);
+                    memcpy(ddr_tile + BLK_BYTES + i * 2, &uq, 2);
+                }
+                // Zero-fill unused row slots in scale section
+                for (int i = r_size; i < TR; i++) {
+                    uint16_t uq = 0;
+                    memcpy(ddr_tile + BLK_BYTES + i * 2, &uq, 2);
+                }
+            }
+            // Write quantized activation to DDR
+            memcpy(g_ddr + act_addr, x_q.data(), cols * 2);
+
+            phaseb_add_descriptor(wt_addr, act_addr, res_addr,
+                ntiles, TILE_BYTES, fpga_sim::DESC_TYPE_Q5_0, TR,
+                0, cols * 2, num_cg);
+
+            // Save verify slot
+            PhaseBVerifySlot vs;
+            vs.result_addr = res_addr;
+            vs.nrows = rows;
+            vs.x_scale = x_scale;
+            vs.row_inv.assign(row_inv.begin(), row_inv.end());
+            vs.expected.assign(y, y + rows);
+            g_phaseb.slots.push_back(vs);
+        }
+    }
+
     auto t1 = std::chrono::high_resolution_clock::now();
     double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
     fpga_sim::g_timing.cpu_ms += ms;
@@ -929,6 +1397,18 @@ void matmul_fpga_q6_k(const Tensor* A, const float* x, float* y, int rows, int c
     constexpr int TILE_ROWS = 32;
     constexpr int BLOCKS_PER_TILE = 32;
 
+    // Phase B DDR addresses (pre-allocated)
+    uint32_t phaseb_wt_addr = 0, phaseb_act_addr = 0, phaseb_res_addr = 0;
+    int phaseb_ntiles = 0, phaseb_ncg = 0;
+    if (g_fpga_phaseb) {
+        phaseb_ncg = (cols + fpga_sim::PHASEB_Q6_K_COLS - 1) / fpga_sim::PHASEB_Q6_K_COLS;
+        int nrow_tiles = (rows + TILE_ROWS - 1) / TILE_ROWS;
+        phaseb_ntiles = phaseb_ncg * nrow_tiles;
+        phaseb_wt_addr = phaseb_alloc(phaseb_ntiles * fpga_sim::PHASEB_Q6_K_TILE_BYTES);
+        phaseb_act_addr = phaseb_alloc(cols * 2);
+        phaseb_res_addr = phaseb_alloc(rows * 8);
+    }
+
     for (int c = 0; c < cols; c += fpga_sim::Q6_K_BLOCK_SIZE) {
         int block_base_offset = c / fpga_sim::Q6_K_BLOCK_SIZE;
 
@@ -941,6 +1421,24 @@ void matmul_fpga_q6_k(const Tensor* A, const float* x, float* y, int rows, int c
                 memcpy(blocks + bi * fpga_sim::Q6_K_BLOCK_BYTES,
                        A->data + block_idx * fpga_sim::Q6_K_BLOCK_BYTES,
                        fpga_sim::Q6_K_BLOCK_BYTES);
+            }
+
+            // Phase B: copy tile blocks to DDR
+            if (g_fpga_phaseb && phaseb_wt_addr) {
+                int cg_idx = c / fpga_sim::PHASEB_Q6_K_COLS;
+                int rg = row0 / TILE_ROWS;
+                int ti = rg * phaseb_ncg + cg_idx;
+                uint8_t* ddr_tile = g_ddr + phaseb_wt_addr + ti * fpga_sim::PHASEB_Q6_K_TILE_BYTES;
+                memcpy(ddr_tile, blocks, nblocks * fpga_sim::Q6_K_BLOCK_BYTES);
+                // Write row_inv UQ24.8 to scale section
+                for (int i = 0; i < nblocks; i++) {
+                    uint32_t uq = (uint32_t)(row_inv[row0 + i] * 256.0f + 0.5f);
+                    memcpy(ddr_tile + fpga_sim::PHASEB_Q6_K_BLK_BYTES + i * 4, &uq, 4);
+                }
+                for (int i = nblocks; i < TILE_ROWS; i++) {
+                    uint32_t uq = 0;
+                    memcpy(ddr_tile + fpga_sim::PHASEB_Q6_K_BLK_BYTES + i * 4, &uq, 4);
+                }
             }
 
             fpga_sim::axi_vecmul_tile_q6_k_axilite(
@@ -972,6 +1470,21 @@ void matmul_fpga_q6_k(const Tensor* A, const float* x, float* y, int rows, int c
 
     for (int i = 0; i < rows; i++) {
         y[i] += (double)tile_result[i] * x_scale / (double)row_inv[i];
+    }
+
+    // Phase B: build descriptor for this Q6_K matmul
+    if (g_fpga_phaseb && phaseb_wt_addr) {
+        memcpy(g_ddr + phaseb_act_addr, x_q.data(), cols * 2);
+        phaseb_add_descriptor(phaseb_wt_addr, phaseb_act_addr, phaseb_res_addr,
+            phaseb_ntiles, fpga_sim::PHASEB_Q6_K_TILE_BYTES, fpga_sim::DESC_TYPE_Q6_K,
+            TILE_ROWS, 0, cols * 2, phaseb_ncg);
+        PhaseBVerifySlot vs;
+        vs.result_addr = phaseb_res_addr;
+        vs.nrows = rows;
+        vs.x_scale = x_scale;
+        vs.row_inv.assign(row_inv, row_inv + rows);
+        vs.expected.assign(y, y + rows);
+        g_phaseb.slots.push_back(vs);
     }
 
     auto t1 = std::chrono::high_resolution_clock::now();
@@ -1514,10 +2027,12 @@ int main(int argc, char** argv) {
         printf("  --fpga-q4k:   Q4_K FPGA path for Q4_K tensors (FFN down proj odd), INT16 fallback\n");
         printf("  --fpga-q5-0: Q5_0 FPGA path for Q5_0 tensors (attn Q/K/O, ffn gate/up), INT16 fallback\n");
         printf("  --fpga-q6-k: Q6_K FPGA path for Q6_K tensors (FFN down proj even), INT16 fallback\n");
+        printf("  --fpga-phaseb: Build Phase B descriptor chain (alongside AXI-Lite path)\n");
         printf("  --perf:       Enable pipeline profiling (Chrome trace JSON + bottleneck analysis)\n");
         printf("  --dump-tiles N: Dump first N Q8 tiles for Verilog cosimulation\n");
         printf("  --dump-tiles-q6-k N: Dump first N Q6_K tiles for Verilog cosimulation\n");
         printf("  --dump-tiles-q5-0 N: Dump first N Q5_0 tiles for Verilog cosimulation\n");
+        printf("  --dump-phaseb: Write /tmp/tb_phaseb.bin (DDR image) + /tmp/tb_phaseb.hdr for iVerilog\n");
         return 1;
     }
 
@@ -1542,6 +2057,8 @@ int main(int argc, char** argv) {
         if (strcmp(argv[i], "--fpga-q4k") == 0) { g_use_fpga = true; g_fpga_q4k = true; }
         if (strcmp(argv[i], "--fpga-q5-0") == 0) { g_use_fpga = true; g_fpga_q5_0 = true; }
         if (strcmp(argv[i], "--fpga-q6-k") == 0) { g_use_fpga = true; g_fpga_q6_k = true; }
+        if (strcmp(argv[i], "--fpga-phaseb") == 0) { g_fpga_phaseb = true; g_use_fpga = true; g_fpga_q5_0 = true; g_fpga_q6_k = true; g_fpga_q4k = true; g_fpga_q8 = true; }
+        if (strcmp(argv[i], "--dump-phaseb") == 0) { g_dump_phaseb = true; }
         if (strcmp(argv[i], "--perf") == 0) g_perf_enabled = true;
         if (strcmp(argv[i], "--dump-tiles") == 0 && i + 1 < argc) {
             int n = atoi(argv[++i]);
@@ -1581,6 +2098,11 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (g_fpga_phaseb) {
+        phaseb_init();
+        printf("[PHASEB] Descriptor chain mode enabled\n");
+    }
+
     std::vector<int> tokens;
     int token;
     while (scanf("%d", &token) == 1) tokens.push_back(token);
@@ -1614,6 +2136,12 @@ int main(int argc, char** argv) {
     if (g_use_fpga) {
         fpga_sim::g_timing.total_fpga_cycles += fpga_sim::accel().total_cycles();
         fpga_sim::g_timing.report();
+    }
+    if (g_fpga_phaseb) {
+        phaseb_verify();
+    }
+    if (g_dump_phaseb) {
+        phaseb_dump_files();
     }
     if (g_perf_enabled) {
         print_trace_summary();

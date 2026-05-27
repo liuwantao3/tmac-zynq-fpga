@@ -1006,10 +1006,27 @@ inline void axi_vecmul_tile_q5_0_8x896_axilite(
     constexpr int NROWS = 8;
     int64_t acc[NROWS] = {0};
 
+    // Fixed-point F16 decode: matches Verilog matmul_q5_0_core.v
+    // F16 → integer d_fp = round(f16 * 256) via integer arithmetic
     for (int bi = 0; bi < NBLOCKS; bi++) {
         const uint8_t* blk = blocks_224 + bi * Q5_0_BLOCK_BYTES;
 
-        float d = read_f16(blk);
+        // Load F16 scale (little-endian)
+        uint16_t f16_bits = (uint16_t)blk[0] | ((uint16_t)blk[1] << 8);
+        uint16_t f16_exp = (f16_bits >> 10) & 0x1F;
+        uint16_t f16_mant = f16_bits & 0x3FF;
+
+        int32_t d_fp;
+        if (f16_exp == 0 || f16_exp == 31) {
+            d_fp = 0;
+        } else if (f16_exp >= 17) {
+            d_fp = (int32_t)(1024 + f16_mant) << (f16_exp - 17);
+        } else {
+            int shift = 17 - f16_exp;
+            d_fp = ((int32_t)(1024 + f16_mant) + (1 << (shift - 1))) >> shift;
+        }
+
+        // Load qh (4 bytes, little-endian)
         uint32_t qh = (uint32_t)blk[2] | ((uint32_t)blk[3] << 8) |
                       ((uint32_t)blk[4] << 16) | ((uint32_t)blk[5] << 24);
 
@@ -1018,18 +1035,25 @@ inline void axi_vecmul_tile_q5_0_8x896_axilite(
             int row = flat / TILE_COLS;
             int col = flat % TILE_COLS;
 
-            uint64_t j = wi < 16 ? wi : wi - 16;
+            int64_t j = wi < 16 ? wi : wi - 16;
             uint8_t qs_byte = blk[6 + j];
             uint8_t ql = (wi < 16) ? (qs_byte & 0xF) : (qs_byte >> 4);
             uint8_t qh_bit = (qh >> wi) & 1;
-            int q = ((qh_bit << 4) | ql) - 16;
+            int q5 = ((qh_bit << 4) | ql) - 16;
 
-            float val_f = d * (float)q;
-            float norm = val_f * row_inv[row];
+            // Fixed-point: val_norm = d_fp * q5 * row_scale >>> 8
+            // row_inv is UQ16.8 format (e.g., 25488 = 99.5625)
+            uint16_t row_scale_uq = (uint16_t)(row_inv[row] * 256.0f + 0.5f);
+
+            int64_t val_norm = (int64_t)d_fp * (int64_t)q5 * (int64_t)(row_scale_uq & 0xFFFF);
+            // Divide by 256: floor for positive, (x-255)/256 for negative (matches Verilog >>> 8)
+            if (val_norm >= 0) val_norm = val_norm / 256;
+            else val_norm = (val_norm - 255) / 256;
+
             int16_t val_i16;
-            if (norm > 32767.0f) val_i16 = 32767;
-            else if (norm < -32768.0f) val_i16 = -32768;
-            else val_i16 = (int16_t)roundf(norm);
+            if (val_norm > 32767) val_i16 = 32767;
+            else if (val_norm < -32768) val_i16 = -32768;
+            else val_i16 = (int16_t)(val_norm & 0xFFFF);
 
             acc[row] += (int64_t)val_i16 * (int64_t)act_reg[col];
         }
@@ -1174,5 +1198,65 @@ inline void axi_vecmul_q4k_row2(const uint8_t* tensor_data, int cols,
     result[0] = acc[0];
     result[1] = acc[1];
 }
+
+// ===========================================================================
+// Phase B Descriptor Chain — matches verilog/matmul_top.v descriptor format
+// ===========================================================================
+#pragma pack(push, 1)
+struct PhaseBDescriptor {
+    uint32_t next_desc_addr;   // 0x00
+    uint32_t weight_addr;      // 0x04
+    uint32_t act_addr;         // 0x08
+    uint32_t result_addr;      // 0x0C
+    uint16_t num_tiles;        // 0x10
+    uint16_t tile_bytes;       // 0x12
+    uint8_t  tensor_type;      // 0x14
+    uint8_t  tile_res_rows;    // 0x15
+    uint8_t  flags;            // 0x16  [0]=interrupt
+    uint16_t act_total_bytes;  // 0x17-0x18
+    uint8_t  num_col_groups;   // 0x19
+    uint8_t  reserved[6];      // 0x1A-0x1F
+};
+#pragma pack(pop)
+static_assert(sizeof(PhaseBDescriptor) == 32, "PhaseBDescriptor must be 32 bytes");
+
+// Tensor type constants for descriptor (matches TENSOR_Q*)
+constexpr uint8_t DESC_TYPE_INT16 = 0;
+constexpr uint8_t DESC_TYPE_Q5_0  = 6;
+constexpr uint8_t DESC_TYPE_Q8_0  = 8;
+constexpr uint8_t DESC_TYPE_Q4_K  = 12;
+constexpr uint8_t DESC_TYPE_Q6_K  = 14;
+constexpr uint8_t DESC_FLAG_INTERRUPT = 0x01;
+
+// Phase B tile constants (block data + scale data for HP burst)
+constexpr int PHASEB_Q5_0_ROWS        = 8;
+constexpr int PHASEB_Q5_0_COLS        = 896;
+constexpr int PHASEB_Q5_0_BLK_BYTES   = 224 * 22;  // 4928
+constexpr int PHASEB_Q5_0_SCL_BYTES   = 8 * 4;     // 32  (row_inv UQ24.8)
+constexpr int PHASEB_Q5_0_TILE_BYTES  = PHASEB_Q5_0_BLK_BYTES + PHASEB_Q5_0_SCL_BYTES; // 4960
+
+constexpr int PHASEB_Q6_K_ROWS        = 32;
+constexpr int PHASEB_Q6_K_COLS        = 256;
+constexpr int PHASEB_Q6_K_BLK_BYTES   = 32 * 210;  // 6720
+constexpr int PHASEB_Q6_K_SCL_BYTES   = 32 * 4;     // 128 (row_inv UQ24.8)
+constexpr int PHASEB_Q6_K_TILE_BYTES  = 6848;
+
+constexpr int PHASEB_Q4_K_ROWS        = 56;
+constexpr int PHASEB_Q4_K_COLS        = 256;
+constexpr int PHASEB_Q4_K_BLK_BYTES   = 56 * 144;  // 8064
+constexpr int PHASEB_Q4_K_SCL_BYTES   = 56 * 4;     // 224 (row_inv UQ24.8)
+constexpr int PHASEB_Q4_K_TILE_BYTES  = 8288;
+
+constexpr int PHASEB_Q8_0_ROWS        = 64;
+constexpr int PHASEB_Q8_0_COLS        = 64;
+constexpr int PHASEB_Q8_0_BLK_BYTES   = 4096;
+constexpr int PHASEB_Q8_0_SCL_BYTES   = 128 * 2;   // combined scales UQ8.8
+constexpr int PHASEB_Q8_0_TILE_BYTES  = 4352;
+
+constexpr int PHASEB_INT16_ROWS       = 64;
+constexpr int PHASEB_INT16_COLS       = 64;
+constexpr int PHASEB_INT16_BLK_BYTES  = 8192;
+constexpr int PHASEB_INT16_SCL_BYTES  = 0;
+constexpr int PHASEB_INT16_TILE_BYTES = 8192;
 
 } // namespace fpga_sim
