@@ -36,6 +36,9 @@ Qwen2-0.5B FPGA accelerator targeting Zynq 7010. Quad-core Verilog RTL: INT16×I
 IDLE → LOAD_WEIGHT → LOAD_ACT → COMPUTE → DRAIN → IDLE
 ```
 
+### Descriptor Chain (OP→OP, no CPU):
+Descriptors in DDR form a linked list. Each descriptor contains weight/act/result addresses, tensor type, and `act_total_bytes`. When descriptor N's `result_addr` equals descriptor N+1's `act_addr`, the chain auto-derives `act_total_bytes = prev.tile_res_rows × 8` (all cores output 48-bit fixed-point, 8 bytes/row). Header validation in `tb_phaseb.v` checks this invariant.
+
 ### Dispatch Logic (tmac_gguf.cpp:452-465):
 ```
 if (g_fpga_q5_0 && A->type == TENSOR_Q5_0) → matmul_fpga_q5_0()  (attn_q/k/o, ffn_gate/up)
@@ -47,13 +50,15 @@ else → matmul_fpga_int16()   (F32 norms, fallback)
 
 ### Tile Sizes and Buffer Usage:
 
-| Type | Tile | Blocks | Bytes/tile | weight_buf |
-|------|------|--------|------------|------------|
-| Q8_0 | 64×896 | — | 4100 | 4096 |
-| Q5_0 | 8×896 | 224 | 4928 | 8192 |
-| Q6_K | 32×256 | 32 | 6720 | 8192 |
-| Q4_K | 56×256 | 56 | 8064 | 8192 |
-| INT16 | 64×64 | — | 8192 | 8192 |
+| Type | Tile | Blocks | Bytes/tile | weight_buf | Result Bytes/row |
+|------|------|--------|------------|------------|-----------------|
+| Q8_0 | 64×896 | — | 4100 | 4096 | 8 |
+| Q5_0 | 8×896 | 224 | 4928 | 8192 | 8 |
+| Q6_K | 32×256 | 32 | 6720 | 8192 | 8 |
+| Q4_K | 56×256 | 56 | 8064 | 8192 | 8 |
+| INT16 | 64×64 | — | 8192 | 8192 | 8 |
+
+All cores output S24.8 fixed-point (48-bit accumulator, zero-extended to 64-bit in DDR).
 
 ### Existing Verilog Cores:
 
@@ -74,10 +79,11 @@ else → matmul_fpga_int16()   (F32 norms, fallback)
 
 1. ~~Implement `matmul_q5_0_core.v`~~ ✅ Done
 2. ~~Implement `matmul_q6_k_core.v`~~ ✅ Done
-3. Instantiate Q5_0 and Q6_K cores in `matmul_top.v` — add mode bits and mux
-4. Create testbenches for Q5_0 and Q6_K cores
+3. ~~Instantiate Q5_0 and Q6_K cores in `matmul_top.v`~~ ✅ Done (2026-05-27)
+4. ~~Create testbenches for Q5_0 and Q6_K cores~~ ✅ Done (2026-05-27)
 5. Vivado simulation — run with Vivado 2019
 6. ~~End-to-end inference test~~ ✅ Verified: all paths produce same token (11 358 3003)
+7. ~~Descriptor chain OP→OP format fix~~ ✅ Done (2026-05-27): auto-derive `act_total_bytes` from previous result when chaining
 
 ## Build & Run Commands
 
