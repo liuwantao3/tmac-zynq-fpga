@@ -502,12 +502,18 @@ void matmul_transposed(const Tensor* A, const float* x, float* y, int rows, int 
 // PHASE B DESCRIPTOR CHAIN — DDR-packed tile dispatch
 // ===========================================================================
 
+// Track previous descriptor's result for OP→OP chain auto-derivation
+static uint32_t g_prev_result_addr = 0;
+static uint8_t  g_prev_tile_res_rows = 0;
+
 // Initialize Phase B chain state
 // Use a region of g_ddr far past the model data (model ~374 MB, DDR=512 MB)
 static void phaseb_init() {
     g_phaseb = {};
     g_phaseb.next_off = 0x18000000;  // 384 MB — well past any tensor data
     g_phaseb.slots.reserve(16);
+    g_prev_result_addr = 0;
+    g_prev_tile_res_rows = 0;
 }
 
 // Bump-allocate from g_ddr
@@ -540,7 +546,17 @@ static uint32_t phaseb_add_descriptor(
     d->tensor_type = tensor_type;
     d->tile_res_rows = tile_res_rows;
     d->flags = flags;
-    d->act_total_bytes = act_total_bytes;
+    // OP→OP chaining: if act_addr == prev result_addr, auto-derive
+    // act_total_bytes = prev.tile_res_rows × 8 (48-bit fixed-point result)
+    if (act_addr == g_prev_result_addr && g_prev_result_addr != 0) {
+        uint16_t derived_act_bytes = (uint16_t)g_prev_tile_res_rows * 8u;
+        fprintf(stderr, "[PHASEB] Chain detected: act_addr=0x%04x matches prev result, "
+                        "auto-derive act_total_bytes=%u (prev rows=%u)\n",
+                act_addr, derived_act_bytes, g_prev_tile_res_rows);
+        d->act_total_bytes = derived_act_bytes;
+    } else {
+        d->act_total_bytes = act_total_bytes;
+    }
     d->num_col_groups = num_col_groups;
     memset(d->reserved, 0, 7);
     if (g_phaseb.tail) {
@@ -550,6 +566,8 @@ static uint32_t phaseb_add_descriptor(
         g_phaseb.head = off;
     }
     g_phaseb.tail = off;
+    g_prev_result_addr = result_addr;
+    g_prev_tile_res_rows = tile_res_rows;
     return off;
 }
 
@@ -581,8 +599,10 @@ static void phaseb_dump() {
 //   [4..7]:    uint32_t ndesc
 //   [8..11]:   uint32_t desc_base_addr (DDR offset of contiguous descriptors)
 //   [12..15]:  uint32_t total_entries  (sum of all nrows)
-//   [16..]:    per-descriptor table: ndesc x 16 bytes each:
-//                uint32_t result_addr, uint32_t nrows, uint32_t reserved, uint32_t expected_offset
+//   [16..]:    per-descriptor table: ndesc x 24 bytes each:
+//                uint32_t result_addr, uint32_t nrows,
+//                uint32_t act_total_bytes, uint32_t prev_result_addr,
+//                uint32_t expected_offset
 //              then flat int64_t expected[total_entries]
 static void phaseb_dump_files() {
     if (g_phaseb.slots.empty()) { fprintf(stderr, "[PHASEB] Nothing to dump\n"); return; }
@@ -662,13 +682,17 @@ static void phaseb_dump_files() {
 
     // Write per-descriptor table
     uint32_t expected_offset = 0;
+    uint32_t prev_result_addr = 0;
     for (int i = 0; i < ndesc; i++) {
-        uint32_t zero = 0;
+        auto* d = (fpga_sim::PhaseBDescriptor*)(g_ddr + desc_offsets[i]);
+        uint32_t act_total_bytes_32 = d->act_total_bytes;
         fwrite(&dinfo[i].result_addr, 4, 1, fhdr);
         fwrite(&dinfo[i].nrows, 4, 1, fhdr);
-        fwrite(&zero, 4, 1, fhdr);  // reserved
+        fwrite(&act_total_bytes_32, 4, 1, fhdr);
+        fwrite(&prev_result_addr, 4, 1, fhdr);
         fwrite(&expected_offset, 4, 1, fhdr);
         expected_offset += dinfo[i].nrows;
+        prev_result_addr = dinfo[i].result_addr;
     }
 
     // Write flat expected array

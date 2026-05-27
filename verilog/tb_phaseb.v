@@ -196,6 +196,12 @@ module tb_phaseb;
     integer   h_desc_base;
     integer   h_total_entries;
 
+    reg [31:0] h_desc_act_bytes [0:15];
+    reg [31:0] h_desc_prev_res  [0:15];
+
+    integer    desc_i;  // shared between header parsing and test sequence
+    integer    hdr_off;
+
     initial begin
         hdr_loaded = 0;
         hdr_fd = $fopen("/tmp/tb_phaseb.hdr", "rb");
@@ -209,6 +215,24 @@ module tb_phaseb;
             h_total_entries = {hdr_buf[15], hdr_buf[14], hdr_buf[13], hdr_buf[12]};
             $display("[TB] Header: ndesc=%0d desc_base=0x%08x total_entries=%0d",
                      h_ndesc, h_desc_base, h_total_entries);
+            // Parse per-descriptor table (24 bytes each after 16-byte header)
+            for (desc_i = 0; desc_i < h_ndesc && desc_i < 16; desc_i = desc_i + 1) begin
+                hdr_off = 16 + desc_i * 24;
+                h_desc_act_bytes[desc_i] = hdr_read32(hdr_off + 8);
+                h_desc_prev_res[desc_i]   = hdr_read32(hdr_off + 12);
+                $display("[TB]   desc %0d: act_total_bytes=%0d prev_result=0x%08x",
+                         desc_i, h_desc_act_bytes[desc_i], h_desc_prev_res[desc_i]);
+                // Validate chain: if prev_result addr matches prior desc result, act_total_bytes should = prev_rows × 8
+                if (desc_i > 0 && h_desc_prev_res[desc_i] != 0) begin
+                    integer prev_rows, expected_act_bytes;
+                    prev_rows = hdr_read32(16 + (desc_i-1) * 24 + 4);  // nrows of prev desc
+                    expected_act_bytes = prev_rows * 8;
+                    if (h_desc_act_bytes[desc_i] != expected_act_bytes) begin
+                        $display("[TB] WARNING: desc %0d act_total_bytes=%0d != expected %0d (prev rows=%0d, chain)",
+                                 desc_i, h_desc_act_bytes[desc_i], expected_act_bytes, prev_rows);
+                    end
+                end
+            end
             hdr_loaded = 1;
         end else begin
             $display("[TB] ERROR: Cannot open /tmp/tb_phaseb.hdr");
@@ -239,9 +263,8 @@ module tb_phaseb;
     // Test sequence
     // ======================================================================
     reg [31:0] rd;
-    integer    desc_i, row_i;
+    integer    row_i;
     integer    total_errors;
-    integer    hdr_off;
     integer    desc_tab_off;
     integer    flat_off;
     integer    exp_off;
