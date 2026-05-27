@@ -16,8 +16,16 @@ module matmul_q5_0_core (
     input  wire [9:0]   act_addr,
     input  wire [15:0]  act_din,
     input  wire [2:0]   res_addr,
-    output wire [47:0]  res_dout
+    output wire [47:0]  res_dout,
+    input  wire         dbg_tile_start,
+    output reg  [31:0]  dbg_tile_cycles,
+    output reg  [7:0]   dbg_tile_id,
+    input  wire         dbg_verbose
 );
+    reg [31:0] cycle_cnt;
+    reg [31:0] tile_start_cycle;
+    reg [31:0] tile_end_cycle;
+    reg [7:0]  tile_counter;
 
     localparam IDLE  = 2'd0;
     localparam LD    = 2'd1;
@@ -84,7 +92,14 @@ module matmul_q5_0_core (
             acc[0] <= 0; acc[1] <= 0; acc[2] <= 0; acc[3] <= 0;
             acc[4] <= 0; acc[5] <= 0; acc[6] <= 0; acc[7] <= 0;
             r_prod <= 0; r_prow <= 0;
+            cycle_cnt <= 0;
+            tile_counter <= 0;
+            tile_start_cycle <= 0;
+            tile_end_cycle <= 0;
+            dbg_tile_cycles <= 0;
+            dbg_tile_id <= 0;
         end else begin
+            cycle_cnt <= cycle_cnt + 1;
             case (state)
                 IDLE: begin
                     done <= 0; busy <= 0;
@@ -92,6 +107,8 @@ module matmul_q5_0_core (
                         acc[0] <= 0; acc[1] <= 0; acc[2] <= 0; acc[3] <= 0;
                         acc[4] <= 0; acc[5] <= 0; acc[6] <= 0; acc[7] <= 0;
                         ei <= 0; busy <= 1;
+                        tile_start_cycle <= cycle_cnt;
+                        tile_counter <= tile_counter + 1;
                         state <= LD;
                     end
                 end
@@ -133,9 +150,9 @@ module matmul_q5_0_core (
 
                     r_prod <= $signed(dec) * $signed(act_reg[r_col]);
 
-                    acc[r_row] <= acc[r_row] + r_prod;
+                    acc[r_row] <= acc[r_row] + $signed(dec) * $signed(act_reg[r_col]);
 
-                    if (ei < 5) begin
+                    if (dbg_verbose && ei < 5) begin
                         $display("[CORE] ei=%0d row=%0d col=%0d d_fp=%0d q5=%0d val_norm=%0d dec=%0d act=%0d prod=%0d acc[%0d]=%0d",
                                  ei, r_row, r_col, d_fp, q5, val_norm, dec, act_reg[r_col], r_prod, r_row, acc[r_row]);
                     end
@@ -149,6 +166,13 @@ module matmul_q5_0_core (
                 end
 
                 DRAIN: begin
+                    tile_end_cycle <= cycle_cnt - 1;
+                    dbg_tile_cycles <= cycle_cnt - tile_start_cycle;
+                    dbg_tile_id <= tile_counter;
+                    $display("[CORE] Tile %02d DONE: start=%0d end=%0d cycles=%0d acc=[%0d,%0d,%0d,%0d,%0d,%0d,%0d,%0d]",
+                             tile_counter, tile_start_cycle, cycle_cnt - 1,
+                             dbg_tile_cycles,
+                             acc[0], acc[1], acc[2], acc[3], acc[4], acc[5], acc[6], acc[7]);
                     done <= 1; busy <= 0;
                     state <= IDLE;
                 end

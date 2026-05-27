@@ -1006,25 +1006,11 @@ inline void axi_vecmul_tile_q5_0_8x896_axilite(
     constexpr int NROWS = 8;
     int64_t acc[NROWS] = {0};
 
-    // Fixed-point F16 decode: matches Verilog matmul_q5_0_core.v
-    // F16 → integer d_fp = round(f16 * 256) via integer arithmetic
+    // F16 dequantization: same as Q6_K/Q4_K (FP32, no fixed-point approximation)
     for (int bi = 0; bi < NBLOCKS; bi++) {
         const uint8_t* blk = blocks_224 + bi * Q5_0_BLOCK_BYTES;
 
-        // Load F16 scale (little-endian)
-        uint16_t f16_bits = (uint16_t)blk[0] | ((uint16_t)blk[1] << 8);
-        uint16_t f16_exp = (f16_bits >> 10) & 0x1F;
-        uint16_t f16_mant = f16_bits & 0x3FF;
-
-        int32_t d_fp;
-        if (f16_exp == 0 || f16_exp == 31) {
-            d_fp = 0;
-        } else if (f16_exp >= 17) {
-            d_fp = (int32_t)(1024 + f16_mant) << (f16_exp - 17);
-        } else {
-            int shift = 17 - f16_exp;
-            d_fp = ((int32_t)(1024 + f16_mant) + (1 << (shift - 1))) >> shift;
-        }
+        float d = read_f16(blk);
 
         // Load qh (4 bytes, little-endian)
         uint32_t qh = (uint32_t)blk[2] | ((uint32_t)blk[3] << 8) |
@@ -1041,19 +1027,13 @@ inline void axi_vecmul_tile_q5_0_8x896_axilite(
             uint8_t qh_bit = (qh >> wi) & 1;
             int q5 = ((qh_bit << 4) | ql) - 16;
 
-            // Fixed-point: val_norm = d_fp * q5 * row_scale >>> 8
-            // row_inv is UQ16.8 format (e.g., 25488 = 99.5625)
-            uint16_t row_scale_uq = (uint16_t)(row_inv[row] * 256.0f + 0.5f);
-
-            int64_t val_norm = (int64_t)d_fp * (int64_t)q5 * (int64_t)(row_scale_uq & 0xFFFF);
-            // Divide by 256: floor for positive, (x-255)/256 for negative (matches Verilog >>> 8)
-            if (val_norm >= 0) val_norm = val_norm / 256;
-            else val_norm = (val_norm - 255) / 256;
+            float val_f = d * (float)q5;
+            float norm = val_f * row_inv[row];
 
             int16_t val_i16;
-            if (val_norm > 32767) val_i16 = 32767;
-            else if (val_norm < -32768) val_i16 = -32768;
-            else val_i16 = (int16_t)(val_norm & 0xFFFF);
+            if (norm > 32767.0f) val_i16 = 32767;
+            else if (norm < -32768.0f) val_i16 = -32768;
+            else val_i16 = (int16_t)roundf(norm);
 
             acc[row] += (int64_t)val_i16 * (int64_t)act_reg[col];
         }
