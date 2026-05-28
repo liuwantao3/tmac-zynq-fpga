@@ -67,7 +67,7 @@ All cores output S24.8 fixed-point (48-bit accumulator, zero-extended to 64-bit 
 | `matmul_q8_core.v` | 64×896 | ~515 | ✅ Working |
 | `matmul_q4k_core.v` | 56×256 | ~? | ✅ Working |
 | `matmul_int16_core.v` | 64×64 | 515 | ✅ Working |
-| `matmul_top.v` | — | — | ✅ 3 cores instantiated (Q8, Q4K, INT16) |
+| `matmul_top.v` | — | — | ✅ 5 cores instantiated (Q8, Q4K, Q5_0, Q6_K, INT16) |
 
 ### Missing Verilog Cores:
 
