@@ -1,0 +1,57 @@
+{
+  "model": "qwen2-0.5b",
+  "num_layers": 28,
+  "hidden_dim": 896,
+  "intermediate_dim": 4864,
+  "vocab_size": 151936,
+  "num_heads": 14,
+  "num_kv_heads": 2,
+  "head_dim": 64,
+  "max_seq_len": 32768,
+  "stages": [
+    {
+      "name": "embedding",
+      "type": "token_embedding",
+      "ops": [
+        {"name": "token_embedding", "weight": "token_embd.weight", "in": "input_ids", "out": "hidden", "quant_type": "Q8_0"}
+      ]
+    },
+    {
+      "name": "layer_00", "ref": "layers/layer_00.json"
+    },
+    {"name": "layer_01", "ref": "layers/layer_01.json"},
+    {"name": "layer_02", "ref": "layers/layer_02.json"},
+    {"name": "layer_03", "ref": "layers/layer_03.json"},
+    {"name": "layer_04", "ref": "layers/layer_04.json"},
+    {"name": "layer_05", "ref": "layers/layer_05.json"},
+    {"name": "layer_06", "ref": "layers/layer_06.json"},
+    {"name": "layer_07", "ref": "layers/layer_07.json"},
+    {"name": "layer_08", "ref": "layers/layer_08.json"},
+    {"name": "layer_09", "ref": "layers/layer_09.json"},
+    {"name": "layer_10", "ref": "layers/layer_10.json"},
+    {"name": "layer_11", "ref": "layers/layer_11.json"},
+    {"name": "layer_12", "ref": "layers/layer_12.json"},
+    {"name": "layer_13", "ref": "layers/layer_13.json"},
+    {"name": "layer_14", "ref": "layers/layer_14.json"},
+    {"name": "layer_15", "ref": "layers/layer_15.json"},
+    {"name": "layer_16", "ref": "layers/layer_16.json"},
+    {"name": "layer_17", "ref": "layers/layer_17.json"},
+    {"name": "layer_18", "ref": "layers/layer_18.json"},
+    {"name": "layer_19", "ref": "layers/layer_19.json"},
+    {"name": "layer_20", "ref": "layers/layer_20.json"},
+    {"name": "layer_21", "ref": "layers/layer_21.json"},
+    {"name": "layer_22", "ref": "layers/layer_22.json"},
+    {"name": "layer_23", "ref": "layers/layer_23.json"},
+    {"name": "layer_24", "ref": "layers/layer_24.json"},
+    {"name": "layer_25", "ref": "layers/layer_25.json"},
+    {"name": "layer_26", "ref": "layers/layer_26.json"},
+    {"name": "layer_27", "ref": "layers/layer_27.json"},
+    {
+      "name": "logits",
+      "ops": [
+        {"name": "rms_norm", "weight": "output_norm.weight", "in": "hidden", "out": "normalized"},
+        {"name": "lm_head", "weight": "lm_head.weight", "in": "normalized", "out": "logits", "quant_type": "Q8_0"}
+      ]
+    }
+  ]
+}

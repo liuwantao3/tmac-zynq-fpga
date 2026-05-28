@@ -1,0 +1,103 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "FPGA Layer Descriptor Chain",
+  "description": "Configuration for a single transformer layer's descriptor chain",
+  "type": "object",
+  "required": ["layer", "hidden_dim", "intermediate_dim", "num_heads", "num_kv_heads", "seq_len", "ops"],
+  "properties": {
+    "layer": {
+      "type": "integer",
+      "description": "Layer index (0-27 for Qwen2-0.5B)",
+      "minimum": 0
+    },
+    "hidden_dim": {
+      "type": "integer",
+      "description": "Hidden dimension (HIDDEN_DIM = 896)"
+    },
+    "intermediate_dim": {
+      "type": "integer",
+      "description": "Intermediate dimension for FFN (INTER_DIM = 4864)"
+    },
+    "num_heads": {
+      "type": "integer",
+      "description": "Number of query heads (NUM_HEADS = 14)"
+    },
+    "num_kv_heads": {
+      "type": "integer",
+      "description": "Number of KV heads (NUM_KV_HEADS = 2)"
+    },
+    "head_dim": {
+      "type": "integer",
+      "description": "Head dimension (HEAD_DIM = 64)"
+    },
+    "seq_len": {
+      "type": "integer",
+      "description": "Current sequence position for RoPE"
+    },
+    "ops": {
+      "type": "array",
+      "description": "Ordered list of operations",
+      "items": {
+        "type": "object",
+        "required": ["name"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Operation name",
+            "enum": [
+              "rms_norm",
+              "matmul_q",
+              "matmul_k",
+              "matmul_v",
+              "matmul_output",
+              "matmul_gate",
+              "matmul_up",
+              "matmul_down",
+              "add_bias",
+              "rope",
+              "softmax_attention",
+              "residual_add",
+              "swiglu"
+            ]
+          },
+          "weight": {
+            "type": "string",
+            "description": "Weight tensor name (for matmul ops)"
+          },
+          "bias": {
+            "type": "string",
+            "description": "Bias tensor name (optional)"
+          },
+          "in": {
+            "type": "string",
+            "description": "Input buffer name"
+          },
+          "out": {
+            "type": "string",
+            "description": "Output buffer name"
+          },
+          "quant_type": {
+            "type": "string",
+            "description": "Quantization type for weights",
+            "enum": ["Q8_0", "Q5_0", "Q6_K", "Q4_K", "INT16"]
+          }
+        }
+      }
+    },
+    "buffers": {
+      "type": "object",
+      "description": "Named memory buffers (DDR offsets)",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "offset": {
+            "type": "integer"
+          },
+          "size": {
+            "type": "integer"
+          }
+        }
+      }
+    }
+  }
+}

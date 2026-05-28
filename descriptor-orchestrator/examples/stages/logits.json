@@ -1,0 +1,7 @@
+{
+  "stage": "logits",
+  "ops": [
+    {"name": "rms_norm", "weight": "output_norm.weight", "in": "hidden", "out": "normalized"},
+    {"name": "lm_head", "weight": "lm_head.weight", "in": "normalized", "out": "logits", "quant_type": "Q8_0"}
+  ]
+}

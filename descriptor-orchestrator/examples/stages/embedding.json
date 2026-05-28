@@ -1,0 +1,6 @@
+{
+  "stage": "embedding",
+  "ops": [
+    {"name": "token_embedding", "weight": "token_embd.weight", "in": "input_ids", "out": "hidden", "quant_type": "Q8_0"}
+  ]
+}

@@ -1,0 +1,78 @@
+{
+  "layer": 11,
+  "ffn_down_type": "Q4_K",
+  "ops": [
+    {
+      "name": "rms_norm",
+      "weight": "blk.11.attn_norm.weight",
+      "in": "hidden",
+      "out": "norm_out"
+    },
+    {
+      "name": "matmul_q",
+      "weight": "blk.11.attn_q.weight",
+      "bias": "blk.11.attn_q.bias",
+      "in": "norm_out",
+      "out": "q"
+    },
+    {
+      "name": "matmul_k",
+      "weight": "blk.11.attn_k.weight",
+      "bias": "blk.11.attn_k.bias",
+      "in": "norm_out",
+      "out": "k"
+    },
+    {
+      "name": "matmul_v",
+      "weight": "blk.11.attn_v.weight",
+      "bias": "blk.11.attn_v.bias",
+      "in": "norm_out",
+      "out": "v"
+    },
+    {
+      "name": "softmax_attention",
+      "in": "q",
+      "out": "context"
+    },
+    {
+      "name": "matmul_output",
+      "weight": "blk.11.attn_output.weight",
+      "in": "context",
+      "out": "attn_out"
+    },
+    {
+      "name": "residual_add",
+      "in": "hidden",
+      "out": "ffn_norm_out"
+    },
+    {
+      "name": "matmul_gate",
+      "weight": "blk.11.ffn_gate.weight",
+      "in": "ffn_norm_out",
+      "out": "gate"
+    },
+    {
+      "name": "matmul_up",
+      "weight": "blk.11.ffn_up.weight",
+      "in": "ffn_norm_out",
+      "out": "up"
+    },
+    {
+      "name": "swiglu",
+      "in": "gate",
+      "out": "swiglu_out"
+    },
+    {
+      "name": "matmul_down",
+      "weight": "blk.11.ffn_down.weight",
+      "in": "swiglu_out",
+      "out": "ffn_out",
+      "quant_type": "Q4_K"
+    },
+    {
+      "name": "residual_add",
+      "in": "hidden",
+      "out": "hidden"
+    }
+  ]
+}
