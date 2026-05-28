@@ -32,6 +32,33 @@ OP_TILE_ROWS = {
     "CPU_OP": 0,
 }
 
+# Load FPGA capabilities from JSON if available
+def load_fpga_caps(path: str = "../fpga_caps.json") -> dict | None:
+    """Load FPGA capabilities from JSON config."""
+    import os
+    full_path = os.path.join(os.path.dirname(__file__), path)
+    if os.path.exists(full_path):
+        with open(full_path) as f:
+            return json.load(f)
+    return None
+
+def validate_fpga_caps(caps: dict, tile_specs: dict) -> bool:
+    """Validate that tile sizes in fpga_caps.json match compiler defaults."""
+    errors = []
+    for qt, rows in tile_specs.items():
+        if qt in caps.get("tile_sizes", {}):
+            cap_rows = caps["tile_sizes"][qt].get("rows")
+            if cap_rows != rows:
+                errors.append(f"{qt}: JSON={cap_rows}, compiler={rows}")
+    if errors:
+        print("[WARNING] FPGA caps mismatch:")
+        for e in errors:
+            print(f"  - {e}")
+        return False
+    else:
+        print("[CAPS] Tile sizes validated OK")
+    return True
+
 DESC_TYPE["token_embedding"] = "Q8_0"
 
 
@@ -169,7 +196,16 @@ def main():
     parser.add_argument("config", help="Pipeline config (model.json)")
     parser.add_argument("-o", "--output", help="Output binary")
     parser.add_argument("-d", "--dump", action="store_true", help="Dump summary")
+    parser.add_argument("--caps", help="FPGA capabilities JSON", default="../fpga_caps.json")
     args = parser.parse_args()
+    
+    # Load and validate FPGA caps
+    caps = load_fpga_caps(args.caps)
+    if caps:
+        print(f'[CAPS] Loaded FPGA capabilities from {args.caps}')
+        validate_fpga_caps(caps, OP_TILE_ROWS)
+    else:
+        print('[CAPS] Using built-in defaults (no fpga_caps.json found)')
     
     binary = compile_pipeline(args.config, args.dump)
     
