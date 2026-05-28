@@ -177,9 +177,6 @@ module matmul_top (
     // ======================================================================
     // Q4K core signals (byte-wide block_buf, auto-increment write_ptr)
     // ======================================================================
-    reg         q4k_wt_we;
-    reg  [12:0] q4k_wt_addr;
-    reg  [7:0]  q4k_wt_din;
     wire        q4k_done, q4k_busy, q4k_decode_busy;
     wire [47:0] q4k_res_dout;
 
@@ -190,9 +187,9 @@ module matmul_top (
         .op_vecmul (1'b1),
         .done      (q4k_done),
         .busy      (q4k_busy),
-        .wt_we     (q4k_wt_we),
-        .wt_addr   (q4k_wt_addr),
-        .wt_din    (q4k_wt_din),
+        .wt_we     (wt_we),
+        .wt_addr   (wt_addr),
+        .wt_din    (wt_din),
         .sc_we     (1'b0),
         .sc_addr   (7'd0),
         .sc_din    (16'd0),
@@ -278,7 +275,11 @@ module matmul_top (
     // AXI4-Lite write FSM
     // ======================================================================
     reg [1:0] wstate;
-    localparam W_IDLE = 0, W_RESP = 1, W_RESP2 = 2;
+    localparam W_IDLE = 0, W_WAIT_W = 1, W_RESP = 2, W_RESP2 = 3;
+
+    reg [15:0] waddr_buf;
+    reg [31:0] wdata_buf;
+    reg [3:0]  wstrb_buf;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -295,41 +296,63 @@ module matmul_top (
             reg_desc_base  <= 0;
             reg_desc_tail  <= 0;
             reg_chain_ctrl <= 0;
+            waddr_buf      <= 0;
+            wdata_buf      <= 0;
+            wstrb_buf      <= 0;
         end else begin
             case (wstate)
                 W_IDLE: begin
                     s_axil_awready <= 1;
                     s_axil_wready  <= 1;
                     if (s_axil_awvalid && s_axil_wvalid) begin
+                        // Both valid same cycle — write immediately
                         s_axil_awready <= 0;
                         s_axil_wready  <= 0;
-                        case (s_axil_awaddr)
-                            REG_AP_CTRL:   reg_ap_ctrl   <= s_axil_wdata;
-                            REG_GIE:       reg_gie       <= s_axil_wdata;
-                            REG_IER:       reg_ier       <= s_axil_wdata;
-                            REG_CTRL_USER: reg_ctrl_user <= s_axil_wdata;
-                            REG_DESC_BASE: reg_desc_base <= s_axil_wdata;
-                            REG_DESC_TAIL: reg_desc_tail <= s_axil_wdata;
-                            REG_CHAIN_CTRL:begin
-                                reg_chain_ctrl <= s_axil_wdata;
-                                if (s_axil_wdata[1]) begin
-                                    reg_desc_head <= 0;
-                                    reg_chain_ctrl[2] <= 0;
-                                end
-                            end
-                            REG_ISR: begin
-                                if (s_axil_wdata[0])
-                                    reg_isr[0] <= 0;
-                            end
-                        endcase
+                        write_reg(s_axil_awaddr, s_axil_wdata, s_axil_wstrb);
+                        wstate <= W_RESP;
+                    end else if (s_axil_awvalid) begin
+                        // Address first, wait for data
+                        s_axil_awready <= 0;
+                        waddr_buf <= s_axil_awaddr;
+                        wstate <= W_WAIT_W;
+                    end else if (s_axil_wvalid) begin
+                        // Data first, wait for address
+                        s_axil_wready <= 0;
+                        wdata_buf <= s_axil_wdata;
+                        wstrb_buf <= s_axil_wstrb;
+                        // Stay in IDLE but with ready deasserted for data channel
+                        wstate <= W_WAIT_W;
+                    end
+                end
+
+                W_WAIT_W: begin
+                    s_axil_awready <= 1;
+                    s_axil_wready  <= 1;
+                    if (s_axil_awvalid && s_axil_wvalid) begin
+                        // Both arrived (one was already buffered, other just arrived)
+                        s_axil_awready <= 0;
+                        s_axil_wready  <= 0;
+                        write_reg(s_axil_awaddr, s_axil_wdata, s_axil_wstrb);
+                        wstate <= W_RESP;
+                    end else if (s_axil_awvalid) begin
+                        // Address arrived (data already buffered)
+                        s_axil_awready <= 0;
+                        write_reg(s_axil_awaddr, wdata_buf, wstrb_buf);
+                        wstate <= W_RESP;
+                    end else if (s_axil_wvalid) begin
+                        // Data arrived (address already buffered)
+                        s_axil_wready <= 0;
+                        write_reg(waddr_buf, s_axil_wdata, s_axil_wstrb);
                         wstate <= W_RESP;
                     end
                 end
+
                 W_RESP: begin
                     s_axil_bvalid <= 1;
                     s_axil_bresp  <= 2'b00;
                     wstate <= W_RESP2;
                 end
+
                 W_RESP2: begin
                     if (s_axil_bready) begin
                         s_axil_bvalid <= 0;
@@ -339,6 +362,38 @@ module matmul_top (
             endcase
         end
     end
+
+    // Write register helper task (compatible with Verilog-2001)
+    task write_reg;
+        input [15:0] addr;
+        input [31:0] data;
+        input [3:0]  strb;
+        begin
+            case (addr)
+                REG_AP_CTRL:   reg_ap_ctrl   <= data;
+                REG_GIE:       reg_gie       <= data;
+                REG_IER:       reg_ier       <= data;
+                REG_CTRL_USER: reg_ctrl_user <= data;
+                REG_DESC_BASE: reg_desc_base <= data;
+                REG_DESC_TAIL: reg_desc_tail <= data;
+                REG_CHAIN_CTRL: begin
+                    reg_chain_ctrl <= data;
+                    if (data[1]) begin
+                        reg_desc_head <= 0;
+                        reg_chain_ctrl[2] <= 0;
+                    end
+                end
+                REG_ISR: begin
+                    if (data[0])
+                        reg_isr[0] <= 0;
+                end
+            endcase
+        end
+    endtask
+
+    // Combinational: wstrb_buf feeds into write_reg but not used for byte-level
+    // writes in the current design (full-word only). The strb input is accepted
+    // for AXI compliance but not gated in the current register file.
 
     // ======================================================================
     // AXI4-Lite read FSM

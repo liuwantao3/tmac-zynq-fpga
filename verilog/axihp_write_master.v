@@ -47,9 +47,12 @@ module axihp_write_master (
             case (state)
                 IDLE: begin
                     if (start && !busy) begin
+                        if (word_count > 256) begin
+                            $display("[WARN] axihp_write_master: word_count=%0d > 256, truncating to 256", word_count);
+                        end
                         busy          <= 1;
                         m_axi_awaddr  <= dst_addr;
-                        m_axi_awlen   <= word_count[7:0] - 1;
+                        m_axi_awlen   <= (|word_count[15:8]) ? 8'd255 : word_count[7:0] - 1;
                         m_axi_awsize  <= 3'd3;
                         m_axi_awburst <= 2'd1;
                         m_axi_awvalid <= 1;

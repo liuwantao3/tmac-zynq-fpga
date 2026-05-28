@@ -94,23 +94,24 @@ module axihp_read_master (
                 DRAIN_BYTE: begin
                     data_out   <= rdata_buf[buf_idx * 8 +: 8];
                     data_valid <= 1;
-                    // Always advance — FSM is always ready
-                    if (buf_idx == 7) begin
-                        // Beat fully drained
-                        buf_idx <= 0;
-                        if (beat_cnt == burst_len) begin
-                            // Last beat of burst
-                            state <= IDLE;
-                            busy  <= 0;
-                            done  <= 1;
+                    if (data_ready) begin
+                        if (buf_idx == 7) begin
+                            // Beat fully drained
+                            buf_idx <= 0;
+                            if (beat_cnt == burst_len) begin
+                                // Last beat of burst
+                                state <= IDLE;
+                                busy  <= 0;
+                                done  <= 1;
+                            end else begin
+                                // More beats in this burst
+                                beat_cnt <= beat_cnt + 1;
+                                m_axi_rready <= 1;
+                                state <= WAIT_R;
+                            end
                         end else begin
-                            // More beats in this burst
-                            beat_cnt <= beat_cnt + 1;
-                            m_axi_rready <= 1;
-                            state <= WAIT_R;
+                            buf_idx <= buf_idx + 1;
                         end
-                    end else begin
-                        buf_idx <= buf_idx + 1;
                     end
                 end
             endcase
