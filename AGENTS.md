@@ -36,6 +36,57 @@ Qwen2-0.5B FPGA accelerator targeting Zynq 7010. Quad-core Verilog RTL: INT16×I
 IDLE → LOAD_WEIGHT → LOAD_ACT → COMPUTE → DRAIN → IDLE
 ```
 
+### CPU-OP Descriptor Protocol (CPU/FPGA synchronization):
+
+To handle CPU-only operations (RMSNorm, RoPE, SoftMax, bias add, SwiGLU, residual add) between FPGA matmuls, the descriptor chain supports a special `CPU_OP` descriptor type (`tensor_type = 15`).
+
+When the FSM encounters a CPU_OP descriptor:
+1. It sets `reg_chain_ctrl[2]=1` and pulses `desc_irq` → CPU interrupt fires
+2. FSM enters `PH_CPU_OP_WAIT` state and **pauses** until CPU resumes it
+3. CPU reads `reg_status` (status=3 = chain busy) to distinguish from chain-complete
+4. CPU reads `reg_desc_head` to identify which descriptor index triggered the CPU_OP
+5. CPU does its work (norm, softmax, etc.) and writes results to DDR
+6. CPU clears `reg_isr[0]` (write REG_ISR) and writes `CHAIN_CTRL[0]=1` to resume
+7. FSM clears the resume signal, advances to next descriptor
+
+The CPU knows what operation to perform from the descriptor's position in the chain (the CPU built the chain, so it has an internal mapping: "descriptor 0 → attn_norm, descriptor 4 → bias+rope+softmax").
+
+**CPU operations per layer** (from `tmac_gguf.cpp`):
+
+| # | Operation | What it does | DDR I/O |
+|---|-----------|-------------|---------|
+| 1 | attn_norm | RMSNorm(hidden) | Read hidden, Write norm_out |
+| 2 | q_bias | q += bias | Read q, Read bias, Write q |
+| 3 | k_bias | k += bias | Read k, Read bias, Write k |
+| 4 | v_bias | v += bias | Read v, Read bias, Write v |
+| 5 | RoPE | apply_rope(q, k, pos) | Read q/k, Write q/k |
+| 6 | SoftMax | score = q·k/√d, softmax, Σv·score | Read q/k/v + KV cache, Write context |
+| 7 | residual | hidden += attn_out | Read hidden, Read attn_out, Write hidden |
+| 8 | ffn_norm | RMSNorm(hidden) | Read hidden, Write norm2 |
+| 9 | SwiGLU | silu(gate) * up | Read gate/up, Write swiglu_out |
+| 10 | residual | hidden += ffn_out | Read hidden, Read ffn_out, Write hidden |
+
+**Typical descriptor chain for one layer** (adjacent CPU ops batched):
+
+```
+Desc  0: CPU_OP           → attn_norm                          (result: norm_out)
+Desc  1: matmul_q5_0      → attn_q     (act: norm_out)          (result: q)
+Desc  2: matmul_q5_0      → attn_k     (act: norm_out)          (result: k)
+Desc  3: matmul_q8_0      → attn_v     (act: norm_out)          (result: v)
+Desc  4: CPU_OP           → bias+rope+softmax                   (result: context)
+Desc  5: matmul_q5_0      → attn_output (act: context)          (result: attn_out)
+Desc  6: CPU_OP           → residual+ffn_norm                   (result: norm2)
+Desc  7: matmul_q5_0      → ffn_gate   (act: norm2)             (result: gate)
+Desc  8: matmul_q5_0      → ffn_up     (act: norm2)             (result: up)
+Desc  9: CPU_OP           → swiglu                              (result: swiglu_out)
+Desc 10: matmul_q6k/q4k   → ffn_down   (act: swiglu_out)        (result: ffn_out)
+Desc 11: CPU_OP           → residual                            (result: hidden)
+```
+
+12 descriptors × 28 layers = 336 descriptors per token. Each CPU_OP triggers one interrupt.
+Adjacent CPU ops are batched into single descriptors (e.g. bias+rope+softmax = one CPU_OP).
+Post-logits (softmax for sampling) is handled outside the descriptor chain.
+
 ### Descriptor Chain (OP→OP, no CPU):
 Descriptors in DDR form a linked list. Each descriptor contains weight/act/result addresses, tensor type, and `act_total_bytes`. When descriptor N's `result_addr` equals descriptor N+1's `act_addr`, the chain auto-derives `act_total_bytes = prev.tile_res_rows × 8` (all cores output 48-bit fixed-point, 8 bytes/row). Header validation in `tb_phaseb.v` checks this invariant.
 
@@ -177,6 +228,11 @@ python3 scripts/extract_tmac.py models/qwen2-0_5b-instruct-q4_k_m.gguf /tmp/mode
 - **AXI address map refactored**: weights at 0x2000-0x3FFF (8 KB, 2048 × 32-bit), acts at 0x1000-0x107C, results at 0x4000-0x40FC/0x4200-0x427C, act readback at 0x5000-0x507C — no address conflicts
 - **ARM bare-metal toolchain installed**: `arm-none-eabi-gcc` 16.1.0 via Homebrew
 - **PS7 bare-metal C test program** at `oss-tools/workspace/sw/`: self-checking INT16 matmul test with UART output, embedded golden reference, verified packing logic
+- **iVerilog all 5 cores pass**: Q8 (6/6), Q4K (4/4), INT16 (smoke), Q5_0 (minimal+fab), Q6_K (minimal+fab)
+- **End-to-end inference verified** with `--fpga-q8 --fpga-q5-0 --fpga-q6-k --fpga-q4k`: produces correct tokens `11 358 3003`, 15× speedup over naive
+- **CPU–FPGA sync protocol** implemented in `matmul_top.v` (PH_CPU_OP_WAIT state, CPU_OP detection, desc_irq), `fpga_sim.hpp` (DESC_TYPE_CPU_OP=15), and `tmac_gguf.cpp` (CPU_OP case in phaseb_run_descriptor)
+- **AGENTS.md updated** with full CPU_OP protocol docs, CPU task table, descriptor chain layout
+- **Code audit** written to `docs/CODE_AUDIT.md` — 6 issues found, all fixed; `tmac_gguf.cpp` compiles clean with `-Wall -Werror`
 
 ### In Progress
 

@@ -557,6 +557,7 @@ module matmul_top (
     localparam PH_WRITE_RESULT  = 5'd11;
     localparam PH_WRITE_WAIT    = 5'd12;
     localparam PH_ADVANCE_DESC  = 5'd13;
+    localparam PH_CPU_OP_WAIT   = 5'd14;
 
     reg [4:0]  ph_state;
     reg        desc_chain_busy;
@@ -748,8 +749,14 @@ module matmul_top (
                             14: reg_ctrl_user <= 32'h0000_0100;  // Q6_K
                         endcase
 
-                        // Start with activation load
-                        ph_state <= PH_LOAD_ACT;
+                        // CPU-OP (type=15): signal CPU and wait for resume
+                        if (desc_tensor_type == 8'd15) begin
+                            reg_chain_ctrl[2] <= 1;
+                            desc_irq <= 1;
+                            ph_state <= PH_CPU_OP_WAIT;
+                        end else begin
+                            ph_state <= PH_LOAD_ACT;
+                        end
                     end
                 end
 
@@ -994,6 +1001,18 @@ module matmul_top (
                         ph_state <= PH_IDLE;
                     end else begin
                         ph_state <= PH_FETCH_DESC;
+                    end
+                end
+
+                // ==========================================================
+                // PH_CPU_OP_WAIT: pause until CPU resumes via CHAIN_CTRL[0]
+                // ==========================================================
+                PH_CPU_OP_WAIT: begin
+                    if (reg_chain_ctrl[0]) begin
+                        reg_chain_ctrl[0] <= 0;
+                        reg_chain_ctrl[2] <= 0;
+                        desc_irq <= 0;
+                        ph_state <= PH_ADVANCE_DESC;
                     end
                 end
 

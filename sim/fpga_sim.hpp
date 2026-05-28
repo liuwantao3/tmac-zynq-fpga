@@ -1206,6 +1206,7 @@ constexpr uint8_t DESC_TYPE_Q5_0  = 6;
 constexpr uint8_t DESC_TYPE_Q8_0  = 8;
 constexpr uint8_t DESC_TYPE_Q4_K  = 12;
 constexpr uint8_t DESC_TYPE_Q6_K  = 14;
+constexpr uint8_t DESC_TYPE_CPU_OP = 15; // CPU-only op: FPGA signals CPU and pauses
 constexpr uint8_t DESC_FLAG_INTERRUPT = 0x01;
 
 // Phase B tile constants (block data + scale data for HP burst)

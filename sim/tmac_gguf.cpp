@@ -8,6 +8,8 @@
 #include <vector>
 #include <string>
 #include <algorithm>
+#include <unordered_map>
+#include <functional>
 #include <fstream>
 #include <iostream>
 #include <chrono>
@@ -795,6 +797,10 @@ static int phaseb_run_descriptor(uint32_t desc_off, int64_t* accumulator) {
                 ri_abs, accumulator, row0);
         }
         return (d->num_tiles / cg) * tr;
+    }
+    case fpga_sim::DESC_TYPE_CPU_OP: {
+        // CPU-OP: no FPGA matmul work, CPU handles this independently
+        return 0;
     }
     case fpga_sim::DESC_TYPE_Q4_K: {
         // Q4_K: 56×256 tile, column groups = cols/256
@@ -2052,6 +2058,7 @@ int main(int argc, char** argv) {
         printf("  --fpga-q5-0: Q5_0 FPGA path for Q5_0 tensors (attn Q/K/O, ffn gate/up), INT16 fallback\n");
         printf("  --fpga-q6-k: Q6_K FPGA path for Q6_K tensors (FFN down proj even), INT16 fallback\n");
         printf("  --fpga-phaseb: Build Phase B descriptor chain (alongside AXI-Lite path)\n");
+
         printf("  --perf:       Enable pipeline profiling (Chrome trace JSON + bottleneck analysis)\n");
         printf("  --dump-tiles N: Dump first N Q8 tiles for Verilog cosimulation\n");
         printf("  --dump-tiles-q6-k N: Dump first N Q6_K tiles for Verilog cosimulation\n");
@@ -2082,6 +2089,7 @@ int main(int argc, char** argv) {
         if (strcmp(argv[i], "--fpga-q5-0") == 0) { g_use_fpga = true; g_fpga_q5_0 = true; }
         if (strcmp(argv[i], "--fpga-q6-k") == 0) { g_use_fpga = true; g_fpga_q6_k = true; }
         if (strcmp(argv[i], "--fpga-phaseb") == 0) { g_fpga_phaseb = true; g_use_fpga = true; g_fpga_q5_0 = true; g_fpga_q6_k = true; g_fpga_q4k = true; g_fpga_q8 = true; }
+
         if (strcmp(argv[i], "--dump-phaseb") == 0) { g_dump_phaseb = true; }
         if (strcmp(argv[i], "--perf") == 0) g_perf_enabled = true;
         if (strcmp(argv[i], "--dump-tiles") == 0 && i + 1 < argc) {
