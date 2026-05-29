@@ -1,26 +1,49 @@
 `timescale 1ns / 1ps
 
 module axi_wrap_int16 (
+    (* X_INTERFACE_INFO = "xilinx.com:signal:clock:1.0 CLK CLK" *)
+    (* X_INTERFACE_PARAMETER = "ASSOCIATED_BUSIF s_axil" *)
     input  wire         clk,
-input  wire         rst_n,
-input  wire         s_axil_awvalid,
-output reg          s_axil_awready,
-input  wire [15:0]  s_axil_awaddr,
-input  wire         s_axil_wvalid,
-output reg          s_axil_wready,
-input  wire [31:0]  s_axil_wdata,
-input  wire [3:0]   s_axil_wstrb,
-output reg          s_axil_bvalid,
-input  wire         s_axil_bready,
-output reg  [1:0]   s_axil_bresp,
-input  wire         s_axil_arvalid,
-output reg          s_axil_arready,
-input  wire [15:0]  s_axil_araddr,
-output reg          s_axil_rvalid,
-input  wire         s_axil_rready,
-output reg  [31:0]  s_axil_rdata,
-output reg  [1:0]   s_axil_rresp,
-output reg          interrupt
+    (* X_INTERFACE_INFO = "xilinx.com:signal:reset:1.0 rst_n RST" *)
+    (* X_INTERFACE_PARAMETER = "POLARITY ACTIVE_LOW" *)
+    input  wire         rst_n,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axilite:1.0 S_AXI AWVALID" *)
+    input  wire         s_axil_awvalid,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axilite:1.0 S_AXI AWREADY" *)
+    output reg          s_axil_awready,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axilite:1.0 S_AXI AWADDR" *)
+    input  wire [15:0]  s_axil_awaddr,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axilite:1.0 S_AXI WVALID" *)
+    input  wire         s_axil_wvalid,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axilite:1.0 S_AXI WREADY" *)
+    output reg          s_axil_wready,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axilite:1.0 S_AXI WDATA" *)
+    input  wire [31:0]  s_axil_wdata,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axilite:1.0 S_AXI WSTRB" *)
+    input  wire [3:0]   s_axil_wstrb,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axilite:1.0 S_AXI BVALID" *)
+    output reg          s_axil_bvalid,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axilite:1.0 S_AXI BREADY" *)
+    input  wire         s_axil_bready,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axilite:1.0 S_AXI BRESP" *)
+    output reg  [1:0]   s_axil_bresp,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axilite:1.0 S_AXI ARVALID" *)
+    input  wire         s_axil_arvalid,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axilite:1.0 S_AXI ARREADY" *)
+    output reg          s_axil_arready,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axilite:1.0 S_AXI ARADDR" *)
+    input  wire [15:0]  s_axil_araddr,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axilite:1.0 S_AXI RVALID" *)
+    output reg          s_axil_rvalid,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axilite:1.0 S_AXI RREADY" *)
+    input  wire         s_axil_rready,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axilite:1.0 S_AXI RDATA" *)
+    output reg  [31:0]  s_axil_rdata,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axilite:1.0 S_AXI RRESP" *)
+    output reg  [1:0]   s_axil_rresp,
+    (* X_INTERFACE_INFO = "xilinx.com:signal:interrupt:1.0 INTERRUPT INTERRUPT" *)
+    (* X_INTERFACE_PARAMETER = "SENSITIVITY EDGE_RISING" *)
+    output reg          interrupt
 );
 
     reg [31:0] reg_ap_ctrl;
@@ -94,6 +117,7 @@ output reg          interrupt
 
     reg [2:0] state;
     reg [5:0] idx;
+    reg start_clear;
 
     always @(posedge clk) begin
         if (!rst_n) begin
@@ -104,16 +128,18 @@ output reg          interrupt
             core_wt_we <= 0;
             core_act_we <= 0;
             reg_status <= 0;
+            start_clear <= 0;
         end else begin
             core_start <= 0;
             core_wt_we <= 0;
             core_act_we <= 0;
             core_res_addr <= idx;
+            start_clear <= 0;
 
             case (state)
                 S_IDLE: begin
                     if (reg_ap_ctrl[0] && !core_busy) begin
-                        reg_ap_ctrl[0] <= 0;
+                        start_clear <= 1;
                         reg_status <= 1;
                         state <= S_LOAD;
                         load_addr <= 0;
@@ -165,10 +191,6 @@ output reg          interrupt
         end
     end
 
-    always @(*) begin
-        reg_ap_ctrl[3:1] = {~core_busy, ~core_busy, core_done};
-    end
-
     // ==================================================================
     // AXI4-Lite write
     // ==================================================================
@@ -189,6 +211,12 @@ output reg          interrupt
             reg_ctrl_user  <= 0;
             wb_we <= 0;
         end else begin
+            // Update status bits every cycle
+            reg_ap_ctrl[3:1] <= {~core_busy, ~core_busy, core_done};
+            // Self-clear start bit when accepted by FSM
+            if (start_clear)
+                reg_ap_ctrl[0] <= 0;
+
             wb_we <= 0;
             case (wstate)
                 W_IDLE: begin
