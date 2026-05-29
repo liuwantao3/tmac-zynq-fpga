@@ -20,11 +20,46 @@ update_compile_order -fileset sources_1
 # Create block design
 create_bd_design "system"
 
-# Zynq PS7 - configure clock BEFORE automation
+# Zynq PS7 - configure clock AND DDR BEFORE automation
 create_bd_cell -type ip -vlnv xilinx.com:ip:processing_system7:5.5 ps7
 set_property CONFIG.PCW_FPGA0_PERIPHERAL_FREQMHZ 100.0 [get_bd_cells ps7]
+set_property CONFIG.PCW_UIPARAM_DDR_PARTNO "MT41J256M16 RE-125" [get_bd_cells ps7]
 apply_bd_automation -rule xilinx.com:bd_rule:processing_system7 \
     -config {make_external "FIXED_IO, DDR"} [get_bd_cells ps7]
+
+# Force DDR geometry for MicroPhase Z7-Lite (MT41J256M16, 512MB)
+set_property CONFIG.PCW_UIPARAM_DDR_PARTNO "MT41J256M16 RE-125" [get_bd_cells ps7]
+set_property CONFIG.PCW_UIPARAM_DDR_DEVICE_CAPACITY "4096 MBits" [get_bd_cells ps7]
+set_property CONFIG.PCW_UIPARAM_DDR_BUS_WIDTH "16 Bit" [get_bd_cells ps7]
+set_property CONFIG.PCW_UIPARAM_DDR_DRAM_WIDTH "16 Bits" [get_bd_cells ps7]
+set_property CONFIG.PCW_UIPARAM_DDR_ROW_ADDR_COUNT 15 [get_bd_cells ps7]
+set_property CONFIG.PCW_UIPARAM_DDR_COL_ADDR_COUNT 10 [get_bd_cells ps7]
+set_property CONFIG.PCW_UIPARAM_DDR_BANK_ADDR_COUNT 3 [get_bd_cells ps7]
+set_property CONFIG.PCW_UIPARAM_DDR_SPEED_BIN "DDR3_1066F" [get_bd_cells ps7]
+set_property CONFIG.PCW_UIPARAM_DDR_FREQ_MHZ 533.333333 [get_bd_cells ps7]
+set_property CONFIG.PCW_UIPARAM_DDR_CL 7 [get_bd_cells ps7]
+set_property CONFIG.PCW_UIPARAM_DDR_CWL 6 [get_bd_cells ps7]
+set_property CONFIG.PCW_UIPARAM_DDR_AL 0 [get_bd_cells ps7]
+set_property CONFIG.PCW_UIPARAM_DDR_BOARD_DELAY0 0.250 [get_bd_cells ps7]
+set_property CONFIG.PCW_UIPARAM_DDR_BOARD_DELAY1 0.250 [get_bd_cells ps7]
+set_property CONFIG.PCW_UIPARAM_DDR_BOARD_DELAY2 0.250 [get_bd_cells ps7]
+set_property CONFIG.PCW_UIPARAM_DDR_BOARD_DELAY3 0.250 [get_bd_cells ps7]
+set_property CONFIG.PCW_UIPARAM_DDR_TRAIN_DATA_EYE 1 [get_bd_cells ps7]
+set_property CONFIG.PCW_UIPARAM_DDR_TRAIN_READ_GATE 1 [get_bd_cells ps7]
+set_property CONFIG.PCW_UIPARAM_DDR_TRAIN_WRITE_LEVEL 1 [get_bd_cells ps7]
+set_property CONFIG.PCW_UIPARAM_DDR_ECC "Disabled" [get_bd_cells ps7]
+set_property CONFIG.PCW_UIPARAM_DDR_MEMORY_TYPE "DDR 3" [get_bd_cells ps7]
+set_property CONFIG.PCW_UIPARAM_DDR_HIGH_TEMP "Normal (0-85)" [get_bd_cells ps7]
+set_property CONFIG.PCW_UIPARAM_DDR_USE_INTERNAL_VREF 0 [get_bd_cells ps7]
+
+# Use UART0 (MIO 14/15) for serial output on MicroPhase Z7-Lite
+set_property CONFIG.PCW_UART0_PERIPHERAL_ENABLE 1 [get_bd_cells ps7]
+set_property CONFIG.PCW_UART0_UART0_IO "MIO 14 .. 15" [get_bd_cells ps7]
+set_property CONFIG.PCW_UART1_PERIPHERAL_ENABLE 0 [get_bd_cells ps7]
+
+# Ensure FCLK_CLK0 is enabled for PL fabric
+set_property CONFIG.PCW_EN_CLK0_PORT 1 [get_bd_cells ps7]
+set_property CONFIG.PCW_FCLK_CLK0_BUF TRUE [get_bd_cells ps7]
 
 # RTL module as block
 create_bd_cell -type module -reference axi_wrap_int16 axi_wrap
@@ -98,5 +133,8 @@ wait_on_run impl_1
 # Open impl design and write checkpoint
 open_run impl_1
 write_checkpoint -force "$proj_dir/post_impl.dcp"
+
+# Export hardware platform (XSA) for Vitis
+write_hw_platform -fixed -include_bit -force "$proj_dir/matmul_bd.xsa"
 
 puts "=== DONE ==="

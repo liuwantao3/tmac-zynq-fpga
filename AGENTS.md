@@ -209,6 +209,18 @@ python3 scripts/extract_tmac.py models/qwen2-0_5b-instruct-q4_k_m.gguf /tmp/mode
 - `docs/FPGA_PERFORMANCE_ANALYSIS.md` — Performance analysis
 - `docs/Q4_K_IMPLEMENTATION_PLAN.md` — Original plan (outdated)
 
+## Target Board: MicroPhase Z7-Lite
+
+- **Part**: `xc7z010clg400-1` (Zynq-7010, 28nm, 432 CLBs, 240 DSP48E1, 4.9 Mb BRAM)
+- **DDR3**: 512 MB, Micron **MT41J256M16 RE-125** (4 Gbit, 16-bit bus, 15 row × 10 col × 3 bank)
+- **DDR speed**: DDR3-1066F (533 MHz core, CL=7, CWL=6, tRCD=7, tRP=7, tRAS=35ns, tRC=48.91ns, tFAW=40ns)
+- **PS7 clock config**: 33.333 MHz crystal → ARM=666.667 MHz, DDR=533.333 MHz, PL=100 MHz
+- **UART console**: UART0 (MIO 14/15) at 115200 baud
+- **Debug**: JTAG via Digilent HS-2 on the onboard FTDI/JTAG bridge
+- **Peripherals**: No Ethernet, no SD card (bare-metal only)
+
+**DDR address map** (from PS7 config): 0x0010_0000 to 0x2000_0000 (512 MB), CPU accesses at 0x0000_0000 alias after MMU/cache setup; bare-metal uses physical 0x0010_0000 base.
+
 ## Project State
 
 ### Done
@@ -218,41 +230,41 @@ python3 scripts/extract_tmac.py models/qwen2-0_5b-instruct-q4_k_m.gguf /tmp/mode
 - ✅ **`matmul_q4k_2x896_core.v`** — Verilog core + testbench done (8/8 tests pass)
 - ✅ **C++ dispatch** — `axi_vecmul_tile_q4k_2x896_axilite()` in `fpga_sim.hpp`, shape-based dispatch in `matmul_fpga_q4k()`
 - **INT16 core standalone P&R complete**: 3954 SLICE_LUTX, 2121 SLICE_FFX, 8 DSP48E1, 2 BRAM36, 1 BUFG — all 88 IOs routed on xc7z010clg400-1
-- **Bitstream generated**: valid Xilinx BIT data (2 MB) at `oss-tools/workspace/build/results/synth_top_int16.bit`
 - **Output register optimization**: removed async reset from output FFs to enable IOB OLOGIC packing, resolving previous `busy` routing failure
-- **JSON post-processing**: `$scopeinfo` cell removed via `clean -purge` in Yosys script (previously caused nextpnr `no BELs remaining` error)
-- **IOSTANDARD constraints**: per-bit XDC generation script for 88 pins solves previous P&R IOSTANDARD requirement
-- **`oss-tools/workspace/build/synth.ys`**: Yosys synthesis script with `clean -purge` to remove `$scopeinfo`
-- **`oss-tools/workspace/build/filter_json.py`**: JSON filter for scopeinfo removal (currently redundant with `clean -purge`)
-- **`axi_wrap_int16.v` BRAM inference fixed**: reworked weight_buf write port (single full-word write, no byte enables), removed async reset from load_addr, added pipelined read register — now infers 4 × RAMB36E1 (2 for core wmem + 2 for weight_buf) with 8 DSP48E1, 4277 FFs, 0 errors
-- **AXI address map refactored**: weights at 0x2000-0x3FFF (8 KB, 2048 × 32-bit), acts at 0x1000-0x107C, results at 0x4000-0x40FC/0x4200-0x427C, act readback at 0x5000-0x507C — no address conflicts
-- **ARM bare-metal toolchain installed**: `arm-none-eabi-gcc` 16.1.0 via Homebrew
-- **PS7 bare-metal C test program** at `oss-tools/workspace/sw/`: self-checking INT16 matmul test with UART output, embedded golden reference, verified packing logic
+- **axi_wrap_int16.v BRAM inference fixed**: 4 × RAMB36E1 + 8 DSP48E1, 4277 FFs, 0 errors
+- **AXI address map refactored**: weights at 0x2000-0x3FFF (8 KB, 2048 × 32-bit), acts at 0x1000-0x107C, results at 0x4000-0x40FC/0x4200-0x427C, act readback at 0x5000-0x507C
+- **PS7 bare-metal C test program** at `vivado_integration/sw/`: self-checking INT16 matmul test with UART output, embedded golden reference
 - **iVerilog all 5 cores pass**: Q8 (6/6), Q4K (4/4), INT16 (smoke), Q5_0 (minimal+fab), Q6_K (minimal+fab)
 - **End-to-end inference verified** with `--fpga-q8 --fpga-q5-0 --fpga-q6-k --fpga-q4k`: produces correct tokens `11 358 3003`, 15× speedup over naive
-- **CPU–FPGA sync protocol** implemented in `matmul_top.v` (PH_CPU_OP_WAIT state, CPU_OP detection, desc_irq), `fpga_sim.hpp` (DESC_TYPE_CPU_OP=15), and `tmac_gguf.cpp` (CPU_OP case in phaseb_run_descriptor)
-- **AGENTS.md updated** with full CPU_OP protocol docs, CPU task table, descriptor chain layout
-- **Code audit** written to `docs/CODE_AUDIT.md` — 6 issues found, all fixed; `tmac_gguf.cpp` compiles clean with `-Wall -Werror`
+- **CPU–FPGA sync protocol** implemented in `matmul_top.v`, `fpga_sim.hpp`, and `tmac_gguf.cpp`
+- **Code audit** written to `docs/CODE_AUDIT.md` — 6 issues found, all fixed
+- **Vivado BD with PS7 + INT16 core** — block design build script at `vivado_integration/build_bd.tcl` (PS7 + axi_interconnect + axi_wrap_int16)
+- **DDR config fixed for MicroPhase Z7-Lite** — MT41J256M16 (512 MB), DDR3-1066F, 15/10/3 row/col/bank, UART0 on MIO 14/15
+- **XSA + bitstream generated** — `vivado_integration/proj_bd/matmul_bd.xsa` (308 KB), `system_wrapper.bit` (~2 MB)
 
 ### In Progress
 
-- **PS7 integration test**: needs Vivado block design (PS7 + AXI interconnect + axi_wrap_int16) to generate full bitstream; current PL-only bitstream has 117 AXI pins exceeding 100 IO limit (expected — AXI-Lite is internal to PS7)
+- **Vitis application build** — XSCT hangs on `app create`; needs Vitis GUI or alternative build flow
+- **Board bring-up** — JTAG connection confirmed (Digilent HS-2 detected), FPGA configures successfully; DDR/ELF download aborted with `pending requests` (likely JTAG speed)
 
 ### Blocked
 
-- (none)
+- XSCT `app create` hangs on Windows after `setws` (known Vitis 2019.2 issue with GUI backend)
 
 ### Next Steps
 
-1. Create Vivado block design integrating PS7, AXI interconnect, and `axi_wrap_int16.v`
-2. Import `sw/` bare-metal C code into Vitis, build, and run on Zynq hardware via JTAG
-3. Verify matmul results match `11 358 3003` inference output
-4. Synthesize and P&R the full `matmul_top.v` (quad-core) once the standalone flow is proven on hardware
+1. Open Vitis GUI on `sw_new` workspace, rebuild platform + app, run via JTAG
+2. Or: use `arm-none-eabi-gcc` directly with BSP headers from `hsi` for standalone build
+3. Lower JTAG frequency to 3–6 MHz if download aborts
+4. Once INT16 proven, quad-core `matmul_top.v` synthesis for full pipeline
 
 ### Relevant Files
 
-- `oss-tools/workspace/rtl/synth_top_int16.v`: Standalone AXI4-Lite wrapper for INT16 core synthesis
-- `oss-tools/workspace/rtl/axi_wrap_int16.v`: Full AXI4-Lite INT16 wrapper (4 BRAM, 8 DSP, PS7-ready)
-- `oss-tools/workspace/Makefile`: synth/pnr/bit targets
-- `oss-tools/workspace/build/synth.ys`: Yosys synthesis script
-- `oss-tools/workspace/sw/`: Bare-metal PS7 C test code (main.c, uart.c, startup.s, link.ld, Makefile)
+- `vivado_integration/build_bd.tcl`: Vivado batch build script (PS7 DDR=MT41J256M16, UART0, 100 MHz PL, AXI interconnect, bitstream + XSA)
+- `vivado_integration/rtl/axi_wrap_int16.v`: AXI4-Lite wrapper with BRAM weight_buf, DSP48 compute
+- `vivado_integration/sw/main.c`: Bare-metal INT16 matmul test
+- `vivado_integration/sw/regs.h`: Register map (IP_BASE=0x43C00000, UART0=0xE0000000)
+- `vivado_integration/sw/uart.c`: UART0 polling driver (115200 baud, 50 MHz ref clock)
+- `vivado_integration/proj_bd/`: Vivado project outputs (post_synth.dcp, post_impl.dcp, matmul_bd.xsa, system_wrapper.bit)
+- `verilog/matmul_int16_core.v`: INT16 compute core (standalone verified, 8 DSP, 2 BRAM)
+- `verilog/matmul_top.v`: Quad-core top (Q8, Q4K, Q5_0, Q6_K, INT16)

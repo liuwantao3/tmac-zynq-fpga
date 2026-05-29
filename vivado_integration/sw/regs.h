@@ -42,8 +42,8 @@
 // Act readback (0x5000-0x507C)
 #define ACT_RD_BASE 0x5000
 
-// UART1 on Zynq PS7
-#define UART_BASE 0xE0001000
+// UART0 on MicroPhase Z7-Lite (MIO 14/15)
+#define UART_BASE 0xE0000000
 
 // UART registers
 #define UART_CR     0x00
