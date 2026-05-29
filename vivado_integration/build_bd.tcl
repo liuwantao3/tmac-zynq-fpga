@@ -77,6 +77,19 @@ wait_on_run synth_1
 open_run synth_1
 write_checkpoint -force "$proj_dir/post_synth.dcp"
 
+# Diagnostics: check clock constraints
+puts "=== CLOCK REPORT ==="
+report_clocks -file "$proj_dir/clocks.rpt"
+report_timing_summary -file "$proj_dir/timing.rpt"
+report_io -file "$proj_dir/io.rpt"
+
+# Check if *FCLK_CLK0 pattern matches any pins
+set fclk_pins [get_pins -hier -quiet *FCLK_CLK0]
+puts "FCLK_CLK0 pins found: [llength $fclk_pins]"
+if {[llength $fclk_pins] > 0} {
+    puts "First pin: [lindex $fclk_pins 0]"
+}
+
 # Launch implementation and bitstream
 launch_runs impl_1 -to_step write_bitstream -jobs 2
 wait_on_run impl_1
