@@ -64,9 +64,10 @@ puts $xdc_file "create_clock -period 10.000 -name clk_100m \[get_pins -hier *FCL
 close $xdc_file
 add_files -fileset constrs_1 "$proj_dir/system.xdc"
 
-# Create HDL wrapper
+# Create HDL wrapper and set as top
 make_wrapper -files [get_files [file normalize "$proj_dir/matmul_bd.srcs/sources_1/bd/system/system.bd"]] -top
 add_files -norecurse [file normalize "$proj_dir/matmul_bd.srcs/sources_1/bd/system/hdl/system_wrapper.v"]
+set_property top system_wrapper [current_fileset]
 update_compile_order -fileset sources_1
 
 # Launch synthesis
