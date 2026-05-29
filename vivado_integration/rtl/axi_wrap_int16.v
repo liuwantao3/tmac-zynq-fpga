@@ -7,39 +7,22 @@ module axi_wrap_int16 (
     (* X_INTERFACE_INFO = "xilinx.com:signal:reset:1.0 rst_n RST" *)
     (* X_INTERFACE_PARAMETER = "POLARITY ACTIVE_LOW" *)
     input  wire         rst_n,
-    (* X_INTERFACE_INFO = "xilinx.com:interface:axilite:1.0 S_AXI AWVALID" *)
     input  wire         s_axil_awvalid,
-    (* X_INTERFACE_INFO = "xilinx.com:interface:axilite:1.0 S_AXI AWREADY" *)
     output reg          s_axil_awready,
-    (* X_INTERFACE_INFO = "xilinx.com:interface:axilite:1.0 S_AXI AWADDR" *)
     input  wire [15:0]  s_axil_awaddr,
-    (* X_INTERFACE_INFO = "xilinx.com:interface:axilite:1.0 S_AXI WVALID" *)
     input  wire         s_axil_wvalid,
-    (* X_INTERFACE_INFO = "xilinx.com:interface:axilite:1.0 S_AXI WREADY" *)
     output reg          s_axil_wready,
-    (* X_INTERFACE_INFO = "xilinx.com:interface:axilite:1.0 S_AXI WDATA" *)
     input  wire [31:0]  s_axil_wdata,
-    (* X_INTERFACE_INFO = "xilinx.com:interface:axilite:1.0 S_AXI WSTRB" *)
     input  wire [3:0]   s_axil_wstrb,
-    (* X_INTERFACE_INFO = "xilinx.com:interface:axilite:1.0 S_AXI BVALID" *)
     output reg          s_axil_bvalid,
-    (* X_INTERFACE_INFO = "xilinx.com:interface:axilite:1.0 S_AXI BREADY" *)
     input  wire         s_axil_bready,
-    (* X_INTERFACE_INFO = "xilinx.com:interface:axilite:1.0 S_AXI BRESP" *)
     output reg  [1:0]   s_axil_bresp,
-    (* X_INTERFACE_INFO = "xilinx.com:interface:axilite:1.0 S_AXI ARVALID" *)
     input  wire         s_axil_arvalid,
-    (* X_INTERFACE_INFO = "xilinx.com:interface:axilite:1.0 S_AXI ARREADY" *)
     output reg          s_axil_arready,
-    (* X_INTERFACE_INFO = "xilinx.com:interface:axilite:1.0 S_AXI ARADDR" *)
     input  wire [15:0]  s_axil_araddr,
-    (* X_INTERFACE_INFO = "xilinx.com:interface:axilite:1.0 S_AXI RVALID" *)
     output reg          s_axil_rvalid,
-    (* X_INTERFACE_INFO = "xilinx.com:interface:axilite:1.0 S_AXI RREADY" *)
     input  wire         s_axil_rready,
-    (* X_INTERFACE_INFO = "xilinx.com:interface:axilite:1.0 S_AXI RDATA" *)
     output reg  [31:0]  s_axil_rdata,
-    (* X_INTERFACE_INFO = "xilinx.com:interface:axilite:1.0 S_AXI RRESP" *)
     output reg  [1:0]   s_axil_rresp,
     (* X_INTERFACE_INFO = "xilinx.com:signal:interrupt:1.0 INTERRUPT INTERRUPT" *)
     (* X_INTERFACE_PARAMETER = "SENSITIVITY EDGE_RISING" *)

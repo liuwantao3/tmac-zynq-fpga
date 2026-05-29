@@ -29,13 +29,28 @@ apply_bd_automation -rule xilinx.com:bd_rule:processing_system7 \
 # RTL module as block
 create_bd_cell -type module -reference axi_wrap_int16 axi_wrap
 
-# AXI automation: creates interconnect + connects AXI clocks/resets
-apply_bd_automation -rule xilinx.com:bd_rule:axi4 \
-    -config {Master /ps7/M_AXI_GP0 {intc ip} Slave /axi_wrap/s_axil {ipc}} \
+# AXI Interconnect (1 master, 1 slave)
+create_bd_cell -type ip -vlnv xilinx.com:ip:axi_interconnect:2.1 axi_intercon
+set_property CONFIG.NUM_MI 1 [get_bd_cells axi_intercon]
+set_property CONFIG.NUM_SI 1 [get_bd_cells axi_intercon]
+
+# Connect AXI bus: PS7 -> Interconnect -> Wrapper
+connect_bd_intf_net [get_bd_intf_pins ps7/M_AXI_GP0] \
+    [get_bd_intf_pins axi_intercon/S00_AXI]
+connect_bd_intf_net [get_bd_intf_pins axi_intercon/M00_AXI] \
     [get_bd_intf_pins axi_wrap/s_axil]
 
-# Manually connect clk and rst_n to wrapper (separate from AXI interface)
+# Connect clocks
+connect_bd_net [get_bd_pins ps7/FCLK_CLK0] [get_bd_pins ps7/M_AXI_GP0_ACLK]
+connect_bd_net [get_bd_pins ps7/FCLK_CLK0] [get_bd_pins axi_intercon/ACLK]
+connect_bd_net [get_bd_pins ps7/FCLK_CLK0] [get_bd_pins axi_intercon/S00_ACLK]
+connect_bd_net [get_bd_pins ps7/FCLK_CLK0] [get_bd_pins axi_intercon/M00_ACLK]
 connect_bd_net [get_bd_pins ps7/FCLK_CLK0] [get_bd_pins axi_wrap/clk]
+
+# Connect resets
+connect_bd_net [get_bd_pins ps7/FCLK_RESET0_N] [get_bd_pins axi_intercon/ARESETN]
+connect_bd_net [get_bd_pins ps7/FCLK_RESET0_N] [get_bd_pins axi_intercon/S00_ARESETN]
+connect_bd_net [get_bd_pins ps7/FCLK_RESET0_N] [get_bd_pins axi_intercon/M00_ARESETN]
 connect_bd_net [get_bd_pins ps7/FCLK_RESET0_N] [get_bd_pins axi_wrap/rst_n]
 
 # Validate
