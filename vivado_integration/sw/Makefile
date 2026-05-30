@@ -7,7 +7,7 @@ SIZE  = $(CROSS)size
 CFLAGS  = -mcpu=cortex-a9 -mthumb -O2 -g -nostdlib -ffreestanding -I.
 LDFLAGS = -mcpu=cortex-a9 -mthumb -T link.ld -Wl,-gc-sections -nostdlib
 
-OBJS = startup.o main.o uart.o
+OBJS = startup.o main.o
 
 all: test_int16.elf test_int16.bin
 
@@ -18,7 +18,7 @@ test_int16.elf: $(OBJS) link.ld
 test_int16.bin: test_int16.elf
 	$(CROSS)objcopy -O binary $< $@
 
-%.o: %.c regs.h uart.h
+%.o: %.c regs.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 %.o: %.s

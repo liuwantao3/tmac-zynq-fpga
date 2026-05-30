@@ -42,25 +42,6 @@
 // Act readback (0x5000-0x507C)
 #define ACT_RD_BASE 0x5000
 
-// UART0 on MicroPhase Z7-Lite (MIO 14/15)
-#define UART_BASE 0xE0000000
-
-// UART registers
-#define UART_CR     0x00
-#define UART_MR     0x04
-#define UART_IER    0x08
-#define UART_IDR    0x0C
-#define UART_IMR    0x10
-#define UART_SR     0x14
-#define UART_BRGR   0x18
-#define UART_RX     0x20
-#define UART_TX     0x24
-
-// UART SR bits
-#define UART_SR_TXEMPTY (1 << 3)
-#define UART_SR_TXFULL  (1 << 4)
-#define UART_SR_RXEMPTY (1 << 9)
-
 // Memory-mapped I/O accessors
 static inline void reg_write(uint32_t base, uint32_t off, uint32_t val) {
     volatile uint32_t *p = (volatile uint32_t *)(uintptr_t)(base + off);

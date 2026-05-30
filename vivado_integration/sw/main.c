@@ -1,5 +1,5 @@
 #include "regs.h"
-#include "uart.h"
+#include "xil_printf.h"
 
 #define NCOLS 64
 #define NROWS 64
@@ -54,45 +54,42 @@ void main(void) {
     uint32_t wb[WT_SIZE];
     int pass = 1;
 
-    // Initialize peripherals
-    uart_init();
-
     // Build test weights and golden reference
     build_weights(wb);
     compute_golden();
 
-    uart_puts("\n=== INT16 Matmul FPGA Test ===\n");
+    xil_printf("\n=== INT16 Matmul FPGA Test ===\n\r");
 
     // 1. Write weights (2048 words at 0x2000-0x3FFF)
-    uart_puts("Writing weights... ");
+    xil_printf("Writing weights... ");
     for (int i = 0; i < WT_SIZE; i++) {
         reg_write(IP_BASE, WT_BASE + i * 4, wb[i]);
     }
-    uart_puts("OK\n");
+    xil_printf("OK\n\r");
 
     // 2. Write activations (64 INT16 at 0x1000-0x107C)
-    uart_puts("Writing activations... ");
+    xil_printf("Writing activations... ");
     for (int i = 0; i < 64; i += 2) {
         uint32_t pair = ((uint32_t)(uint16_t)(i + 2) << 16) | (uint16_t)(i + 1);
         reg_write(IP_BASE, ACT_BASE + i * 2, pair);
     }
-    uart_puts("OK\n");
+    xil_printf("OK\n\r");
 
     // 3. Start computation
-    uart_puts("Starting computation... ");
+    xil_printf("Starting computation... ");
     reg_write(IP_BASE, REG_AP_CTRL, 1);
-    uart_puts("started\n");
+    xil_printf("started\n\r");
 
     // 4. Poll STATUS until done
-    uart_puts("Waiting... ");
+    xil_printf("Waiting... ");
     uint32_t status;
     do {
         status = reg_read(IP_BASE, REG_STATUS);
     } while (status != STATUS_IDLE);
-    uart_puts("done\n");
+    xil_printf("done\n\r");
 
     // 5. Read results
-    uart_puts("Reading results...\n");
+    xil_printf("Reading results...\n\r");
     int errors = 0;
     for (int r = 0; r < NROWS; r++) {
         // Read lo 32 bits
@@ -105,24 +102,16 @@ void main(void) {
             actual |= ~0xFFFFFFFFFFFFLL;
 
         if (actual != (int64_t)golden[r]) {
-            uart_puts("  Row ");
-            uart_putdec(r);
-            uart_puts(": GOT ");
-            uart_putdec((int32_t)actual);
-            uart_puts(" EXPECT ");
-            uart_putdec(golden[r]);
-            uart_puts("  FAIL\n");
+            xil_printf("  Row %d: GOT %d EXPECT %d  FAIL\n\r", r, (int32_t)actual, golden[r]);
             errors++;
             pass = 0;
         }
     }
 
     if (pass) {
-        uart_puts("\n=== ALL PASS ===\n");
+        xil_printf("\n=== ALL PASS ===\n\r");
     } else {
-        uart_puts("\n=== ");
-        uart_putdec(errors);
-        uart_puts(" FAILURES ===\n");
+        xil_printf("\n=== %d FAILURES ===\n\r", errors);
     }
 
     // Halt
