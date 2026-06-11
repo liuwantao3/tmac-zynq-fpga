@@ -27,7 +27,7 @@ Qwen2-0.5B FPGA accelerator targeting Zynq 7010. Quad-core Verilog RTL: INT16×I
 
 6. **INT16 fallback** — tiles that don't fit the above paths (e.g. F32 norms, any other tensor types) fall back to `matmul_fpga_int16` which uses pure INT16×INT16 via `MatmulAccel`.
 
-7. **Vivado 2019** — development on Windows with Vivado 2019 (previously used iVerilog on Mac).
+7. **Vivado 2023.1** — development on Windows with Vivado 2023.1 (upgraded from 2019.2). LLVM clang 7.0 bundled with Vivado used as ARM cross-compiler (`--target=armv7a-none-eabi`). Vitis 2023.1 used for debugging/running.
 
 ## Architecture Summary
 
@@ -142,6 +142,12 @@ All cores output S24.8 fixed-point (48-bit accumulator, zero-extended to 64-bit 
 # Verilog tests (iVerilog)
 make -C verilog all                     # Q8 + Q4K + Q5_0 + INT16 smoke
 
+# Vivado batch build
+C:\Xilinx\Vivado\2023.1\bin\vivado.bat -mode batch -source vivado_integration/build_bd.tcl
+
+# JTAG load via XSDB
+C:\Xilinx\Vivado\2023.1\bin\xsdb.bat vivado_integration/sw/load.tcl
+
 # C++ integration test
 g++ -std=c++14 -O2 -I sim -I gguf -I . sim/test_integration.cpp -lpthread -o /tmp/ti
 /tmp/ti
@@ -244,19 +250,26 @@ python3 scripts/extract_tmac.py models/qwen2-0_5b-instruct-q4_k_m.gguf /tmp/mode
 
 ### In Progress
 
-- **Vitis application build** — XSCT hangs on `app create`; needs Vitis GUI or alternative build flow
-- **Board bring-up** — JTAG connection confirmed (Digilent HS-2 detected), FPGA configures successfully; DDR/ELF download aborted with `pending requests` (likely JTAG speed)
+- **INT16 AXI wrapper verified on hardware** — All 64 rows pass, golden reference matches
+- **Vitis 2023.1** — GUI workflow works (create platform from XSA, build, run via JTAG)
+- **LLVM clang 7.0** — Vivado 2023.1 LLVM used as ARM cross-compiler for standalone builds
 
-### Blocked
+### Bug Fixes (2026-06-11)
 
-- XSCT `app create` hangs on Windows after `setws` (known Vitis 2019.2 issue with GUI backend)
+Four bugs found and fixed in `axi_wrap_int16.v`:
+
+1. **Act buffer address decode** (`vivado_integration/rtl/axi_wrap_int16.v:297`): `9'b000_1000_0` (16) → `9'h20` (32). The underscore placement was misleading — the literal evaluated to 16, not 32, causing act_buf writes to target 0x0800 instead of 0x1000.
+
+2. **W channel back-to-back write loss** (line 272): Removed `!bvalid_r` from W data latch condition. Back-to-back AXI writes lost data because WVALID was rejected while BVALID was still asserted from the previous write.
+
+3. **Result read 1-cycle misalignment** (line 133): Changed `core_res_addr` from registered (`core_res_addr <= idx`) to combinational (`assign core_res_addr = idx`). During S_DRAIN, `core_res_dout = acc[res_addr]` read the old (pre-update) `core_res_addr`, causing result_buf to get stale acc values.
+
+4. **Result HI address decode** (line 377): `addr[11:10] == 2'b10` → `addr[9:8] == 2'b10`. The original check never matched addresses in the 0x4200-0x42FF range because their bits [11:10] are 00, not 10. This caused the upper 16 bits of each result to read from result_buf[31:0] instead of result_buf[47:32], duplicating the lower 32 bits.
 
 ### Next Steps
 
-1. Open Vitis GUI on `sw_new` workspace, rebuild platform + app, run via JTAG
-2. Or: use `arm-none-eabi-gcc` directly with BSP headers from `hsi` for standalone build
-3. Lower JTAG frequency to 3–6 MHz if download aborts
-4. Once INT16 proven, quad-core `matmul_top.v` synthesis for full pipeline
+1. Quad-core `matmul_top.v` synthesis for full pipeline
+2. Vivado simulation — run with Vivado 2023.1
 
 ### Relevant Files
 

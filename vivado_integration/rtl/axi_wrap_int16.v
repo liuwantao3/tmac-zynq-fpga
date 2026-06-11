@@ -1,34 +1,60 @@
 `timescale 1ns / 1ps
 
 module axi_wrap_int16 (
-    (* X_INTERFACE_INFO = "xilinx.com:signal:clock:1.0 CLK CLK" *)
-    (* X_INTERFACE_PARAMETER = "ASSOCIATED_BUSIF s_axil" *)
-    input  wire         clk,
-    (* X_INTERFACE_INFO = "xilinx.com:signal:reset:1.0 rst_n RST" *)
+    (* X_INTERFACE_INFO = "xilinx.com:signal:clock:1.0 S_AXI_ACLK CLK" *)
+    (* X_INTERFACE_PARAMETER = "ASSOCIATED_BUSIF S_AXI" *)
+    input  wire         S_AXI_ACLK,
+    (* X_INTERFACE_INFO = "xilinx.com:signal:reset:1.0 S_AXI_ARESETN RST" *)
     (* X_INTERFACE_PARAMETER = "POLARITY ACTIVE_LOW" *)
-    input  wire         rst_n,
-    input  wire         s_axil_awvalid,
-    output reg          s_axil_awready,
-    input  wire [15:0]  s_axil_awaddr,
-    input  wire         s_axil_wvalid,
-    output reg          s_axil_wready,
-    input  wire [31:0]  s_axil_wdata,
-    input  wire [3:0]   s_axil_wstrb,
-    output reg          s_axil_bvalid,
-    input  wire         s_axil_bready,
-    output reg  [1:0]   s_axil_bresp,
-    input  wire         s_axil_arvalid,
-    output reg          s_axil_arready,
-    input  wire [15:0]  s_axil_araddr,
-    output reg          s_axil_rvalid,
-    input  wire         s_axil_rready,
-    output reg  [31:0]  s_axil_rdata,
-    output reg  [1:0]   s_axil_rresp,
+    input  wire         S_AXI_ARESETN,
+
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 S_AXI AWADDR" *)
+    input  wire [15:0]  S_AXI_AWADDR,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 S_AXI AWVALID" *)
+    input  wire         S_AXI_AWVALID,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 S_AXI AWREADY" *)
+    output wire         S_AXI_AWREADY,
+
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 S_AXI WDATA" *)
+    input  wire [31:0]  S_AXI_WDATA,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 S_AXI WSTRB" *)
+    input  wire [3:0]   S_AXI_WSTRB,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 S_AXI WVALID" *)
+    input  wire         S_AXI_WVALID,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 S_AXI WREADY" *)
+    output wire         S_AXI_WREADY,
+
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 S_AXI BRESP" *)
+    output wire [1:0]   S_AXI_BRESP,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 S_AXI BVALID" *)
+    output wire         S_AXI_BVALID,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 S_AXI BREADY" *)
+    input  wire         S_AXI_BREADY,
+
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 S_AXI ARADDR" *)
+    input  wire [15:0]  S_AXI_ARADDR,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 S_AXI ARVALID" *)
+    input  wire         S_AXI_ARVALID,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 S_AXI ARREADY" *)
+    output wire         S_AXI_ARREADY,
+
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 S_AXI RDATA" *)
+    output wire [31:0]  S_AXI_RDATA,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 S_AXI RRESP" *)
+    output wire [1:0]   S_AXI_RRESP,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 S_AXI RVALID" *)
+    output wire         S_AXI_RVALID,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 S_AXI RREADY" *)
+    input  wire         S_AXI_RREADY,
+
     (* X_INTERFACE_INFO = "xilinx.com:signal:interrupt:1.0 INTERRUPT INTERRUPT" *)
     (* X_INTERFACE_PARAMETER = "SENSITIVITY EDGE_RISING" *)
-    output reg          interrupt
+    output wire         interrupt
 );
 
+    // ====================================================================
+    // Internal registers
+    // ====================================================================
     reg [31:0] reg_ap_ctrl;
     reg [31:0] reg_gie;
     reg [31:0] reg_ier;
@@ -36,45 +62,49 @@ module axi_wrap_int16 (
     reg [31:0] reg_ctrl_user;
     reg [31:0] reg_status;
 
-    // Weight buffer (2048 × 32-bit = 8192 bytes, BRAM)
+    // Weight buffer (2048 x 32-bit = 8192 bytes, BRAM)
     (* ram_style = "block" *) reg [31:0] weight_buf [0:2047];
     reg [10:0] wb_waddr;
     reg [31:0] wb_wdata;
     reg        wb_we;
 
-    always @(posedge clk) begin
+    always @(posedge S_AXI_ACLK) begin
         if (wb_we)
             weight_buf[wb_waddr] <= wb_wdata;
     end
 
-    // Act buffer
+    // Act and result buffers
     reg [15:0] act_buf [0:63];
     reg [47:0] result_buf [0:63];
     integer ai;
 
-    // Weight load sequencer: copy weight_buf → core wmem
-    reg [12:0] load_addr;
+    // ====================================================================
+    // Core instance
+    // ====================================================================
     reg        core_wt_we;
     reg [12:0] core_wt_addr;
     reg [7:0]  core_wt_din;
-    reg [7:0]  core_wt_din_pre;
     reg        core_act_we;
     reg [5:0]  core_act_addr;
     reg [15:0] core_act_din;
-    reg [5:0]  core_res_addr;
+    wire [5:0] core_res_addr;
     reg        core_start;
 
-    // Separate weight_buf read register (no async reset for BRAM compatibility)
-    always @(posedge clk) begin
+    reg [13:0] load_addr;  // 14 bits to hold 8192 (2^13)
+    reg [7:0]  core_wt_din_pre;
+
+    always @(posedge S_AXI_ACLK) begin
         core_wt_din_pre <= weight_buf[load_addr[12:2]][{load_addr[1:0], 3'b000} +: 8];
     end
 
     wire core_done, core_busy;
     wire [47:0] core_res_dout;
+    // Pre-fetch address for weight loading (BRAM read has 1-cycle latency)
+    wire [13:0] prev_load = load_addr - 1;
 
     matmul_int16_core u_core (
-        .clk       (clk),
-        .rst_n     (rst_n),
+        .clk       (S_AXI_ACLK),
+        .rst_n     (S_AXI_ARESETN),
         .start     (core_start),
         .op_vecmul (1'b0),
         .done      (core_done),
@@ -92,6 +122,9 @@ module axi_wrap_int16 (
         .res_dout  (core_res_dout)
     );
 
+    // ====================================================================
+    // Compute FSM
+    // ====================================================================
     localparam S_IDLE  = 0;
     localparam S_LOAD  = 1;
     localparam S_ACT   = 2;
@@ -99,11 +132,12 @@ module axi_wrap_int16 (
     localparam S_DRAIN = 4;
 
     reg [2:0] state;
-    reg [5:0] idx;
+    reg [6:0] idx;  // 7 bits to hold 64 (2^6)
+    assign core_res_addr = idx;
     reg start_clear;
 
-    always @(posedge clk) begin
-        if (!rst_n) begin
+    always @(posedge S_AXI_ACLK) begin
+        if (!S_AXI_ARESETN) begin
             state      <= S_IDLE;
             idx        <= 0;
             load_addr  <= 0;
@@ -116,7 +150,6 @@ module axi_wrap_int16 (
             core_start <= 0;
             core_wt_we <= 0;
             core_act_we <= 0;
-            core_res_addr <= idx;
             start_clear <= 0;
 
             case (state)
@@ -130,9 +163,12 @@ module axi_wrap_int16 (
                 end
 
                 S_LOAD: begin
-                    if (load_addr < 8192) begin
+                    core_wt_we <= 0;
+                    if (load_addr == 0) begin
+                        load_addr <= 1;
+                    end else if (load_addr <= 8192) begin
                         core_wt_we   <= 1;
-                        core_wt_addr <= {load_addr[3:0], load_addr[12:4]};
+                        core_wt_addr <= {prev_load[3:0], prev_load[12:4]};
                         core_wt_din  <= core_wt_din_pre;
                         load_addr    <= load_addr + 1;
                     end else begin
@@ -174,116 +210,151 @@ module axi_wrap_int16 (
         end
     end
 
-    // ==================================================================
-    // AXI4-Lite write
-    // ==================================================================
-    reg [1:0] wstate;
-    localparam W_IDLE = 0, W_RESP = 1;
+    // ====================================================================
+    // AXI4-Lite write (standard template pattern)
+    // ====================================================================
+    reg awready_r;
+    reg wready_r;
+    reg bvalid_r;
+    reg [1:0] bresp_r;
 
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            wstate <= W_IDLE;
-            s_axil_awready <= 0;
-            s_axil_wready  <= 0;
-            s_axil_bvalid  <= 0;
-            s_axil_bresp   <= 0;
-            reg_ap_ctrl    <= 32'h0000_0004;
-            reg_gie        <= 0;
-            reg_ier        <= 0;
-            reg_isr        <= 0;
-            reg_ctrl_user  <= 0;
-            wb_we <= 0;
+    reg [15:0] awaddr_r;
+    reg [31:0] wdata_r;
+    reg        aw_got;
+    reg        w_got;
+
+    assign S_AXI_AWREADY = awready_r;
+    assign S_AXI_WREADY  = wready_r;
+    assign S_AXI_BVALID  = bvalid_r;
+    assign S_AXI_BRESP   = bresp_r;
+
+    always @(posedge S_AXI_ACLK) begin
+        if (!S_AXI_ARESETN) begin
+            awready_r <= 0;
+            wready_r  <= 0;
+            bvalid_r  <= 0;
+            bresp_r   <= 0;
+            reg_ap_ctrl   <= 32'h0000_0004;
+            reg_gie       <= 0;
+            reg_ier       <= 0;
+            reg_isr       <= 0;
+            reg_ctrl_user <= 0;
+            awaddr_r <= 0;
+            wdata_r  <= 0;
+            aw_got   <= 0;
+            w_got    <= 0;
+            wb_we    <= 0;
         end else begin
-            // Update status bits every cycle
             reg_ap_ctrl[3:1] <= {~core_busy, ~core_busy, core_done};
-            // Self-clear start bit when accepted by FSM
             if (start_clear)
                 reg_ap_ctrl[0] <= 0;
 
             wb_we <= 0;
-            case (wstate)
-                W_IDLE: begin
-                    s_axil_awready <= 1;
-                    s_axil_wready  <= 1;
-                    if (s_axil_awvalid && s_axil_wvalid) begin
-                        s_axil_awready <= 0;
-                        s_axil_wready  <= 0;
-                        wstate <= W_RESP;
 
-                        case (s_axil_awaddr[15:0])
-                            16'h0000: if (!core_busy && state == S_IDLE)
-                                          reg_ap_ctrl[0] <= s_axil_wdata[0];
-                            16'h0004: reg_gie       <= s_axil_wdata;
-                            16'h0008: reg_ier       <= s_axil_wdata;
-                            16'h000C: if (s_axil_wdata[0]) reg_isr[0] <= 0;
-                            16'h0010: reg_ctrl_user <= s_axil_wdata;
-                        endcase
+            // Defaults
+            awready_r <= 0;
+            wready_r  <= 0;
 
-                        // Weight write: AXI 0x2000-0x3FFF → weight_buf (2048 × 32-bit)
-                        if (s_axil_awaddr[15:13] == 3'b001) begin
-                            wb_we     <= 1;
-                            wb_waddr  <= s_axil_awaddr[12:2];
-                            wb_wdata  <= s_axil_wdata;
-                        end
+            // ============================================================
+            // AW: latch address when valid
+            // ============================================================
+            if (S_AXI_AWVALID && !awready_r) begin
+                awready_r <= 1;
+                if (!aw_got) begin
+                    awaddr_r <= S_AXI_AWADDR;
+                    aw_got   <= 1;
+                end
+            end
 
-                        // Act write: AXI 0x1000-0x107C → act_buf
-                        if (s_axil_awaddr[15:7] == 9'b000_1000_0) begin
-                            ai = {s_axil_awaddr[6:2], 1'b0};
-                            if (ai < 63) begin
-                                act_buf[ai]     <= s_axil_wdata[15:0];
-                                act_buf[ai + 1] <= s_axil_wdata[31:16];
-                            end
-                        end
+            // ============================================================
+            // W: latch data when valid
+            // ============================================================
+            if (S_AXI_WVALID && !wready_r) begin
+                wready_r <= 1;
+                if (!w_got) begin
+                    wdata_r <= S_AXI_WDATA;
+                    w_got   <= 1;
+                end
+            end
+
+            // ============================================================
+            // B: when both AW and W received, process and send response
+            // ============================================================
+            if (aw_got && w_got && !bvalid_r) begin
+                bvalid_r <= 1;
+                bresp_r  <= 2'b00;
+
+                // Process write
+                case (awaddr_r[15:0])
+                    16'h0000: if (!core_busy && state == S_IDLE)
+                                 reg_ap_ctrl[0] <= wdata_r[0];
+                    16'h0004: reg_gie       <= wdata_r;
+                    16'h0008: reg_ier       <= wdata_r;
+                    16'h000C: if (wdata_r[0]) reg_isr[0] <= 0;
+                    16'h0010: reg_ctrl_user <= wdata_r;
+                endcase
+
+                if (awaddr_r[15:13] == 3'b001) begin
+                    wb_we    <= 1;
+                    wb_waddr <= awaddr_r[12:2];
+                    wb_wdata <= wdata_r;
+                end
+
+                if (awaddr_r[15:7] == 9'h20) begin
+                    ai = {awaddr_r[6:2], 1'b0};
+                    if (ai < 63) begin
+                        act_buf[ai]     <= wdata_r[15:0];
+                        act_buf[ai + 1] <= wdata_r[31:16];
                     end
                 end
 
-                W_RESP: begin
-                    s_axil_bvalid <= 1;
-                    s_axil_bresp  <= 2'b00;
-                    s_axil_awready <= 0;
-                    s_axil_wready  <= 0;
-                    if (s_axil_bready) begin
-                        s_axil_bvalid <= 0;
-                        wstate <= W_IDLE;
-                    end
-                end
-            endcase
+
+                aw_got <= 0;
+                w_got  <= 0;
+            end
+
+            // Clear BVALID when BREADY
+            if (bvalid_r && S_AXI_BREADY) begin
+                bvalid_r <= 0;
+            end
         end
     end
 
-    // ==================================================================
+    // ====================================================================
     // AXI4-Lite read
-    // ==================================================================
-    reg [1:0] rstate;
-    localparam R_IDLE = 0, R_DATA = 1;
+    // ====================================================================
+    reg arready_r;
+    reg rvalid_r;
+    reg [31:0] rdata_r;
+    reg [1:0] rresp_r;
 
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            rstate <= R_IDLE;
-            s_axil_arready <= 0;
-            s_axil_rvalid  <= 0;
-            s_axil_rdata   <= 0;
-            s_axil_rresp   <= 0;
+    assign S_AXI_ARREADY = arready_r;
+    assign S_AXI_RVALID  = rvalid_r;
+    assign S_AXI_RDATA   = rdata_r;
+    assign S_AXI_RRESP   = rresp_r;
+
+    always @(posedge S_AXI_ACLK) begin
+        if (!S_AXI_ARESETN) begin
+            arready_r <= 0;
+            rvalid_r  <= 0;
+            rdata_r   <= 0;
+            rresp_r   <= 0;
         end else begin
-            case (rstate)
-                R_IDLE: begin
-                    s_axil_arready <= 1;
-                    if (s_axil_arvalid) begin
-                        s_axil_arready <= 0;
-                        rstate <= R_DATA;
-                        s_axil_rdata <= axil_read(s_axil_araddr);
-                    end
-                end
+            arready_r <= 0;
 
-                R_DATA: begin
-                    s_axil_rvalid <= 1;
-                    s_axil_rresp  <= 2'b00;
-                    if (s_axil_rready) begin
-                        s_axil_rvalid <= 0;
-                        rstate <= R_IDLE;
-                    end
-                end
-            endcase
+            if (S_AXI_ARVALID && !arready_r) begin
+                arready_r <= 1;
+                rdata_r   <= axil_read(S_AXI_ARADDR);
+                rresp_r   <= 2'b00;
+            end
+
+            if (!rvalid_r && arready_r) begin
+                rvalid_r <= 1;
+            end
+
+            if (rvalid_r && S_AXI_RREADY) begin
+                rvalid_r <= 0;
+            end
         end
     end
 
@@ -303,21 +374,17 @@ module axi_wrap_int16 (
                     endcase
                 end
                 4'h5: begin
-                    // Act readback: 0x5000-0x507C
                     if (addr[8:7] == 2'b00) begin
                         ri = {addr[6:2], 1'b0};
                         axil_read = {act_buf[ri + 1], act_buf[ri]};
                     end
                 end
                 4'h4: begin
-                    // Result: 0x4000-0x40FC (lo 32b), 0x4200-0x427C (hi 16b)
-                    if (addr[11:10] == 2'b00) begin
-                        // 0x4000-0x40FF → lo
+                    if (addr[9:8] == 2'b00) begin
                         ri = (addr - 16'h4000) >> 2;
                         if (ri < 64)
                             axil_read = result_buf[ri][31:0];
-                    end else if (addr[11:10] == 2'b10) begin
-                        // 0x4200-0x42FF → hi
+                    end else if (addr[9:8] == 2'b10) begin
                         ri = (addr - 16'h4200) >> 2;
                         if (ri < 64)
                             axil_read = {16'b0, result_buf[ri][47:32]};
@@ -327,13 +394,19 @@ module axi_wrap_int16 (
         end
     endfunction
 
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            interrupt <= 0;
+    // ====================================================================
+    // Interrupt
+    // ====================================================================
+    reg int_r;
+    assign interrupt = int_r;
+
+    always @(posedge S_AXI_ACLK) begin
+        if (!S_AXI_ARESETN) begin
+            int_r <= 0;
         end else begin
             if (core_done && reg_gie[0] && reg_ier[0])
                 reg_isr[0] <= 1;
-            interrupt <= reg_gie[0] && reg_ier[0] && reg_isr[0];
+            int_r <= reg_gie[0] && reg_ier[0] && reg_isr[0];
         end
     end
 

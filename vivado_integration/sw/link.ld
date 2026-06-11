@@ -31,4 +31,10 @@ SECTIONS
         . = . + 0x10000;
         __stack_top = .;
     } > DDR
+
+    /DISCARD/ : {
+        *(.ARM.exidx*)
+        *(.comment*)
+        *(.note*)
+    }
 }
