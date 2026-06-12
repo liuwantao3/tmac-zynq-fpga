@@ -227,49 +227,91 @@ python3 scripts/extract_tmac.py models/qwen2-0_5b-instruct-q4_k_m.gguf /tmp/mode
 
 **DDR address map** (from PS7 config): 0x0010_0000 to 0x2000_0000 (512 MB), CPU accesses at 0x0000_0000 alias after MMU/cache setup; bare-metal uses physical 0x0010_0000 base.
 
-## Project State
+## Phase 1: AXI HP + INT16
 
-### Done
+### Batch Build Framework
 
-- ✅ ~~`--dump-tiles` for Q4K AXI-Lite path~~
-- ✅ ~~`tb_cosim.v` for Q4_K~~
-- ✅ **`matmul_q4k_2x896_core.v`** — Verilog core + testbench done (8/8 tests pass)
-- ✅ **C++ dispatch** — `axi_vecmul_tile_q4k_2x896_axilite()` in `fpga_sim.hpp`, shape-based dispatch in `matmul_fpga_q4k()`
-- **INT16 core standalone P&R complete**: 3954 SLICE_LUTX, 2121 SLICE_FFX, 8 DSP48E1, 2 BRAM36, 1 BUFG — all 88 IOs routed on xc7z010clg400-1
-- **Output register optimization**: removed async reset from output FFs to enable IOB OLOGIC packing, resolving previous `busy` routing failure
-- **axi_wrap_int16.v BRAM inference fixed**: 4 × RAMB36E1 + 8 DSP48E1, 4277 FFs, 0 errors
-- **AXI address map refactored**: weights at 0x2000-0x3FFF (8 KB, 2048 × 32-bit), acts at 0x1000-0x107C, results at 0x4000-0x40FC/0x4200-0x427C, act readback at 0x5000-0x507C
-- **PS7 bare-metal C test program** at `vivado_integration/sw/`: self-checking INT16 matmul test with UART output, embedded golden reference
-- **iVerilog all 5 cores pass**: Q8 (6/6), Q4K (4/4), INT16 (smoke), Q5_0 (minimal+fab), Q6_K (minimal+fab)
-- **End-to-end inference verified** with `--fpga-q8 --fpga-q5-0 --fpga-q6-k --fpga-q4k`: produces correct tokens `11 358 3003`, 15× speedup over naive
-- **CPU–FPGA sync protocol** implemented in `matmul_top.v`, `fpga_sim.hpp`, and `tmac_gguf.cpp`
-- **Code audit** written to `docs/CODE_AUDIT.md` — 6 issues found, all fixed
-- **Vivado BD with PS7 + INT16 core** — block design build script at `vivado_integration/build_bd.tcl` (PS7 + axi_interconnect + axi_wrap_int16)
-- **DDR config fixed for MicroPhase Z7-Lite** — MT41J256M16 (512 MB), DDR3-1066F, 15/10/3 row/col/bank, UART0 on MIO 14/15
-- **XSA + bitstream generated** — `vivado_integration/proj_bd/matmul_bd.xsa` (308 KB), `system_wrapper.bit` (~2 MB)
+Three scripts form the batch build/debug pipeline:
 
-### In Progress
+| Script | Purpose | Command |
+|--------|---------|---------|
+| `vivado_integration/build_bd.tcl` | Full Zynq BD (PS7 + AXI Lite + AXI HP) | `vivado -mode batch -source build_bd.tcl` |
+| `vivado_integration/build_debug.tcl` | Minimal test design with ILA | `vivado -mode batch -source build_debug.tcl` |
+| `vivado_integration/capture_ila.tcl` | ILA capture (WIP) | `vivado -mode batch -source capture_ila.tcl` |
 
-- **INT16 AXI wrapper verified on hardware** — All 64 rows pass, golden reference matches
-- **Vitis 2023.1** — GUI workflow works (create platform from XSA, build, run via JTAG)
-- **LLVM clang 7.0** — Vivado 2023.1 LLVM used as ARM cross-compiler for standalone builds
+### Batch Build with ILA (`build_debug.tcl`) — Step by Step
 
-### Bug Fixes (2026-06-11)
+```tcl
+# 1. Create project for xc7z010
+create_project -force debug_test $proj_dir -part xc7z010clg400-1
+# 2. Add RTL source
+add_files -fileset sources_1 [file normalize "$rtl_dir/debug_test.v"]
+set_property top debug_test [current_fileset]
+# 3. Synthesize
+launch_runs synth_1 -jobs 8
+wait_on_run synth_1
+# 4. Open synthesized design, create ILA core
+open_run synth_1
+create_debug_core u_ila_0 ila
+set_property C_DATA_DEPTH 1024 [get_debug_cores u_ila_0]
+set_property C_TRIGIN_EN false [get_debug_cores u_ila_0]
+set_property C_TRIGOUT_EN false [get_debug_cores u_ila_0]
+# 5. Connect ILA clock to BUFG output (routable)
+connect_debug_port u_ila_0/clk [get_nets {clk_IBUF_BUFG}]
+# 6. Connect probes to MARK_DEBUG nets
+connect_debug_port u_ila_0/probe0 [get_nets {dbg_tick}]
+# 7. Write synth checkpoint
+write_checkpoint
+# 8. Implement with relaxed DRC (unconstrained I/O test design)
+set_property STEPS.write_bitstream.TCL.PRE {write_bitstream_hook.tcl} [get_runs impl_1]
+launch_runs impl_1 -to_step write_bitstream -jobs 8
+wait_on_run impl_1
+```
 
-Four bugs found and fixed in `axi_wrap_int16.v`:
+### ILA Capture (`capture_ila.tcl`) — Step by Step
 
-1. **Act buffer address decode** (`vivado_integration/rtl/axi_wrap_int16.v:297`): `9'b000_1000_0` (16) → `9'h20` (32). The underscore placement was misleading — the literal evaluated to 16, not 32, causing act_buf writes to target 0x0800 instead of 0x1000.
+```tcl
+# 1. Connect to hardware
+open_hw_manager
+connect_hw_server
+open_hw_target
+current_hw_device [lindex [get_hw_devices] end]
+# 2. Set bitstream and probes file
+set_property PROGRAM.FILE $bit [current_hw_device]
+set_property PROBES.FILE $ltx [current_hw_device]
+# 3. Program FPGA
+program_hw_devices [current_hw_device]
+# 4. Configure BSCAN scan chain (required for ILA detection)
+set_property BSCAN_SWITCH_USER_MASK 0x02 [current_hw_device]
+refresh_hw_device [current_hw_device]
+# 5. Find ILA and set depth
+set ila [lindex [get_hw_ilas -of_objects [current_hw_device]] 0]
+set_property CONTROL.DATA_DEPTH 1024 $ila
+# 6. Arm ILA and capture
+run_hw_ila $ila
+after 2000
+# 7. Read data and save to CSV
+set data [read_hw_ila_data $ila]
+write_hw_ila_data -force -csv_file ila_data.csv $data
+```
 
-2. **W channel back-to-back write loss** (line 272): Removed `!bvalid_r` from W data latch condition. Back-to-back AXI writes lost data because WVALID was rejected while BVALID was still asserted from the previous write.
+### Known Issues
 
-3. **Result read 1-cycle misalignment** (line 133): Changed `core_res_addr` from registered (`core_res_addr <= idx`) to combinational (`assign core_res_addr = idx`). During S_DRAIN, `core_res_dout = acc[res_addr]` read the old (pre-update) `core_res_addr`, causing result_buf to get stale acc values.
+| Issue | Cause | Workaround |
+|-------|-------|------------|
+| AXI HP read stuck in RD_WT | HP interconnect/auto_pc | Use ILA to capture ARADDR/ARVALID/ARREADY |
+| ILA not detected after program | BSCAN_SWITCH_USER_MASK not set | Set 0x02 and refresh |
+| xsdb can't find ARM core | DAP error after Vivado program | Run ps7_init from xc7z010 target |
+| ps7_init.tcl path | File at `vivado_integration/` not `proj_bd/` | Use absolute path |
 
-4. **Result HI address decode** (line 377): `addr[11:10] == 2'b10` → `addr[9:8] == 2'b10`. The original check never matched addresses in the 0x4200-0x42FF range because their bits [11:10] are 00, not 10. This caused the upper 16 bits of each result to read from result_buf[31:0] instead of result_buf[47:32], duplicating the lower 32 bits.
+### Verification Scripts
 
-### Next Steps
-
-1. Quad-core `matmul_top.v` synthesis for full pipeline
-2. Vivado simulation — run with Vivado 2023.1
+| Script | What it does |
+|--------|-------------|
+| `sw/hp_test.c` | Full HP test: writes weights/acts to DDR, starts computation, checks results |
+| `sw/run_hp.tcl` | XSDB: init PS7, load ELF, run |
+| `sw/build.tcl` | XSCT: create Vitis platform + app + build |
+| `vivado_integration/check_props.tcl` | Debug: list all hw_device properties |
 
 ### Relevant Files
 
