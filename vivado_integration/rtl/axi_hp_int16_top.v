@@ -57,7 +57,26 @@ module axi_hp_int16_top (
     reg [31:0] reg_wt_addr;     // DDR address of weights (8192 bytes)
     reg [31:0] reg_act_addr;    // DDR address of activations (128 bytes)
     reg [31:0] reg_res_addr;    // DDR address for results (512 bytes)
-    reg [31:0] reg_debug;       // debug: {hp_done, hp_busy, state, byte_cnt}
+    reg [31:0] reg_debug;
+
+    // Debug probes for Vivado ILA (MARK_DEBUG causes auto-insertion)
+    (* MARK_DEBUG = "TRUE" *) wire [31:0] dbg_araddr;    assign dbg_araddr = m_axi_araddr;
+    (* MARK_DEBUG = "TRUE" *) wire        dbg_arvalid;   assign dbg_arvalid = m_axi_arvalid;
+    (* MARK_DEBUG = "TRUE" *) wire        dbg_arready;   assign dbg_arready = m_axi_arready;
+    (* MARK_DEBUG = "TRUE" *) wire [7:0]  dbg_arlen;     assign dbg_arlen = m_axi_arlen;
+    (* MARK_DEBUG = "TRUE" *) wire [63:0] dbg_rdata;     assign dbg_rdata = m_axi_rdata;
+    (* MARK_DEBUG = "TRUE" *) wire        dbg_rvalid;    assign dbg_rvalid = m_axi_rvalid;
+    (* MARK_DEBUG = "TRUE" *) wire        dbg_rready;    assign dbg_rready = m_axi_rready;
+    (* MARK_DEBUG = "TRUE" *) wire        dbg_rlast;     assign dbg_rlast = m_axi_rlast;
+    (* MARK_DEBUG = "TRUE" *) wire [31:0] dbg_awaddr;    assign dbg_awaddr = m_axi_awaddr;
+    (* MARK_DEBUG = "TRUE" *) wire        dbg_awvalid;   assign dbg_awvalid = m_axi_awvalid;
+    (* MARK_DEBUG = "TRUE" *) wire        dbg_awready;   assign dbg_awready = m_axi_awready;
+    (* MARK_DEBUG = "TRUE" *) wire [63:0] dbg_wdata;     assign dbg_wdata = m_axi_wdata;
+    (* MARK_DEBUG = "TRUE" *) wire        dbg_wvalid;    assign dbg_wvalid = m_axi_wvalid;
+    (* MARK_DEBUG = "TRUE" *) wire        dbg_wready;    assign dbg_wready = m_axi_wready;
+    (* MARK_DEBUG = "TRUE" *) wire        dbg_wlast;     assign dbg_wlast = m_axi_wlast;
+    (* MARK_DEBUG = "TRUE" *) wire        dbg_bvalid;    assign dbg_bvalid = m_axi_bvalid;
+    (* MARK_DEBUG = "TRUE" *) wire        dbg_bready;    assign dbg_bready = m_axi_bready;
 
     wire core_done, core_busy;
     wire [47:0] core_res_dout;
