@@ -10,13 +10,12 @@ set_property PROGRAM.FILE $proj/debug_test.runs/impl_1/debug_test.bit [current_h
 set_property PROBES.FILE $proj/debug_test.runs/impl_1/debug_test.ltx [current_hw_device]
 
 # Program
+# Set BSCAN scan chain to match user scan chain 1
+catch {set_property BSCAN_SWITCH_USER_MASK 2 [current_hw_device]}
 program_hw_devices [current_hw_device]
 
 # Load probes
 set_property PROBES.FILE $proj/debug_test.runs/impl_1/debug_test.ltx [current_hw_device]
-
-# Set scan chain mask to enable ILA detection
-set_property BSCAN_SWITCH_USER_MASK 0x02 [current_hw_device]
 refresh_hw_device [current_hw_device]
 
 set ila [lindex [get_hw_ilas -of_objects [current_hw_device]] 0]
