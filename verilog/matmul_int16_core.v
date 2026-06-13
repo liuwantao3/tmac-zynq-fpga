@@ -28,10 +28,14 @@ module matmul_int16_core (
     reg [1:0] state;
     reg [5:0] k;
     reg [2:0] g;
-    integer wi_i;
 
-    (* ram_style = "block" *) reg [63:0] wmem_lo [0:511];
-    (* ram_style = "block" *) reg [63:0] wmem_hi [0:511];
+    (* ram_style = "distributed" *) reg [63:0] wmem_lo [0:511];
+    (* ram_style = "distributed" *) reg [63:0] wmem_hi [0:511];
+
+    reg [127:0] wmem_rdata;
+    always @(posedge clk) begin
+        wmem_rdata <= {wmem_hi[{k, g}], wmem_lo[{k, g}]};
+    end
 
     always @(posedge clk) begin
         if (wt_we) begin
@@ -54,11 +58,6 @@ module matmul_int16_core (
                 4'd15: wmem_hi[wt_addr[8:0]][63:56] <= wt_din;
             endcase
         end
-    end
-
-    reg [127:0] wmem_rdata;
-    always @(posedge clk) begin
-        wmem_rdata <= {wmem_hi[{k, g}], wmem_lo[{k, g}]};
     end
 
     reg signed [15:0] act_reg [0:63];
@@ -86,26 +85,74 @@ module matmul_int16_core (
             state <= IDLE;
             k <= 0; g <= 0; done <= 0; busy <= 0;
             p1_valid <= 0; p2_valid <= 0;
+            p2_row_base <= 0;
+            p1_row_base <= 0;
+            p1_act <= 0;
+            p2_partial[0] <= 0; p2_partial[1] <= 0; p2_partial[2] <= 0; p2_partial[3] <= 0;
+            p2_partial[4] <= 0; p2_partial[5] <= 0; p2_partial[6] <= 0; p2_partial[7] <= 0;
+            acc[0] <= 0; acc[1] <= 0; acc[2] <= 0; acc[3] <= 0;
+            acc[4] <= 0; acc[5] <= 0; acc[6] <= 0; acc[7] <= 0;
+            acc[8] <= 0; acc[9] <= 0; acc[10] <= 0; acc[11] <= 0;
+            acc[12] <= 0; acc[13] <= 0; acc[14] <= 0; acc[15] <= 0;
+            acc[16] <= 0; acc[17] <= 0; acc[18] <= 0; acc[19] <= 0;
+            acc[20] <= 0; acc[21] <= 0; acc[22] <= 0; acc[23] <= 0;
+            acc[24] <= 0; acc[25] <= 0; acc[26] <= 0; acc[27] <= 0;
+            acc[28] <= 0; acc[29] <= 0; acc[30] <= 0; acc[31] <= 0;
+            acc[32] <= 0; acc[33] <= 0; acc[34] <= 0; acc[35] <= 0;
+            acc[36] <= 0; acc[37] <= 0; acc[38] <= 0; acc[39] <= 0;
+            acc[40] <= 0; acc[41] <= 0; acc[42] <= 0; acc[43] <= 0;
+            acc[44] <= 0; acc[45] <= 0; acc[46] <= 0; acc[47] <= 0;
+            acc[48] <= 0; acc[49] <= 0; acc[50] <= 0; acc[51] <= 0;
+            acc[52] <= 0; acc[53] <= 0; acc[54] <= 0; acc[55] <= 0;
+            acc[56] <= 0; acc[57] <= 0; acc[58] <= 0; acc[59] <= 0;
+            acc[60] <= 0; acc[61] <= 0; acc[62] <= 0; acc[63] <= 0;
         end else begin
             case (state)
                 IDLE: begin
                     done <= 0; busy <= 0;
                     p1_valid <= 0; p2_valid <= 0;
                     if (start) begin
-                        for (wi_i = 0; wi_i < 64; wi_i = wi_i + 1) acc[wi_i] <= 0;
+                        acc[0] <= 0; acc[1] <= 0; acc[2] <= 0; acc[3] <= 0;
+                        acc[4] <= 0; acc[5] <= 0; acc[6] <= 0; acc[7] <= 0;
+                        acc[8] <= 0; acc[9] <= 0; acc[10] <= 0; acc[11] <= 0;
+                        acc[12] <= 0; acc[13] <= 0; acc[14] <= 0; acc[15] <= 0;
+                        acc[16] <= 0; acc[17] <= 0; acc[18] <= 0; acc[19] <= 0;
+                        acc[20] <= 0; acc[21] <= 0; acc[22] <= 0; acc[23] <= 0;
+                        acc[24] <= 0; acc[25] <= 0; acc[26] <= 0; acc[27] <= 0;
+                        acc[28] <= 0; acc[29] <= 0; acc[30] <= 0; acc[31] <= 0;
+                        acc[32] <= 0; acc[33] <= 0; acc[34] <= 0; acc[35] <= 0;
+                        acc[36] <= 0; acc[37] <= 0; acc[38] <= 0; acc[39] <= 0;
+                        acc[40] <= 0; acc[41] <= 0; acc[42] <= 0; acc[43] <= 0;
+                        acc[44] <= 0; acc[45] <= 0; acc[46] <= 0; acc[47] <= 0;
+                        acc[48] <= 0; acc[49] <= 0; acc[50] <= 0; acc[51] <= 0;
+                        acc[52] <= 0; acc[53] <= 0; acc[54] <= 0; acc[55] <= 0;
+                        acc[56] <= 0; acc[57] <= 0; acc[58] <= 0; acc[59] <= 0;
+                        acc[60] <= 0; acc[61] <= 0; acc[62] <= 0; acc[63] <= 0;
                         busy <= 1; k <= 0; g <= 0;
                         state <= COMPUTE;
                     end
                 end
 
                 COMPUTE: begin
-                    if (p2_valid)
-                        for (wi_i = 0; wi_i < 8; wi_i = wi_i + 1)
-                            acc[p2_row_base + wi_i] <= acc[p2_row_base + wi_i] + p2_partial[wi_i];
+                    if (p2_valid) begin
+                        acc[p2_row_base+0] <= acc[p2_row_base+0] + p2_partial[0];
+                        acc[p2_row_base+1] <= acc[p2_row_base+1] + p2_partial[1];
+                        acc[p2_row_base+2] <= acc[p2_row_base+2] + p2_partial[2];
+                        acc[p2_row_base+3] <= acc[p2_row_base+3] + p2_partial[3];
+                        acc[p2_row_base+4] <= acc[p2_row_base+4] + p2_partial[4];
+                        acc[p2_row_base+5] <= acc[p2_row_base+5] + p2_partial[5];
+                        acc[p2_row_base+6] <= acc[p2_row_base+6] + p2_partial[6];
+                        acc[p2_row_base+7] <= acc[p2_row_base+7] + p2_partial[7];
+                    end
                     if (p1_valid) begin
-                        for (wi_i = 0; wi_i < 8; wi_i = wi_i + 1)
-                            p2_partial[wi_i] <= $signed(p1_act) *
-                                $signed(wmem_rdata[wi_i*16 +: 16]);
+                        p2_partial[0] <= $signed(p1_act) * $signed(wmem_rdata[0*16 +: 16]);
+                        p2_partial[1] <= $signed(p1_act) * $signed(wmem_rdata[1*16 +: 16]);
+                        p2_partial[2] <= $signed(p1_act) * $signed(wmem_rdata[2*16 +: 16]);
+                        p2_partial[3] <= $signed(p1_act) * $signed(wmem_rdata[3*16 +: 16]);
+                        p2_partial[4] <= $signed(p1_act) * $signed(wmem_rdata[4*16 +: 16]);
+                        p2_partial[5] <= $signed(p1_act) * $signed(wmem_rdata[5*16 +: 16]);
+                        p2_partial[6] <= $signed(p1_act) * $signed(wmem_rdata[6*16 +: 16]);
+                        p2_partial[7] <= $signed(p1_act) * $signed(wmem_rdata[7*16 +: 16]);
                         p2_row_base <= p1_row_base; p2_valid <= 1;
                     end else begin
                         p2_valid <= 0;
@@ -122,13 +169,25 @@ module matmul_int16_core (
                 end
 
                 DRAIN: begin
-                    if (p2_valid)
-                        for (wi_i = 0; wi_i < 8; wi_i = wi_i + 1)
-                            acc[p2_row_base + wi_i] <= acc[p2_row_base + wi_i] + p2_partial[wi_i];
+                    if (p2_valid) begin
+                        acc[p2_row_base+0] <= acc[p2_row_base+0] + p2_partial[0];
+                        acc[p2_row_base+1] <= acc[p2_row_base+1] + p2_partial[1];
+                        acc[p2_row_base+2] <= acc[p2_row_base+2] + p2_partial[2];
+                        acc[p2_row_base+3] <= acc[p2_row_base+3] + p2_partial[3];
+                        acc[p2_row_base+4] <= acc[p2_row_base+4] + p2_partial[4];
+                        acc[p2_row_base+5] <= acc[p2_row_base+5] + p2_partial[5];
+                        acc[p2_row_base+6] <= acc[p2_row_base+6] + p2_partial[6];
+                        acc[p2_row_base+7] <= acc[p2_row_base+7] + p2_partial[7];
+                    end
                     if (p1_valid) begin
-                        for (wi_i = 0; wi_i < 8; wi_i = wi_i + 1)
-                            p2_partial[wi_i] <= $signed(p1_act) *
-                                $signed(wmem_rdata[wi_i*16 +: 16]);
+                        p2_partial[0] <= $signed(p1_act) * $signed(wmem_rdata[0*16 +: 16]);
+                        p2_partial[1] <= $signed(p1_act) * $signed(wmem_rdata[1*16 +: 16]);
+                        p2_partial[2] <= $signed(p1_act) * $signed(wmem_rdata[2*16 +: 16]);
+                        p2_partial[3] <= $signed(p1_act) * $signed(wmem_rdata[3*16 +: 16]);
+                        p2_partial[4] <= $signed(p1_act) * $signed(wmem_rdata[4*16 +: 16]);
+                        p2_partial[5] <= $signed(p1_act) * $signed(wmem_rdata[5*16 +: 16]);
+                        p2_partial[6] <= $signed(p1_act) * $signed(wmem_rdata[6*16 +: 16]);
+                        p2_partial[7] <= $signed(p1_act) * $signed(wmem_rdata[7*16 +: 16]);
                         p2_row_base <= p1_row_base; p2_valid <= 1;
                     end else begin
                         p2_valid <= 0;
@@ -137,9 +196,16 @@ module matmul_int16_core (
                 end
 
                 DRAIN2: begin
-                    if (p2_valid)
-                        for (wi_i = 0; wi_i < 8; wi_i = wi_i + 1)
-                            acc[p2_row_base + wi_i] <= acc[p2_row_base + wi_i] + p2_partial[wi_i];
+                    if (p2_valid) begin
+                        acc[p2_row_base+0] <= acc[p2_row_base+0] + p2_partial[0];
+                        acc[p2_row_base+1] <= acc[p2_row_base+1] + p2_partial[1];
+                        acc[p2_row_base+2] <= acc[p2_row_base+2] + p2_partial[2];
+                        acc[p2_row_base+3] <= acc[p2_row_base+3] + p2_partial[3];
+                        acc[p2_row_base+4] <= acc[p2_row_base+4] + p2_partial[4];
+                        acc[p2_row_base+5] <= acc[p2_row_base+5] + p2_partial[5];
+                        acc[p2_row_base+6] <= acc[p2_row_base+6] + p2_partial[6];
+                        acc[p2_row_base+7] <= acc[p2_row_base+7] + p2_partial[7];
+                    end
                     p2_valid <= 0; busy <= 0; done <= 1; state <= IDLE;
                 end
             endcase

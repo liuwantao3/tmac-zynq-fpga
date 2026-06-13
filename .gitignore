@@ -72,6 +72,42 @@ docker/xilinx_installers/*.tar
 *.vvp
 *.vcd
 
+# XSIM simulation artifacts
+xsim.dir/
+*.wdb
+xelab.pb
+xvlog.pb
+xsim.jou
+xsim_*.backup.jou
+
+# Vivado integration build artifacts (regenerated from scripts)
+vivado_integration/proj_bd/
+vivado_integration/debug_proj/
+vivado_integration/vitis_ws/
+vivado_integration/.Xil/
+vivado_integration/sim/
+vivado_integration/debug/
+vivado_integration/matmul_bd.bit
+vivado_integration/ps7_init.c
+vivado_integration/ps7_init.h
+vivado_integration/ps7_init.html
+vivado_integration/ps7_init_gpl.c
+vivado_integration/ps7_init_gpl.h
+vivado_integration/vivado_pid*.zip
+vivado_integration/build_debug_hp.tcl
+vivado_integration/rebuild_fast.*
+vivado_integration/post_synth_sim.*
+vivado_integration/run_post_synth_sim.tcl
+vivado_integration/synth_core.tcl
+vivado_integration/write_bitstream_hook.tcl
+
+# ELF binaries in sw/
+vivado_integration/sw/*.elf
+vivado_integration/sw/*.o
+
+# XSDB console dumps
+xsdb_*.txt
+
 # IDE
 .idea/
 .vscode/

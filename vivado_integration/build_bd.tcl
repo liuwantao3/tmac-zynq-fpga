@@ -1,4 +1,4 @@
-# Vivado block design: matmul_top with AXI4-Lite (GP0) + AXI HP (HP0)
+# Vivado block design: matmul_top with AXI4-Lite (GP0) + AXI HP (HP1)
 # Usage: vivado -mode batch -source build_bd.tcl
 
 set origin "D:/Users/u/tmac-zynq-fpga"
@@ -57,10 +57,19 @@ set_property CONFIG.PCW_UART0_PERIPHERAL_ENABLE 1 [get_bd_cells ps7]
 set_property CONFIG.PCW_UART0_UART0_IO "MIO 14 .. 15" [get_bd_cells ps7]
 set_property CONFIG.PCW_UART1_PERIPHERAL_ENABLE 0 [get_bd_cells ps7]
 
-# Enable HP0 slave port for PL access to DDR
+# Enable HP0 + HP1. Boot ROM partitions FIFO blocks across enabled ports.
+# HP0 connected but unused (reserved for read-only test). HP1 is primary PL↔DDR path.
 set_property CONFIG.PCW_USE_S_AXI_HP0 1 [get_bd_cells ps7]
+set_property CONFIG.PCW_S_AXI_HP0_DATA_WIDTH 64 [get_bd_cells ps7]
+set_property CONFIG.PCW_S_AXI_HP0_ID_WIDTH 6 [get_bd_cells ps7]
 set_property CONFIG.PCW_S_AXI_HP0_BASEADDR 0x00000000 [get_bd_cells ps7]
 set_property CONFIG.PCW_S_AXI_HP0_HIGHADDR 0x3FFFFFFF [get_bd_cells ps7]
+
+set_property CONFIG.PCW_USE_S_AXI_HP1 1 [get_bd_cells ps7]
+set_property CONFIG.PCW_S_AXI_HP1_DATA_WIDTH 64 [get_bd_cells ps7]
+set_property CONFIG.PCW_S_AXI_HP1_ID_WIDTH 6 [get_bd_cells ps7]
+set_property CONFIG.PCW_S_AXI_HP1_BASEADDR 0x00000000 [get_bd_cells ps7]
+set_property CONFIG.PCW_S_AXI_HP1_HIGHADDR 0x3FFFFFFF [get_bd_cells ps7]
 
 # PL fabric clock
 set_property CONFIG.PCW_EN_CLK0_PORT 1 [get_bd_cells ps7]
@@ -77,16 +86,17 @@ set_property CONFIG.NUM_SI 1 [get_bd_cells axi_lite]
 connect_bd_intf_net [get_bd_intf_pins ps7/M_AXI_GP0] [get_bd_intf_pins axi_lite/S00_AXI]
 connect_bd_intf_net [get_bd_intf_pins axi_lite/M00_AXI] [get_bd_intf_pins axi_hp_top/S_AXI]
 
-# ======== AXI HP interconnect (top → PS7 HP0 = DDR) ========
+# ======== AXI HP interconnect (top → PS7 HP1 = DDR, read + write path) ========
+# HP1 is primary PL↔DDR port. AFI1 is enabled in ps7_post_config.
 create_bd_cell -type ip -vlnv xilinx.com:ip:axi_interconnect:2.1 axi_hp
 set_property CONFIG.NUM_MI 1 [get_bd_cells axi_hp]
 set_property CONFIG.NUM_SI 1 [get_bd_cells axi_hp]
-set_property CONFIG.PROTOCOL "AXI4" [get_bd_cells axi_hp]
+set_property CONFIG.PROTOCOL "AXI3" [get_bd_cells axi_hp]
 set_property CONFIG.DATA_WIDTH 64 [get_bd_cells axi_hp]
 set_property CONFIG.ADDR_WIDTH 32 [get_bd_cells axi_hp]
 
 connect_bd_intf_net [get_bd_intf_pins axi_hp_top/M_AXI_HP] [get_bd_intf_pins axi_hp/S00_AXI]
-connect_bd_intf_net [get_bd_intf_pins axi_hp/M00_AXI] [get_bd_intf_pins ps7/S_AXI_HP0]
+connect_bd_intf_net [get_bd_intf_pins axi_hp/M00_AXI] [get_bd_intf_pins ps7/S_AXI_HP1]
 
 # ======== Clocks ========
 connect_bd_net [get_bd_pins ps7/FCLK_CLK0] [get_bd_pins ps7/M_AXI_GP0_ACLK]
@@ -98,6 +108,7 @@ connect_bd_net [get_bd_pins ps7/FCLK_CLK0] [get_bd_pins axi_hp/ACLK]
 connect_bd_net [get_bd_pins ps7/FCLK_CLK0] [get_bd_pins axi_hp/S00_ACLK]
 connect_bd_net [get_bd_pins ps7/FCLK_CLK0] [get_bd_pins axi_hp/M00_ACLK]
 connect_bd_net [get_bd_pins ps7/FCLK_CLK0] [get_bd_pins ps7/S_AXI_HP0_ACLK]
+connect_bd_net [get_bd_pins ps7/FCLK_CLK0] [get_bd_pins ps7/S_AXI_HP1_ACLK]
 
 # ======== Resets ========
 connect_bd_net [get_bd_pins ps7/FCLK_RESET0_N] [get_bd_pins axi_lite/ARESETN]
@@ -107,6 +118,7 @@ connect_bd_net [get_bd_pins ps7/FCLK_RESET0_N] [get_bd_pins axi_hp_top/rst_n]
 connect_bd_net [get_bd_pins ps7/FCLK_RESET0_N] [get_bd_pins axi_hp/ARESETN]
 connect_bd_net [get_bd_pins ps7/FCLK_RESET0_N] [get_bd_pins axi_hp/S00_ARESETN]
 connect_bd_net [get_bd_pins ps7/FCLK_RESET0_N] [get_bd_pins axi_hp/M00_ARESETN]
+
 
 # Validate
 validate_bd_design
@@ -120,18 +132,16 @@ if {$ctrl_seg eq ""} {
     create_bd_addr_seg -range 0x00010000 -offset 0x43C00000 \
         [get_bd_addr_spaces ps7/Data] $ctrl_seg SEG_hp_top_ctrl
 }
-# HP0: axi_hp_top → PS7 S_AXI_HP0 → DDR 0x00000000-0x1FFFFFFF
-set hp_seg [get_bd_addr_segs -quiet ps7/S_AXI_HP0/HP0_DDR_LOW]
-if {$hp_seg eq ""} {
-    set hp_seg [get_bd_addr_segs -quiet ps7/S_AXI_HP0/Reg]
-}
+# HP1: axi_hp_top → PS7 S_AXI_HP1 → DDR 0x00000000-0x1FFFFFFF
+set hp_seg [get_bd_addr_segs -quiet ps7/S_AXI_HP1/HP1_DDR_LOW]
+if {$hp_seg eq ""} { set hp_seg [get_bd_addr_segs -quiet ps7/S_AXI_HP1/Reg] }
 if {$hp_seg ne ""} {
     create_bd_addr_seg -range 0x20000000 -offset 0x00000000 \
         [get_bd_addr_spaces axi_hp_top/M_AXI_HP] $hp_seg SEG_hp_top_ddr
-    puts "HP0 DDR mapped OK"
+    puts "HP1 DDR mapped OK"
 } else {
-    puts "ERROR: Cannot find PS7 HP0 address segment!"
-    # Fallback: self-assign
+    puts "ERROR: Cannot find PS7 HP1 address segment!"
+    puts "Available HP1 segments: [get_bd_addr_segs -quiet ps7/S_AXI_HP1/*]"
     assign_bd_address
 }
 

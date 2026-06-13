@@ -29,6 +29,8 @@ Qwen2-0.5B FPGA accelerator targeting Zynq 7010. Quad-core Verilog RTL: INT16×I
 
 7. **Vivado 2023.1** — development on Windows with Vivado 2023.1 (upgraded from 2019.2). LLVM clang 7.0 bundled with Vivado used as ARM cross-compiler (`--target=armv7a-none-eabi`). Vitis 2023.1 used for debugging/running.
 
+8. **Decision: Switch from HP to ACP (2026-06-13)** — AXI HP write path is dead due to AFI FIFO partition locked by boot ROM (0 write blocks, read-only). Switching to ACP (Accelerator Coherency Port) which has no AFI FIFO, supports reads+ writes, and provides automatic cache coherence. See `docs/debug_log.md` for full root-cause analysis.
+
 ## Architecture Summary
 
 ### User FSM flow (matmul_top.v):
@@ -135,6 +137,7 @@ All cores output S24.8 fixed-point (48-bit accumulator, zero-extended to 64-bit 
 5. Vivado simulation — run with Vivado 2019
 6. ~~End-to-end inference test~~ ✅ Verified: all paths produce same token (11 358 3003)
 7. ~~Descriptor chain OP→OP format fix~~ ✅ Done (2026-05-27): auto-derive `act_total_bytes` from previous result when chaining
+8. **Switch HP → ACP** — redesign for working PL↔DDR writes (see `docs/debug_log.md`)
 
 ## Build & Run Commands
 
@@ -145,8 +148,11 @@ make -C verilog all                     # Q8 + Q4K + Q5_0 + INT16 smoke
 # Vivado batch build
 C:\Xilinx\Vivado\2023.1\bin\vivado.bat -mode batch -source vivado_integration/build_bd.tcl
 
-# JTAG load via XSDB
-C:\Xilinx\Vivado\2023.1\bin\xsdb.bat vivado_integration/sw/load.tcl
+# JTAG load via XSDB (single session: program + init + run + capture)
+C:\Xilinx\Vivado\2023.1\bin\xsdb.bat vivado_integration\sw\run_hp.tcl
+
+# JTAG load via Vivado HW Manager (clears DAP sticky errors)
+Copy system_wrapper.bit from proj_bd/ to current dir, then run Vivado HW manager
 
 # C++ integration test
 g++ -std=c++14 -O2 -I sim -I gguf -I . sim/test_integration.cpp -lpthread -o /tmp/ti
@@ -193,6 +199,7 @@ python3 scripts/extract_tmac.py models/qwen2-0_5b-instruct-q4_k_m.gguf /tmp/mode
 - `verilog/tb_matmul_q6_k.v` — Q6_K core tests (fabricated patterns)
 - `verilog/tb_cosim_q5_0.v` — Q5_0 co-simulation (waits for tile dump)
 - `verilog/tb_cosim_q6_k.v` — Q6_K co-simulation (waits for tile dump)
+- `verilog/tb_hp_verify.v` — HP write path testbench (passes with 5 bug fixes)
 
 ### C++ Simulation
 - `sim/tmac_gguf.cpp` — Full inference pipeline, dispatch by tensor type
@@ -227,99 +234,94 @@ python3 scripts/extract_tmac.py models/qwen2-0_5b-instruct-q4_k_m.gguf /tmp/mode
 
 **DDR address map** (from PS7 config): 0x0010_0000 to 0x2000_0000 (512 MB), CPU accesses at 0x0000_0000 alias after MMU/cache setup; bare-metal uses physical 0x0010_0000 base.
 
-## Phase 1: AXI HP + INT16
+## Phase 1: AXI4-Lite + ACP (Accelerator Coherency Port)
+
+### Status
+- **AXI4-Lite (GP0) control path** ✅ Verified on hardware — all register R/W correct
+- **HP0/HP1 write path** ❌ Dead — AFI0_/AFI1_FIFO_PARTITION = 0x00000007 (write=0 blocks), locked by boot ROM
+- **HP0/HP1 read path** ✅ Working (7 read FIFO blocks)
+- **ACP** 🔄 In development — no AFI FIFO, cache coherent, supports reads + writes
+
+### Root Cause: HP Write FIFO
+Both HP0 and HP1 have 0-block write FIFOs allocated by boot ROM at power-on:
+```
+AFI0_FIFO_PARTITION (0xF8008004) = 0x00000007 → read=7, write=0
+AFI1_FIFO_PARTITION (0xF8009004) = 0x00000007 → read=7, write=0
+```
+The register is **write-once after reset** and boot ROM locks it before FSBL runs. No software workaround (bypass mode, channel enable) overcomes this. The AXI interconnect provides speculative AXI responses — AWREADY + WREADY + BVALID all assert, but data never enters the PS7. See `docs/debug_log.md` for full analysis.
+
+### Why ACP
+The ACP (Accelerator Coherency Port) connects PL to the SCU (Snoop Control Unit) directly — **no AFI FIFO**. It also provides:
+- Automatic L1/L2 cache coherence — no manual cache flush/invalidate needed
+- 64-bit AXI3 protocol (same as HP)
+- Up to 16-beat bursts (same as HP)
+- Both read and write transactions
 
 ### Batch Build Framework
 
-Three scripts form the batch build/debug pipeline:
-
 | Script | Purpose | Command |
 |--------|---------|---------|
-| `vivado_integration/build_bd.tcl` | Full Zynq BD (PS7 + AXI Lite + AXI HP) | `vivado -mode batch -source build_bd.tcl` |
-| `vivado_integration/build_debug.tcl` | Minimal test design with ILA | `vivado -mode batch -source build_debug.tcl` |
-| `vivado_integration/capture_ila.tcl` | ILA capture (WIP) | `vivado -mode batch -source capture_ila.tcl` |
+| `vivado_integration/build_bd.tcl` | Full Zynq BD (PS7 + AXI Lite + AXI HP→ACP) | `vivado -mode batch -source build_bd.tcl` |
+| `vivado_integration/sw/rebuild.tcl` | XSCT: rebuild Vitis app | `xsct vivado_integration/sw/rebuild.tcl` |
+| `vivado_integration/sw/run_hp.tcl` | XSDB: program FPGA + init PS7 + load ELF + capture | `xsdb vivado_integration/sw/run_hp.tcl` |
 
-### Batch Build with ILA (`build_debug.tcl`) — Step by Step
+### Debug Workflow
 
-```tcl
-# 1. Create project for xc7z010
-create_project -force debug_test $proj_dir -part xc7z010clg400-1
-# 2. Add RTL source
-add_files -fileset sources_1 [file normalize "$rtl_dir/debug_test.v"]
-set_property top debug_test [current_fileset]
-# 3. Synthesize
-launch_runs synth_1 -jobs 8
-wait_on_run synth_1
-# 4. Open synthesized design, create ILA core
-open_run synth_1
-create_debug_core u_ila_0 ila
-set_property C_DATA_DEPTH 1024 [get_debug_cores u_ila_0]
-set_property C_TRIGIN_EN false [get_debug_cores u_ila_0]
-set_property C_TRIGOUT_EN false [get_debug_cores u_ila_0]
-# 5. Connect ILA clock to BUFG output (routable)
-connect_debug_port u_ila_0/clk [get_nets {clk_IBUF_BUFG}]
-# 6. Connect probes to MARK_DEBUG nets
-connect_debug_port u_ila_0/probe0 [get_nets {dbg_tick}]
-# 7. Write synth checkpoint
-write_checkpoint
-# 8. Implement with relaxed DRC (unconstrained I/O test design)
-set_property STEPS.write_bitstream.TCL.PRE {write_bitstream_hook.tcl} [get_runs impl_1]
-launch_runs impl_1 -to_step write_bitstream -jobs 8
-wait_on_run impl_1
+**Step 1 — Vivado builds bitstream:**
+```
+C:\Xilinx\Vivado\2023.1\bin\vivado.bat -mode batch -source vivado_integration\build_bd.tcl
 ```
 
-### ILA Capture (`capture_ila.tcl`) — Step by Step
-
-```tcl
-# 1. Connect to hardware
-open_hw_manager
-connect_hw_server
-open_hw_target
-current_hw_device [lindex [get_hw_devices] end]
-# 2. Set bitstream and probes file
-set_property PROGRAM.FILE $bit [current_hw_device]
-set_property PROBES.FILE $ltx [current_hw_device]
-# 3. Program FPGA
-program_hw_devices [current_hw_device]
-# 4. Configure BSCAN scan chain (required for ILA detection)
-set_property BSCAN_SWITCH_USER_MASK 0x02 [current_hw_device]
-refresh_hw_device [current_hw_device]
-# 5. Find ILA and set depth
-set ila [lindex [get_hw_ilas -of_objects [current_hw_device]] 0]
-set_property CONTROL.DATA_DEPTH 1024 $ila
-# 6. Arm ILA and capture
-run_hw_ila $ila
-after 2000
-# 7. Read data and save to CSV
-set data [read_hw_ila_data $ila]
-write_hw_ila_data -force -csv_file ila_data.csv $data
+**Step 2 — Rebuild Vitis app (if C code changed):**
+```
+copy vivado_integration\sw\hp_test.c D:\Users\u\workspace\tmac\src\hp_test.c /Y
+C:\Xilinx\Vitis\2023.1\bin\xsct.bat vivado_integration\sw\rebuild.tcl
 ```
 
-### Known Issues
+**Step 3 — Single XSDB session:**
+```
+C:\Xilinx\Vivado\2023.1\bin\xsdb.bat vivado_integration\sw\run_hp.tcl
+```
 
-| Issue | Cause | Workaround |
-|-------|-------|------------|
-| AXI HP read stuck in RD_WT | HP interconnect/auto_pc | Use ILA to capture ARADDR/ARVALID/ARREADY |
-| ILA not detected after program | BSCAN_SWITCH_USER_MASK not set | Set 0x02 and refresh |
-| xsdb can't find ARM core | DAP error after Vivado program | Run ps7_init from xc7z010 target |
-| ps7_init.tcl path | File at `vivado_integration/` not `proj_bd/` | Use absolute path |
+The `run_hp.tcl` script handles:
+1. FPGA programming via `fpga -file`
+2. PS7 initialization via `ps7_init` (DDR, clocks)
+3. ARM core selection and ELF download
+4. Spin/poll markers in OCM (non-cacheable diagnostic area)
+5. DAP memory read capture of all diagnostic regions
 
-### Verification Scripts
+### Verilog Bug Fixes (2026-06-12)
 
-| Script | What it does |
-|--------|-------------|
-| `sw/hp_test.c` | Full HP test: writes weights/acts to DDR, starts computation, checks results |
-| `sw/run_hp.tcl` | XSDB: init PS7, load ELF, run |
-| `sw/build.tcl` | XSCT: create Vitis platform + app + build |
-| `vivado_integration/check_props.tcl` | Debug: list all hw_device properties |
+1. **Stray byte consumption** (`axi_hp_int16_top.v`): After HP read burst completes, `data_valid` stays high for one cycle while `hp_read_busy` is already low. Added `&& hp_read_busy` guard.
+
+2. **DRAIN 6-bit counter wrap** (`axi_hp_int16_top.v`): `reg [5:0] idx` wraps at 63; `idx < 64` always true. Widened to `reg [6:0] idx`.
+
+3. **FSM auto-restart** (`axi_hp_int16_top.v`): Start bit never cleared. Added auto-clear on state != IDLE.
+
+4. **Write master `done` stuck high** (`axi_hp_int16_top.v`): Changed to `hp_write_busy_fall` detection.
+
+5. **HP read master byte duplication** (`axihp_read_master.v`): Root cause of wrong hardware results. Fixed by advancing `data_out` immediately on non-last-byte consumption and clearing `data_valid` on last byte.
+
+### PS7 Config Changes
+
+`ps7_post_config_3_0` in `ps7_init.tcl` was modified to enable AFI1:
+```tcl
+mwr -force 0xF8009000 0x00000003  ;# AFI1 enable + bypass FIFO
+mwr -force 0xF8009008 0x00000001  ;# write channel enable
+mwr -force 0xF800900C 0x00000001  ;# read channel enable
+```
 
 ### Relevant Files
 
-- `vivado_integration/build_bd.tcl`: Vivado batch build script (PS7 DDR=MT41J256M16, UART0, 100 MHz PL, AXI interconnect, bitstream + XSA)
-- `vivado_integration/rtl/axi_wrap_int16.v`: AXI4-Lite wrapper with BRAM weight_buf, DSP48 compute
-- `vivado_integration/sw/main.c`: Bare-metal INT16 matmul test
-- `vivado_integration/sw/regs.h`: Register map (IP_BASE=0x43C00000, UART0=0xE0000000)
-- `vivado_integration/sw/uart.c`: UART0 polling driver (115200 baud, 50 MHz ref clock)
-- `vivado_integration/proj_bd/`: Vivado project outputs (post_synth.dcp, post_impl.dcp, matmul_bd.xsa, system_wrapper.bit)
-- `verilog/matmul_int16_core.v`: INT16 compute core (standalone verified, 8 DSP, 2 BRAM)
-- `verilog/matmul_top.v`: Quad-core top (Q8, Q4K, Q5_0, Q6_K, INT16)
+- `vivado_integration/build_bd.tcl`: Vivado batch build (PS7 with HP0+HP1, to be switched to ACP)
+- `vivado_integration/rtl/axi_hp_int16_top.v`: Top FSM — HP burst read + write master (to be adapted for ACP)
+- `vivado_integration/rtl/axi_wrap_int16.v`: Original AXI4-Lite wrapper (verified on hardware, GP0-only fallback)
+- `vivado_integration/sw/hp_test.c`: Bare-metal test — AFI experiment, cache diagnostics, compute test
+- `vivado_integration/sw/run_hp.tcl`: XSDB capture script
+- `vivado_integration/sw/regs.h`: Register map
+- `vivado_integration/ps7_init.tcl`: Modified — AFI1 enabled in ps7_post_config
+- `verilog/axihp_read_master.v`: HP read master (to be adapted for ACP)
+- `verilog/axihp_write_master.v`: HP write master (to be adapted for ACP)
+- `verilog/matmul_int16_core.v`: INT16 compute core (verified standalone)
+- `verilog/tb_hp_verify.v`: HP testbench — passes with all 5 bug fixes
+- `docs/debug_log.md`: Full debug history, cache coherence fix, DAP/JTAG lessons

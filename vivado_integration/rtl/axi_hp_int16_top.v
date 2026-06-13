@@ -58,25 +58,27 @@ module axi_hp_int16_top (
     reg [31:0] reg_act_addr;    // DDR address of activations (128 bytes)
     reg [31:0] reg_res_addr;    // DDR address for results (512 bytes)
     reg [31:0] reg_debug;
-
-    // Debug probes for Vivado ILA (MARK_DEBUG causes auto-insertion)
-    (* MARK_DEBUG = "TRUE" *) wire [31:0] dbg_araddr;    assign dbg_araddr = m_axi_araddr;
-    (* MARK_DEBUG = "TRUE" *) wire        dbg_arvalid;   assign dbg_arvalid = m_axi_arvalid;
-    (* MARK_DEBUG = "TRUE" *) wire        dbg_arready;   assign dbg_arready = m_axi_arready;
-    (* MARK_DEBUG = "TRUE" *) wire [7:0]  dbg_arlen;     assign dbg_arlen = m_axi_arlen;
-    (* MARK_DEBUG = "TRUE" *) wire [63:0] dbg_rdata;     assign dbg_rdata = m_axi_rdata;
-    (* MARK_DEBUG = "TRUE" *) wire        dbg_rvalid;    assign dbg_rvalid = m_axi_rvalid;
-    (* MARK_DEBUG = "TRUE" *) wire        dbg_rready;    assign dbg_rready = m_axi_rready;
-    (* MARK_DEBUG = "TRUE" *) wire        dbg_rlast;     assign dbg_rlast = m_axi_rlast;
-    (* MARK_DEBUG = "TRUE" *) wire [31:0] dbg_awaddr;    assign dbg_awaddr = m_axi_awaddr;
-    (* MARK_DEBUG = "TRUE" *) wire        dbg_awvalid;   assign dbg_awvalid = m_axi_awvalid;
-    (* MARK_DEBUG = "TRUE" *) wire        dbg_awready;   assign dbg_awready = m_axi_awready;
-    (* MARK_DEBUG = "TRUE" *) wire [63:0] dbg_wdata;     assign dbg_wdata = m_axi_wdata;
-    (* MARK_DEBUG = "TRUE" *) wire        dbg_wvalid;    assign dbg_wvalid = m_axi_wvalid;
-    (* MARK_DEBUG = "TRUE" *) wire        dbg_wready;    assign dbg_wready = m_axi_wready;
-    (* MARK_DEBUG = "TRUE" *) wire        dbg_wlast;     assign dbg_wlast = m_axi_wlast;
-    (* MARK_DEBUG = "TRUE" *) wire        dbg_bvalid;    assign dbg_bvalid = m_axi_bvalid;
-    (* MARK_DEBUG = "TRUE" *) wire        dbg_bready;    assign dbg_bready = m_axi_bready;
+    reg [31:0] reg_wr_test;     // [0]=write test trigger, [14:8]=test idx
+    reg        wr_sticky_start, wr_sticky_aw, wr_sticky_w, wr_sticky_b;
+    // reg_debug layout:
+    // [2:0]   = FSM state
+    // [3]     = fsm_busy
+    // [4]     = hp_write_start (LIVE)
+    // [5]     = wr_sticky_aw
+    // [6]     = wr_sticky_w
+    // [7]     = wr_sticky_b
+    // [9:8]   = idx[1:0]
+    // [10]    = hp_read_busy
+    // [11]    = hp_read_done
+    // [12]    = hp_write_busy
+    // [13]    = hp_write_done
+    // [14]    = core_busy
+    // [15]    = core_done
+    // [16]    = wr_sticky_start
+    // [17]    = hp_write_busy_fall
+    // [20:18] = prev_state (state from which IDLE was entered)
+    // [23:21] = 000
+    // [31:24] = 0xDB (marker)
 
     wire core_done, core_busy;
     wire [47:0] core_res_dout;
@@ -89,6 +91,7 @@ module axi_hp_int16_top (
     reg         wt_we;
     reg  [12:0] wt_addr;
     reg  [7:0]  wt_din;
+    reg  [7:0]  act_lo;
     wire [5:0]  res_addr;
     wire [47:0] res_dout;
 
@@ -105,7 +108,9 @@ module axi_hp_int16_top (
     // ======== AXI HP Read Master ========
     wire        hp_read_busy, hp_read_done, hp_read_valid;
     wire [7:0]  hp_read_data;
-    reg         hp_read_ready, hp_read_start;
+    reg         hp_read_start;
+    wire        hp_read_ready;
+    assign hp_read_ready = (state == RD_WT || state == RD_ACT) && hp_read_valid && hp_read_busy;
     reg  [31:0] hp_read_addr;
     reg  [7:0]  hp_read_len;
 
@@ -147,40 +152,93 @@ module axi_hp_int16_top (
 
     // ======== FSM ========
     localparam IDLE  = 0, RD_WT = 1, RD_ACT = 2, COMP = 3, DRAIN = 4,
-               START_WR = 5, WR_RES = 6;
-    reg [2:0] state;
-    reg [13:0] byte_cnt;    // bytes read/written in current phase
-    reg [5:0]  idx;
+               START_WR = 5, WR_RES = 6, WRITE_TEST = 7;
+    reg [2:0] state;  // 3 bits supports 0-7 (8 states)
+    reg [13:0] byte_cnt;
+    reg [6:0]  idx;
     reg        core_start_pulse;
-    reg        start_clear;
-    reg        hp_read_done_prev;  // edge detection for hp_read_done
-    wire       hp_read_done_rise = hp_read_done && !hp_read_done_prev;
+    reg        fsm_busy;
+    reg [2:0]  prev_state;
+    reg        hp_read_busy_prev;
+    wire       hp_read_busy_fall = !hp_read_busy && hp_read_busy_prev;
+    reg        hp_write_busy_prev;
+    wire       hp_write_busy_fall = !hp_write_busy && hp_write_busy_prev;
+    reg [1:0]  wr_test_idx;
+    reg        wr_test_active;
 
     assign core_start = core_start_pulse;
     assign res_addr = idx;
     assign res_dout = core_res_dout;
 
-    // Debug
-    always @(*) begin
-        reg_debug = {hp_read_busy, hp_read_done, hp_write_busy, hp_write_done,
-                     state, byte_cnt[7:0], idx};
+    // Diagnostic: capture FIRST hp_read_addr
+    reg [31:0] dbg_first_addr;
+    reg        dbg_first_done;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin dbg_first_addr <= 0; dbg_first_done <= 0; end
+        else if (hp_read_start && !dbg_first_done) begin
+            dbg_first_addr <= hp_read_addr;
+            dbg_first_done <= 1;
+        end
     end
+
+    // Replace dedicated diagnostic block — fold into FSM block to avoid multi-driver
+    // Write-sticky bits live in reg_debug[9:6]
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             state <= IDLE; reg_status <= 0;
-            hp_read_start <= 0; hp_read_ready <= 0;
+            hp_read_start <= 0;
             hp_write_start <= 0; hp_write_valid <= 0;
             wt_we <= 0; act_we <= 0; core_start_pulse <= 0;
-            byte_cnt <= 0; idx <= 0;
+            byte_cnt <= 0; idx <= 0; act_lo <= 0;
+            fsm_busy <= 0; hp_read_busy_prev <= 0; hp_write_busy_prev <= 0;
+            reg_debug <= 0;
+            wr_sticky_aw <= 0; wr_sticky_w <= 0; wr_sticky_b <= 0; wr_sticky_start <= 0;
+            wr_test_idx <= 0;
         end else begin
+            // Capture write sticky events
+            if (m_axi_awvalid && m_axi_awready) wr_sticky_aw <= 1;
+            if (m_axi_wvalid  && m_axi_wready)  wr_sticky_w  <= 1;
+            if (m_axi_bvalid  && m_axi_bready)  wr_sticky_b  <= 1;
+            if (hp_write_start)                 wr_sticky_start <= 1;
+
+            // Live diagnostic: expose FSM state via reg_debug
+            reg_debug[2:0]   <= state;
+            reg_debug[3]     <= fsm_busy;
+            reg_debug[4]     <= hp_write_start;                // live, not sticky
+            reg_debug[5]     <= wr_sticky_aw;
+            reg_debug[6]     <= wr_sticky_w;
+            reg_debug[7]     <= wr_sticky_b;
+            reg_debug[9:8]   <= idx[1:0];
+            reg_debug[10]    <= hp_read_busy;
+            reg_debug[11]    <= hp_read_done;
+            reg_debug[12]    <= hp_write_busy;
+            reg_debug[13]    <= hp_write_done;
+            reg_debug[14]    <= core_busy;
+            reg_debug[15]    <= core_done;
+            reg_debug[17:16] <= {wr_sticky_start, hp_write_busy_fall};
+            reg_debug[20:18] <= prev_state;
+            reg_debug[23:21] <= 3'b000;
+            reg_debug[31:24] <= 8'hDB;
+
             hp_read_start <= 0; hp_write_start <= 0; hp_write_valid <= 0;
             wt_we <= 0; act_we <= 0; core_start_pulse <= 0;
-            hp_read_done_prev <= hp_read_done;
+            hp_read_busy_prev <= hp_read_busy;
+            hp_write_busy_prev <= hp_write_busy;
+            prev_state <= state;
 
             case (state)
                 IDLE: begin
-                    if (reg_ap_ctrl[0] && !core_busy) begin
+                    if (reg_wr_test[0] && !hp_write_busy && !wr_test_active) begin
+                        // Direct write test: bypass core, write known pattern to DDR
+                        wr_test_active <= 1;
+                        hp_write_addr <= reg_res_addr;
+                        hp_write_count <= 16'd4;
+                        hp_write_start <= 1;
+                        wr_test_idx <= 0;
+                        state <= WRITE_TEST;
+                    end else if (reg_ap_ctrl[0] && !core_busy && !fsm_busy) begin
+                        fsm_busy <= 1;
                         reg_status <= 1; state <= RD_WT;
                         byte_cnt <= 0;
                         // Start reading weights from DDR
@@ -191,50 +249,47 @@ module axi_hp_int16_top (
                 end
 
                 RD_WT: begin
-                    if (hp_read_valid && !hp_read_ready) begin
-                        hp_read_ready <= 1;
+                    if (hp_read_busy)
+                        hp_read_start <= 0;
+
+                    if (hp_read_valid && hp_read_busy) begin
                         wt_we <= 1;
                         wt_addr <= {byte_cnt[3:0], byte_cnt[12:4]};
                         wt_din  <= hp_read_data;
                         byte_cnt <= byte_cnt + 1;
-                    end else begin
-                        hp_read_ready <= 0;
                     end
 
-                    if (hp_read_done_rise) begin
+                    if (hp_read_busy_fall) begin
                         if (byte_cnt < 8192) begin
-                            // Next burst
                             hp_read_addr <= reg_wt_addr + byte_cnt;
-                            hp_read_len <= 8'd15;   // 16 beats = 128 bytes per burst (AXI3 max)
+                            hp_read_len <= 8'd15;
                             hp_read_start <= 1;
                         end else begin
-                            // Weights done, start reading activations
                             state <= RD_ACT;
                             byte_cnt <= 0;
                             hp_read_addr <= reg_act_addr;
-                            hp_read_len <= 8'd15;  // 16 beats = 128 bytes
+                            hp_read_len <= 8'd15;
                             hp_read_start <= 1;
                         end
                     end
                 end
 
                 RD_ACT: begin
-                    if (hp_read_valid && !hp_read_ready) begin
-                        hp_read_ready <= 1;
-                        // Accumulate pairs of bytes into 16-bit activations
+                    if (hp_read_busy)
+                        hp_read_start <= 0;
+
+                    if (hp_read_valid && hp_read_busy) begin
                         if (byte_cnt[0] == 0)
-                            act_din[7:0] <= hp_read_data;
+                            act_lo <= hp_read_data;
                         else begin
-                            act_din[15:8] <= hp_read_data;
+                            act_din <= {hp_read_data, act_lo};
                             act_we <= 1;
                             act_addr <= byte_cnt[6:1];
                         end
                         byte_cnt <= byte_cnt + 1;
-                    end else begin
-                        hp_read_ready <= 0;
                     end
 
-                    if (hp_read_done_rise) begin
+                    if (hp_read_busy_fall) begin
                         state <= COMP;
                         core_start_pulse <= 1;
                     end
@@ -254,7 +309,7 @@ module axi_hp_int16_top (
                         state <= START_WR;
                         idx <= 0;
                         hp_write_addr <= reg_res_addr;
-                        hp_write_count <= 64;
+                        hp_write_count <= 16;
                     end
                 end
 
@@ -264,9 +319,17 @@ module axi_hp_int16_top (
                 end
 
                 WR_RES: begin
-                    if (!hp_write_busy && hp_write_done) begin
-                        state <= IDLE;
-                        reg_status <= 0;
+                    if (hp_write_busy_fall) begin
+                        if (idx < 64) begin
+                            // More results to write: start next burst
+                            hp_write_addr <= hp_write_addr + 128;
+                            hp_write_count <= 16;
+                            state <= START_WR;
+                        end else begin
+                            state <= IDLE;
+                            reg_status <= 0;
+                            fsm_busy <= 0;
+                        end
                     end
                     if (hp_write_valid && hp_write_ready) begin
                         hp_write_valid <= 0;
@@ -275,6 +338,28 @@ module axi_hp_int16_top (
                     if (!hp_write_valid && idx < 64) begin
                         hp_write_data <= {16'd0, 16'd0, res_dout[31:0]};
                         hp_write_valid <= 1;
+                    end
+                end
+
+                WRITE_TEST: begin
+                    if (hp_write_busy)
+                        hp_write_start <= 0;
+                    // Send test data: 4 words of known pattern
+                    if (hp_write_valid && hp_write_ready) begin
+                        hp_write_valid <= 0;
+                        wr_test_idx <= wr_test_idx + 1;
+                    end else if (!hp_write_valid && wr_test_idx < 4) begin
+                        case (wr_test_idx)
+                            0: hp_write_data <= 64'hDEADBEEF_CAFEBABE;
+                            1: hp_write_data <= 64'h12345678_9ABCDEF0;
+                            2: hp_write_data <= 64'h00000000_FFFFFFFF;
+                            3: hp_write_data <= 64'hAAAAAAAA_55555555;
+                        endcase
+                        hp_write_valid <= 1;
+                    end
+                    if (hp_write_busy_fall) begin
+                        state <= IDLE;
+                        wr_test_active <= 0;
                     end
                 end
             endcase
@@ -296,11 +381,12 @@ module axi_hp_int16_top (
         if (!rst_n) begin
             awready_r <= 0; wready_r <= 0; bvalid_r <= 0; bresp_r <= 0;
             awaddr_r <= 0; wdata_r <= 0; aw_got <= 0; w_got <= 0;
-            reg_ap_ctrl <= 32'h4; reg_status <= 0;
+            reg_ap_ctrl <= 32'h4;
             reg_wt_addr <= 0; reg_act_addr <= 0; reg_res_addr <= 0;
+            reg_wr_test <= 0;
         end else begin
             reg_ap_ctrl[3:1] <= {~core_busy, ~core_busy, core_done};
-            if (start_clear) reg_ap_ctrl[0] <= 0;
+            if (state != IDLE) reg_ap_ctrl[0] <= 0;
 
             awready_r <= 0; wready_r <= 0;
 
@@ -322,6 +408,7 @@ module axi_hp_int16_top (
                     16'h0018: reg_wt_addr  <= wdata_r;
                     16'h001C: reg_act_addr <= wdata_r;
                     16'h0020: reg_res_addr <= wdata_r;
+                    16'h0028: reg_wr_test  <= wdata_r;
                 endcase
                 aw_got <= 0; w_got <= 0;
             end
@@ -353,6 +440,7 @@ module axi_hp_int16_top (
                     16'h001C: rdata_r <= reg_act_addr;
                     16'h0020: rdata_r <= reg_res_addr;
                     16'h0024: rdata_r <= reg_debug;
+                    16'h0028: rdata_r <= reg_wr_test;
                     default:  rdata_r <= 32'h0;
                 endcase
                 rresp_r <= 2'b00;

@@ -68,6 +68,23 @@ module tb_int16_smoke;
         $display("PASS: row 63 = %0d", res_dout);
 
         $display("\n=== INT16 SMOKE TEST PASSED ===");
+        $display("\n=== SECOND RUN: verify acc reset ===");
+        // Second run: same weights/acts, should get same result
+        $display("Starting compute (2nd run)...");
+        @(negedge clk); start=1;
+        @(negedge clk); start=0;
+        wait(done);
+        @(posedge clk);
+
+        $display("Checking row 0 = 64 (2nd run)...");
+        res_addr = 0; @(negedge clk);
+        if (res_dout !== 64) begin
+            $display("FAIL: row 0 (2nd run) = %0d (expected 64)", res_dout);
+            $finish;
+        end
+        $display("PASS: row 0 (2nd run) = %0d", res_dout);
+
+        $display("\n=== INT16 DOUBLE RUN TEST PASSED ===");
         $finish;
     end
 endmodule
