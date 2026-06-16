@@ -311,6 +311,30 @@ mwr -force 0xF8009008 0x00000001  ;# write channel enable
 mwr -force 0xF800900C 0x00000001  ;# read channel enable
 ```
 
+### Latest Debug Session (2026-06-14)
+
+**Problem:** SLCR register LVL_SHFTR_EN (0xF8000090) write returns 0 readback — both with and without explicit SLCR unlock (0xDF0D to 0xF8000008). The exact same write pattern worked in the first session but fails in all subsequent builds.
+
+**Tested configurations:**
+- With explicit SLCR unlock before each SLCR access (0xDF0D write to 0xF8000008 + DSB + ISB): **LVL_SHFTR_EN=0**
+- Without SLCR unlock (same code as first session): **LVL_SHFTR_EN=0**
+
+**Disassembly verified:** The compiler generates correct code — `str r2, [r3]` at 0xF8000090 with the value 0x000F000F.
+
+**First session (worked):** The original BSP build from the repo produced correct LVL_SHFTR_EN=0x0000000F readback. No explicit SLCR unlock was used.
+
+**Hypotheses to investigate:**
+1. **MMU mapping for SLCR region (0xF8000000):** BSP's `__cpu_init` sets up MMU table at 0x00104000. Check if the SLCR region is mapped as Device-Shareable (strongly-ordered). A non-cacheable Normal mapping might cause write buffering. The mapping for 0xE0000000 (UART region) looked correct; verify 0xF8000000 mapping.
+2. **Compiler barrier insufficiency:** The inline `dsb()` function is correct (`dsb sy`), but maybe the compiler reorders the store before the SLCR unlock completes. The first session's `*(volatile unsigned long *)` vs current `*(volatile unsigned *)` should be equivalent, but could affect compiler codegen.
+3. **BSP build variation:** The first session used the original BSP from the repo; subsequent rebuilds may include different BSP source files or configuration. Check if BSP's `xparameters.h` or `__cpu_init` changed.
+4. **CPU halted in XUartPs_SendByte:** PC always ends at 0x001014b8 (entry of XUartPs_SendByte) after 30s run, meaning CPU completed all xil_printf calls and was at the start of the last one when halted. The UART output IS correct — just the SLCR readback is wrong.
+
+**Next steps in study:**
+1. Dump MMU table entries for 0xF8000000 region to verify Device-Shareable mapping
+2. Try writing to a different SLCR register (e.g., FPGA_RST_CTRL at 0xF8000708) to see if any SLCR write works
+3. Compare BSP build flags between sessions (check rebuild.tcl output for differences)
+4. Consider adding explicit `__attribute__((section(".text")))` or barrier macro (`__DMB()`)
+
 ### Relevant Files
 
 - `vivado_integration/build_bd.tcl`: Vivado batch build (PS7 with HP0+HP1, to be switched to ACP)

@@ -156,16 +156,12 @@ proc ps7_peripherals_init_data_3_0 {} {
 }
 proc ps7_post_config_3_0 {} {
     mwr -force 0XF8000008 0x0000DF0D
-    mask_write 0XF8000900 0x0000000F 0x0000000F
+    # NOTE: LVL_SHFTR_EN is at 0xF8000090 (offset 0x090), NOT 0xF8000900!
+    # The auto-generated ps7_init has a one-digit-off bug in the address.
+    # SLCR mask format: bits[23:16]=mask for data bits[7:0]
+    mwr -force 0XF8000090 0x000F000F
     mask_write 0XF8000240 0xFFFFFFFF 0x00000000
-    # AFI0: enable + bypass FIFO, enable write/read channels (read-only, write FIFO locked to 0)
-    mwr -force 0XF8008000 0x00000003  ;# [0]=enable, [1]=bypass FIFO
-    mwr -force 0XF8008008 0x00000001  ;# write channel enable
-    mwr -force 0XF800800C 0x00000001  ;# read channel enable
-    # AFI1 (HP1, primary PL↔DDR path): enable + bypass FIFO
-    mwr -force 0XF8009000 0x00000003  ;# [0]=enable, [1]=bypass FIFO
-    mwr -force 0XF8009008 0x00000001  ;# write channel enable
-    mwr -force 0XF800900C 0x00000001  ;# read channel enable
+    mask_write 0XF8000910 0xFFFFFFFF 0x0000000F
     mwr -force 0XF8000004 0x0000767B
 }
 proc ps7_debug_3_0 {} {
@@ -332,6 +328,7 @@ proc ps7_peripherals_init_data_2_0 {} {
 }
 proc ps7_post_config_2_0 {} {
     mwr -force 0XF8000008 0x0000DF0D
+    mwr -force 0XF8000090 0x0000000F
     mask_write 0XF8000900 0x0000000F 0x0000000F
     mask_write 0XF8000240 0xFFFFFFFF 0x00000000
     mwr -force 0XF8000004 0x0000767B
@@ -498,6 +495,7 @@ proc ps7_peripherals_init_data_1_0 {} {
 }
 proc ps7_post_config_1_0 {} {
     mwr -force 0XF8000008 0x0000DF0D
+    mwr -force 0XF8000090 0x0000000F
     mask_write 0XF8000900 0x0000000F 0x0000000F
     mask_write 0XF8000240 0xFFFFFFFF 0x00000000
     mwr -force 0XF8000004 0x0000767B
@@ -516,10 +514,16 @@ set APU_FREQ  666666666
 
 proc mask_poll { addr mask } {
     set count 1
-    set curval "0x[string range [mrd $addr] end-8 end]"
+    set raw ""
+    catch {set raw [mrd $addr]}
+    if {$raw eq ""} { return }
+    set curval "0x[string range $raw end-8 end]"
     set maskedval [expr {$curval & $mask}]
     while { $maskedval == 0 } {
-        set curval "0x[string range [mrd $addr] end-8 end]"
+        set raw ""
+        catch {set raw [mrd $addr]}
+        if {$raw eq ""} { return }
+        set curval "0x[string range $raw end-8 end]"
         set maskedval [expr {$curval & $mask}]
         set count [ expr { $count + 1 } ]
         if { $count == 100000000 } {
@@ -544,8 +548,21 @@ proc mask_delay { addr val } {
 }
 
 proc ps_version { } {
-    set si_ver "0x[string range [mrd 0xF8007080] end-8 end]"
-    set mask_sil_ver "0x[expr {$si_ver >> 28}]"
+    set si_ver_raw ""
+    catch {set si_ver_raw [mrd 0xF8000080]}
+    if {$si_ver_raw eq ""} {
+        return 0x0
+    }
+    set si_str ""
+    catch {set si_str "0x[string range $si_ver_raw end-8 end]"}
+    if {$si_str eq ""} {
+        return 0x0
+    }
+    set mask_sil_ver ""
+    catch {set mask_sil_ver "0x[expr {$si_str >> 28}]"}
+    if {$mask_sil_ver eq ""} {
+        return 0x0
+    }
     return $mask_sil_ver;
 }
 

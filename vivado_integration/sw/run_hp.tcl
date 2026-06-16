@@ -1,101 +1,124 @@
-# XSDB: full flow — program FPGA, init PS7, load ELF, run with live capture
+# XSDB: minimal flow — FPGA + PS7 + load ELF + run
+configparams force-mem-accesses 1
 connect
-after 500
+after 5000
 
-# Program FPGA (works once after power cycle)
-fpga -file {D:/Users/u/tmac-zynq-fpga/vivado_integration/proj_bd/matmul_bd.runs/impl_1/system_wrapper.bit}
-puts "=== FPGA programmed ==="
+proc list_targets {} {
+    puts "=== All targets ==="
+    if {[catch {targets} err]} {
+        puts "No targets listed: $err"
+    }
+}
+proc select_dap {} {
+    foreach pattern {"*DAP*" "*APU*" "*ps7*" "*PS7*"} {
+        if {![catch {targets -set -filter [list name =~ $pattern]} err]} {
+            if {![catch {mrd 0xF8000090 1}]} { return 1 }
+        }
+    }
+    for {set tn 1} {$tn <= 10} {incr tn} {
+        if {![catch {targets -set $tn} err]} {
+            if {![catch {mrd 0xF8000090 1}]} { return 1 }
+        }
+    }
+    return 0
+}
+proc select_arm0 {} {
+    foreach pattern {"*Cortex-A9*#0*" "*Cortex-A9*0*" "*A9*#0*" "#0*"} {
+        if {![catch {targets -set -filter [list name =~ $pattern]} err]} {
+            if {![catch {rrd pc}]} { return 1 }
+        }
+    }
+    for {set tn 1} {$tn <= 10} {incr tn} {
+        if {![catch {targets -set $tn} err]} {
+            if {![catch {rrd pc}]} { return 1 }
+        }
+    }
+    return 0
+}
 
+list_targets
+
+# Step 1: Program FPGA
+puts "=== Programming FPGA ==="
+if {[catch {fpga -file {D:/Users/u/tmac-zynq-fpga/vivado_integration/proj_bd/matmul_bd.runs/impl_1/system_wrapper.bit}} err]} {
+    puts "fpga failed: $err"
+    list_targets
+    exit 1
+}
+puts "FPGA programmed"
+after 2000
+list_targets
+
+# Step 2: Initialize PS7
 source {D:/Users/u/tmac-zynq-fpga/vivado_integration/ps7_init.tcl}
-targets -set 1
-puts "Running ps7_init (AFI0+AFI1 configured)..."
-if {[catch {ps7_init; ps7_post_config} err]} {
+after 500
+puts "=== Selecting DAP ==="
+if {![select_dap]} {
+    puts "ERROR: Could not select DAP target"
+    list_targets
+    exit 1
+}
+puts "DAP target selected"
+after 500
+puts "Running ps7_init..."
+if {[catch {ps7_init} err]} {
     puts "ps7_init failed: $err"
+    list_targets
     exit 1
 }
 puts "PS7 initialized"
 
-targets -set -filter {name =~ "ARM Cortex-A9 MPCore #0"}
+# Step 3: Deassert PL reset via DAP
+puts "=== Deassert PL reset ==="
+puts "FPGA_RST_CTRL before: [mrd 0xF8000708 1]"
+catch {mwr 0xF8000708 0x00010600}
+after 100
+puts "FPGA_RST_CTRL after: [mrd 0xF8000708 1]"
+after 1000
+
+# Step 4: Load ELF and continue CPU
+puts "=== Selecting ARM core ==="
+if {![select_arm0]} {
+    puts "ERROR: Could not select ARM core"
+    list_targets
+    exit 1
+}
 puts "ARM core selected"
-catch {rst -processor}
-dow {D:/Users/u/workspace/tmac/Debug/tmac.elf}
-con
-
-# Switch to DAP/APU target for all memory reads
-catch {targets -set 1}
-after 200
-
-# Spin 1: AFI experiment results
-set timeout 15000
-set elapsed 0
-while {$elapsed < $timeout} {
-    after 100
-    set val [mrd 0x00203100 1]
-    if {[string first "00000001" $val] >= 0} {
-        puts "=== SPIN 1: AFI experiment ==="
-        puts "AFI experiment (dbg[0..15]):"
-        puts [mrd 0x002032D0 16]
-        puts "AFI1_WR_CHANNEL reads back from ARM: [mrd 0x002032F0 1]"
-        mwr 0x00203100 0
-        break
-    }
-    set elapsed [expr {$elapsed + 100}]
-}
-if {$elapsed >= $timeout} {
-    puts "TIMEOUT spin 1"
+catch {stop}
+after 500
+puts "Loading ELF..."
+if {[catch {dow {D:/Users/u/workspace/tmac/Debug/tmac.elf}} err]} {
+    puts "dow failed: $err"
     exit 1
 }
+after 500
 
-# Spin 2: Write test results
-set elapsed 0
-while {$elapsed < $timeout} {
-    after 100
-    set val [mrd 0x00203104 1]
-    if {[string first "00000001" $val] >= 0} {
-        puts "=== SPIN 2: Write test results ==="
-        puts "WR_TEST scratch dump (ARM read after L2 inv):"
-        puts [mrd 0x00203240 10]
-        puts "DDR direct at WR_TEST_ADDR (DAP bypasses cache):"
-        puts [mrd 0x00201000 8]
-        puts "PL reg_debug at spin2: [mrd 0x00203264 1]"
-        mwr 0x00203104 0
-        break
-    }
-    set elapsed [expr {$elapsed + 100}]
+puts "Continuing CPU..."
+catch {con}
+after 1000
+
+# Step 5: Let CPU run for 30s, then halt and read PC
+puts "=== Letting CPU run (30s)... ==="
+after 30000
+catch {stop}
+after 500
+if {[catch {set pc_after [rrd pc]} e]} {
+    puts "Can't read PC: $e"
+} else {
+    puts "PC after run: $pc_after"
 }
-if {$elapsed >= $timeout} {
-    puts "TIMEOUT spin 2"
-    exit 1
+if {[catch {set cpsr_val [rrd cpsr]} e]} {
+    puts "Can't read CPSR: $e"
+} else {
+    puts "CPSR: $cpsr_val"
 }
 
-# Wait for compute test to complete
-after 15000
+# Read PL registers via DAP to see if markers appeared
+select_dap
+after 500
+puts "=== PL reg at 0x43C00004 (REG_GIE) ==="
+catch {puts [mrd 0x43C00004 1]}
+puts "=== DDR at ELF entry ==="
+catch {puts [mrd 0x00100000 8]}
 
-puts "=== reg_debug capture ==="
-puts "dbg0 (before start):"; puts [mrd 0x00203000 1]
-puts "dbg_at_start:"; puts [mrd 0x00203004 1]
-puts "completion marker + dbg_done + status + iter:"; puts [mrd 0x00203008 4]
-puts "dbg_running (first poll):"; puts [mrd 0x00203018 1]
-puts "timeout marker:"; puts [mrd 0x0020301C 2]
-
-puts "=== Compute results (first 16 lower 32 bits) ==="
-puts [mrd 0x00203030 16]
-puts "=== DDR direct at RES_ADDR (DAP bypasses cache) ==="
-puts [mrd 0x00202080 32]
-
-puts "=== PS7 status + SLCR unlock value ==="
-puts [mrd 0x00203270 3]
-puts "=== PS7 AFI0 registers ==="
-puts [mrd 0x00203278 7]
-puts "=== PS7 AFI1 registers ==="
-puts [mrd 0x002032B4 5]
-puts "=== DDR status ==="
-puts [mrd 0x00203290 1]
-
-puts "=== OCM marker (cache-free) ==="
-puts [mrd 0x00010000 4]
-
-puts "=== DONE marker ==="
-puts [mrd 0x00203200 1]
-puts [mrd 0x00203204 1]
 puts "=== DONE ==="

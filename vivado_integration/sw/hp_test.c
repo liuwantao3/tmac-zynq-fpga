@@ -1,45 +1,14 @@
 #include "xil_printf.h"
+#include "xil_mmu.h"
 
 #define DIAG_BASE 0x00203000
 
-// PL310 L2 Cache Controller (Zynq-7010: 8-way, 512KB)
-#define L2C_BASE       0xF8F02000
-#define L2C_CLEAN_WAY  (L2C_BASE + 0x7B8)  // Write 0xFF to clean all 8 ways
-#define L2C_CLEAN_INV  (L2C_BASE + 0x7FC)  // Write 0xFF to clean+inv all 8 ways
-#define L2C_SYNC       (L2C_BASE + 0x730)  // Poll bit 0 until 0
-
-static void l2_clean_all(void) {
-    *(volatile unsigned*)L2C_CLEAN_WAY = 0xFF;
-    __asm__("dsb");
-    while (*(volatile unsigned*)L2C_SYNC & 1);
-    __asm__("dsb");
-    __asm__("isb");
-}
-
-static void l2_clean_inv_all(void) {
-    *(volatile unsigned*)L2C_CLEAN_INV = 0xFF;
-    __asm__("dsb");
-    while (*(volatile unsigned*)L2C_SYNC & 1);
-    __asm__("dsb");
-    __asm__("isb");
-}
-
-// Flush ARM→DDR: L1 D-cache by MVA + L2 clean by way
+// Clean+Invalidate cache to PoC (writes dirty data to DDR)
 static void flush_cache(unsigned long addr, unsigned long len) {
     unsigned long end = addr + len;
     for (unsigned long a = addr & ~31; a < end; a += 32)
-        __asm__("mcr p15, 0, %0, c7, c10, 1" : : "r" (a));
+        __asm__("mcr p15, 0, %0, c7, c14, 1" : : "r" (a));
     __asm__("dsb");
-    l2_clean_all();
-}
-
-// Invalidate DDR→ARM: L2 clean+inv by way + L1 D-cache invalidate
-static void inv_cache(unsigned long addr, unsigned long len) {
-    (void)addr; (void)len; // full inv, ignore range
-    l2_clean_inv_all();
-    __asm__("mcr p15, 0, %0, c7, c6, 0" : : "r" (0)); // invalidate entire L1 D$
-    __asm__("dsb");
-    __asm__("isb");
 }
 
 #define IP_BASE 0x43C00000
@@ -55,16 +24,15 @@ static void inv_cache(unsigned long addr, unsigned long len) {
 #define ACT_ADDR  (WT_ADDR + 8192)
 #define RES_ADDR  (ACT_ADDR + 128)
 #define WR_TEST_ADDR 0x00201000
-#define OCM_MARK  0x00010000  // OCM marker for cache-free verification
 
 static void wr(unsigned o, unsigned v) { *(volatile unsigned *)(IP_BASE+o) = v; }
 static unsigned rd(unsigned o) { return *(volatile unsigned *)(IP_BASE+o); }
 
 int main(void) {
     int i;
-    xil_printf("\n=== HP1 test with L2 cache fix ===\n\r");
+    xil_printf("\n=== HP write test (LVL_SHFTR_EN fix) ===\n\r");
 
-    // Write weight/act data (everyone=1, acts=1..64)
+    // Write weight/act data
     for (int w = 0; w < 2048; w++)
         *(volatile unsigned *)(WT_ADDR + w*4) = 0x00010001;
     for (i = 0; i < 64; i++)
@@ -73,85 +41,146 @@ int main(void) {
     flush_cache(ACT_ADDR, 128);
     xil_printf("Weights/acts written and flushed\n\r");
 
-    // AFI Experiment
-    {
-        unsigned *dbg = (unsigned*)(DIAG_BASE + 0x2D0);
+    // === FIX: Reconfigure SLCR page table (Strongly-Ordered) ===
+    // Xilinx BSP maps 0xF8000000 with 0xC06 which is Device (C=0,B=1, shareable).
+    // This is architecturally CORRECT for MMIO. Yet CPU reads return garbage.
+    // Changing to 0xC02 (Strongly-Ordered, C=0,B=0) as a diagnostic step.
+    // The real fix may be: re-writing entry + cache clean + TLB invalidate
+    // to repair any runtime corruption of the page table.
+    xil_printf("Fixing SLCR page table entry...\n\r");
+    Xil_SetTlbAttributes(0xF8000000, 0xC02);
+    __asm__("dsb");
+    __asm__("isb");
 
-        // 1. LOCKSTA before unlock
-        dbg[0] = *(volatile unsigned*)0xF8000004;
-        __asm__("dsb");
+    // Force D-cache clean of page table entry so L2 page table walker sees it
+    unsigned ttbr0_val;
+    __asm__("mrc p15,0,%[val],c2,c0,0" : [val] "=r" (ttbr0_val));
+    unsigned pt_entry_addr = (ttbr0_val & 0xFFFFC000) + ((0xF8000000 >> 20) << 2);
+    flush_cache(pt_entry_addr, 32);
+    __asm__("dsb");
 
-        // 2. Unlock SLCR
-        *(volatile unsigned*)0xF8000008 = 0xDF0D;
-        __asm__("dsb"); __asm__("isb");
+    // Also flush any stale cached lines for the SLCR address range
+    flush_cache(0xF8000000, 0x100000);  // entire 1MB section
+    __asm__("dsb");
 
-        // 3. LOCKSTA after unlock
-        dbg[1] = *(volatile unsigned*)0xF8000004;
-        __asm__("dsb");
+    // TLB invalidate (redundant after Xil_SetTlbAttributes, but belt-and-suspenders)
+    __asm__("mcr p15, 0, %0, c8, c7, 1" : : "r" (0xF8000000));
+    __asm__("dsb");
+    __asm__("isb");
 
-        // 4-5. AFI0_FIFO before/after write
-        dbg[2] = *(volatile unsigned*)0xF8008004;
-        *(volatile unsigned*)0xF8008004 = 0x00000707;
-        __asm__("dsb");
-        dbg[3] = *(volatile unsigned*)0xF8008004;
+    // Verify: read back page table entry
+    unsigned pt_entry = *(volatile unsigned*)pt_entry_addr;
+    xil_printf("TTBR0=0x%08X PT[F8000000]=0x%08X\n\r", ttbr0_val, pt_entry);
+    *(volatile unsigned*)(DIAG_BASE + 0x2A0) = ttbr0_val;
+    *(volatile unsigned*)(DIAG_BASE + 0x2A4) = pt_entry;
+    __asm__("dsb");
+    flush_cache(DIAG_BASE + 0x2A0, 8);
+    __asm__("dsb");
 
-        // 6-9. AFI1 registers READ (before any ARM modification)
-        dbg[4] = *(volatile unsigned*)0xF8009000;  // AFI1_CTRL
-        dbg[5] = *(volatile unsigned*)0xF8009004;  // AFI1_FIFO_PARTITION
-        dbg[6] = *(volatile unsigned*)0xF8009008;  // AFI1_WR_CHANNEL_CTRL
-        dbg[7] = *(volatile unsigned*)0xF800900C;  // AFI1_RD_CHANNEL_CTRL
+    // === SLCR register writes ===
+    // SLCR is mapped as Normal Write-Through by Xilinx BSP page table.
+    // volatile + DSB must force stores to bus.
+    // Readbacks are from same CPU path (not DAP) to verify writes took effect.
 
-        // Enable AFI1 (in case ps7_post_config didn't)
-        *(volatile unsigned*)0xF8009000 = 0x00000003;
-        *(volatile unsigned*)0xF8009008 = 0x00000001;
-        *(volatile unsigned*)0xF800900C = 0x00000001;
-        __asm__("dsb");
+    unsigned slcr_lv, slcr_unlock, slcr_lv2;
 
-        // 10-13. AFI1 registers AFTER enable
-        dbg[8]  = *(volatile unsigned*)0xF8009000;
-        dbg[9]  = *(volatile unsigned*)0xF8009004;
-        dbg[10] = *(volatile unsigned*)0xF8009008;
-        dbg[11] = *(volatile unsigned*)0xF800900C;
+    // Step 1: SLCR unlock
+    slcr_unlock = *(volatile unsigned*)0xF8000008;
+    *(volatile unsigned*)0xF8000008 = 0xDF0D;
+    __asm__("dsb");
+    __asm__("isb");
+    slcr_lv = *(volatile unsigned*)0xF8000090;
 
-        // 14-15. AFI0 channel verify
-        dbg[12] = *(volatile unsigned*)0xF8008008;
-        dbg[13] = *(volatile unsigned*)0xF800800C;
+    // Step 2: Enable LVL_SHFTR_EN (mask-bits[23:16] for data-bits[7:0])
+    *(volatile unsigned*)0xF8000090 = (0x0F << 16) | 0x0F;  // 0x000F000F
+    __asm__("dsb");
+    __asm__("isb");
+    slcr_lv2 = *(volatile unsigned*)0xF8000090;
 
-        // 16-17. MIO test (verify SLCR unlock works)
-        dbg[14] = *(volatile unsigned*)0xF8000240;
-        *(volatile unsigned*)0xF8000240 = 0xDEADBEEF;
-        __asm__("dsb");
-        dbg[15] = *(volatile unsigned*)0xF8000240;
+    // Step 3: Deassert PL reset (mask-bits[31:16] for data-bits[15:0])
+    unsigned fpga_rst_val = *(volatile unsigned*)0xF8000708;
+    unsigned fpga_rst_data = fpga_rst_val & ~1;   // clear bit 0
+    unsigned fpga_rst_mask = 1;                    // mask only bit 0
+    *(volatile unsigned*)0xF8000708 = (fpga_rst_mask << 16) | fpga_rst_data;
+    __asm__("dsb");
+    __asm__("isb");
+    unsigned fpga_rst_v2 = *(volatile unsigned*)0xF8000708;
 
-        // Lock SLCR
-        *(volatile unsigned*)0xF8000008 = 0;
-        __asm__("dsb"); __asm__("isb");
+    // Store SLCR probe values
+    *(volatile unsigned*)(DIAG_BASE + 0x100) = slcr_unlock;    // before unlock
+    *(volatile unsigned*)(DIAG_BASE + 0x104) = slcr_lv;        // before en
+    *(volatile unsigned*)(DIAG_BASE + 0x108) = slcr_lv2;       // after en
+    *(volatile unsigned*)(DIAG_BASE + 0x10C) = fpga_rst_val;   // before reset
+    *(volatile unsigned*)(DIAG_BASE + 0x0F8) = 0xCAFEBABE;     // early marker
+    *(volatile unsigned*)(DIAG_BASE + 0x204) = fpga_rst_v2;    // after reset
+    __asm__("dsb");
+    flush_cache(DIAG_BASE + 0x0F8, 8);    // flush early marker immediately
+    flush_cache(DIAG_BASE + 0x100, 0x10); // flush SLCR probes (0x203100-0x20310F)
+    flush_cache(DIAG_BASE + 0x204, 8);    // flush fpga_rst_v2
+    __asm__("dsb");
 
-        flush_cache(DIAG_BASE + 0x2D0, 64);
-        xil_printf("AFI done\n\r");
-    }
+    // Step 4: Reconfigure AFI0 FIFO partition (never properly tried with mask format!)
+    // Reset: AFI0_FIFO_PARTITION=0x00000007 (RdFIFO=7, WrFIFO=0) — write FIFO dead.
+    // No boot code writes to this in JTAG mode, so we are FIRST writer = write-once succeeds.
+    // Use SLCR mask format: (mask << 16) | data, where mask[15:0] enables data[15:0].
+    // Bits [11:8] = WrFIFO, bits[3:0] = RdFIFO.
+    unsigned fifo_part_val = *(volatile unsigned*)0xF8008004;
+    unsigned fifo_data = (6 << 8) | 2;   // WrFIFO=6, RdFIFO=2
+    unsigned fifo_mask = (0xF << 8) | 0xF; // mask bits[11:8] and [3:0]
+    *(volatile unsigned*)0xF8008004 = (fifo_mask << 16) | fifo_data;
+    __asm__("dsb");
+    __asm__("isb");
+    unsigned fifo_part_v2 = *(volatile unsigned*)0xF8008004;
 
-    // === SPIN 1: DAP reads AFI experiment ===
-    *(volatile unsigned*)(DIAG_BASE + 0x100) = 1;
-    flush_cache(DIAG_BASE + 0x100, 4);
-    xil_printf("SPIN1\n\r");
-    while (*(volatile unsigned*)(DIAG_BASE + 0x100)) ;
+    // Markers to detect hang point
+    *(volatile unsigned*)(DIAG_BASE + 0x120) = 0xBEEF0001;  // before AFI0_CTRL write
+    __asm__("dsb");
+    flush_cache(DIAG_BASE + 0x120, 4);
+    __asm__("dsb");
 
-    // === DIRECT WRITE TEST via HP1 ===
-    // Init scratch with 0xDEADDEADDEADDEAD
+    // Step 5: Enable AFI0 + bypass mode, then enable write channel
+    *(volatile unsigned*)0xF8008000 = 0x00000003;  // AFI0_CTRL: enable + bypass
+    __asm__("dsb"); __asm__("isb");
+    *(volatile unsigned*)(DIAG_BASE + 0x124) = 0xBEEF0002;  // after AFI0_CTRL, before WRCHAN_CTRL
+    __asm__("dsb");
+    flush_cache(DIAG_BASE + 0x124, 4);
+    __asm__("dsb");
+
+    *(volatile unsigned*)0xF8008008 = 0x00000001;  // AFI0_WRCHAN_CTRL: enable write channel
+    __asm__("dsb"); __asm__("isb");
+    *(volatile unsigned*)(DIAG_BASE + 0x128) = 0xBEEF0003;  // after WRCHAN_CTRL
+    __asm__("dsb");
+    flush_cache(DIAG_BASE + 0x128, 4);
+    __asm__("dsb");
+
+    // Configure HP address map
+    *(volatile unsigned*)0xF8008014 = 0x00000006;  // WRITE_ADDR: +200000 → 0x00200000
+    *(volatile unsigned*)0xF8008018 = 0x00000010;  // WRITE_SIZE: 1MB
+    *(volatile unsigned*)0xF800801C = 0x00000004;  // RD_ADDR: +200000 → 0x00200000
+    *(volatile unsigned*)0xF8008028 = 0x00000000;  // RD_CTRL: 0
+    __asm__("dsb");
+
+    // Store FIFO partition probe values
+    *(volatile unsigned*)(DIAG_BASE + 0x110) = fifo_part_val;  // before
+    *(volatile unsigned*)(DIAG_BASE + 0x114) = fifo_part_v2;   // after
+    *(volatile unsigned*)(DIAG_BASE + 0x204) = fpga_rst_v2;    // after reset
+    __asm__("dsb");
+    flush_cache(DIAG_BASE + 0x110, 8);
+    flush_cache(DIAG_BASE + 0x204, 8);
+    __asm__("dsb");
+
+    __asm__("dsb");
+    // SLCR lock (not strictly needed, but canonical)
+    *(volatile unsigned*)0xF8000004 = 0x767B;
+    __asm__("dsb");
+    __asm__("isb");
+
+    xil_printf("AXI_HP configured with write FIFO\n\r");
+
+    // Init scratch with test pattern
     for (int wi = 0; wi < 8; wi++)
         *(volatile unsigned long long *)(WR_TEST_ADDR + wi*8) = 0xDEADDEADDEADDEADULL;
     flush_cache(WR_TEST_ADDR, 64);
-
-    // Unlock SLCR again for AFI1 enable (ps7_post_config runs before ELF)
-    *(volatile unsigned*)0xF8000008 = 0xDF0D;
-    __asm__("dsb"); __asm__("isb");
-    // Force-enable AFI1 write channel
-    *(volatile unsigned*)0xF8009000 = 0x00000003;
-    *(volatile unsigned*)0xF8009008 = 0x00000001;
-    *(volatile unsigned*)0xF800900C = 0x00000001;
-    *(volatile unsigned*)0xF8000008 = 0;
-    __asm__("dsb"); __asm__("isb");
 
     // Start PL write test
     wr(REG_RES_ADDR, WR_TEST_ADDR);
@@ -165,28 +194,14 @@ int main(void) {
         if (!(rd(REG_STATUS) & 1)) { wt_done = 1; break; }
     }
     wr(REG_WR_TEST, 0);
-
-    // Invalidate + read back
-    inv_cache(WR_TEST_ADDR, 64);
-    volatile unsigned long long *wtest = (volatile unsigned long long *)WR_TEST_ADDR;
-    for (int wi = 0; wi < 4; wi++) {
-        unsigned lo = (unsigned)wtest[wi];
-        unsigned hi = (unsigned)(wtest[wi] >> 32);
-        *(volatile unsigned*)(DIAG_BASE + 0x240 + wi*8) = lo;
-        *(volatile unsigned*)(DIAG_BASE + 0x244 + wi*8) = hi;
-    }
+    xil_printf("WR_TEST: done=%d\n\r", wt_done);
     *(volatile unsigned*)(DIAG_BASE + 0x260) = wt_done;
     *(volatile unsigned*)(DIAG_BASE + 0x264) = rd(REG_DEBUG);
-    flush_cache(DIAG_BASE + 0x240, 0x28);
-    xil_printf("WR_TEST: done=%d\n\r", wt_done);
+    __asm__("dsb");
+    flush_cache(DIAG_BASE + 0x260, 8);
+    __asm__("dsb");
 
-    // === SPIN 2: DAP reads write test results ===
-    *(volatile unsigned*)(DIAG_BASE + 0x104) = 1;
-    flush_cache(DIAG_BASE + 0x104, 4);
-    xil_printf("SPIN2\n\r");
-    while (*(volatile unsigned*)(DIAG_BASE + 0x104)) ;
-
-    // === NORMAL COMPUTE TEST ===
+    // === NORMAL COMPUTE TEST (via HP) ===
     for (int ri = 0; ri < 64; ri++)
         *(volatile unsigned long long *)(RES_ADDR + ri*8) = 0xAAAAAAAAAAAAAAAAULL;
     flush_cache(RES_ADDR, 64*8);
@@ -225,56 +240,28 @@ int main(void) {
         *(volatile unsigned*)(DIAG_BASE + 0x20) = dbg_to;
     }
 
-    // Read results with full cache invalidate
-    inv_cache(RES_ADDR, 64*8);
+    // Read results
+    __asm__("dsb");
+    flush_cache(RES_ADDR, 64*8);
+    __asm__("dsb");
     volatile unsigned long long *p = (volatile unsigned long long *)RES_ADDR;
     for (int ri = 0; ri < 16; ri++) {
         unsigned lo = (unsigned)p[ri];
         *(volatile unsigned*)(DIAG_BASE + 0x30 + ri*4) = lo;
     }
 
-    // PS7 REGISTER DUMP
-    *(volatile unsigned*)(DIAG_BASE + 0x270) = 0x50533700;
+    // Flush all DIAG data
     __asm__("dsb");
-    flush_cache(DIAG_BASE + 0x270, 4);
-    __asm__("dsb");
-
-    volatile unsigned *ps7_st = (volatile unsigned*)(DIAG_BASE + 0x274);
-    *ps7_st = 0;
-
-    volatile unsigned v;
-
-    v = *(volatile unsigned*)0xF8000008; *ps7_st = 1;
-    *(volatile unsigned*)(DIAG_BASE + 0x274) = v;
-
-    v = *(volatile unsigned*)0xF8008000; *ps7_st = 2; *(volatile unsigned*)(DIAG_BASE + 0x278) = v;
-    v = *(volatile unsigned*)0xF8008004; *ps7_st = 3; *(volatile unsigned*)(DIAG_BASE + 0x27C) = v;
-    v = *(volatile unsigned*)0xF8008008; *ps7_st = 4; *(volatile unsigned*)(DIAG_BASE + 0x280) = v;
-    v = *(volatile unsigned*)0xF800800C; *ps7_st = 5; *(volatile unsigned*)(DIAG_BASE + 0x284) = v;
-    v = *(volatile unsigned*)0xF8008010; *ps7_st = 6; *(volatile unsigned*)(DIAG_BASE + 0x288) = v;
-    v = *(volatile unsigned*)0xF8006094; *ps7_st = 7; *(volatile unsigned*)(DIAG_BASE + 0x28C) = v;
-
-    v = *(volatile unsigned*)0xF8009000; *ps7_st = 10; *(volatile unsigned*)(DIAG_BASE + 0x2B4) = v;
-    v = *(volatile unsigned*)0xF8009004; *ps7_st = 11; *(volatile unsigned*)(DIAG_BASE + 0x2B8) = v;
-    v = *(volatile unsigned*)0xF8009008; *ps7_st = 12; *(volatile unsigned*)(DIAG_BASE + 0x2BC) = v;
-    v = *(volatile unsigned*)0xF800900C; *ps7_st = 13; *(volatile unsigned*)(DIAG_BASE + 0x2C0) = v;
-    v = *(volatile unsigned*)0xF8009010; *ps7_st = 14; *(volatile unsigned*)(DIAG_BASE + 0x2C4) = v;
-
-    v = *(volatile unsigned*)0xF8006008; *ps7_st = 8; *(volatile unsigned*)(DIAG_BASE + 0x290) = v;
-    *ps7_st = 9;
-
-    __asm__("dsb");
-    flush_cache(DIAG_BASE + 0x270, 0x60);
+    flush_cache(DIAG_BASE + 0x00, 0x100);
     __asm__("dsb");
 
-    xil_printf("PS7 dumped\n\r");
-
-    // DONE
+    // Write DONE marker + flush both words
     __asm__("dsb");
     *(volatile unsigned*)(DIAG_BASE + 0x200) = 0xCAFEBABE;
-    flush_cache(DIAG_BASE + 0x200, 4);
-    __asm__("dsb");
     *(volatile unsigned*)(DIAG_BASE + 0x204) = rd(REG_DEBUG);
+    __asm__("dsb");
+    flush_cache(DIAG_BASE + 0x200, 8);
+    __asm__("dsb");
 
     xil_printf("Done\n\r");
     while(1)__asm__("wfi");
