@@ -21,13 +21,16 @@ SECTIONS
     } > DDR
 
     .bss (NOLOAD) : {
+        . = ALIGN(8);
         __bss_start = .;
         *(.bss*)
         *(COMMON)
+        . = ALIGN(8);
         __bss_end = .;
     } > DDR
 
     .stack (NOLOAD) : {
+        . = ALIGN(8);
         . = . + 0x10000;
         __stack_top = .;
     } > DDR

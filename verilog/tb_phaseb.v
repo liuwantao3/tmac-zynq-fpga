@@ -36,7 +36,13 @@ module tb_phaseb;
     wire [7:0]  m_axi_arlen;
     wire [2:0]  m_axi_arsize;
     wire [1:0]  m_axi_arburst;
+    wire [1:0]  m_axi_arlock;
+    wire [3:0]  m_axi_arcache;
+    wire [2:0]  m_axi_arprot;
+    wire [5:0]  m_axi_arid;
     wire [63:0] m_axi_rdata;
+    wire [1:0]  m_axi_rresp;
+    wire [5:0]  m_axi_rid;
     wire        m_axi_rvalid;
     wire        m_axi_rready;
     wire        m_axi_rlast;
@@ -46,14 +52,20 @@ module tb_phaseb;
     wire [7:0]  m_axi_awlen;
     wire [2:0]  m_axi_awsize;
     wire [1:0]  m_axi_awburst;
+    wire [1:0]  m_axi_awlock;
+    wire [3:0]  m_axi_awcache;
+    wire [2:0]  m_axi_awprot;
+    wire [5:0]  m_axi_awid;
     wire [63:0] m_axi_wdata;
     wire        m_axi_wvalid;
     wire        m_axi_wready;
     wire        m_axi_wlast;
     wire [7:0]  m_axi_wstrb;
+    wire [5:0]  m_axi_wid;
     wire        m_axi_bvalid;
     wire        m_axi_bready;
     wire [1:0]  m_axi_bresp;
+    wire [5:0]  m_axi_bid;
 
     // DDR model debug readback
     reg  [31:0] dbg_addr;
@@ -86,7 +98,13 @@ module tb_phaseb;
         .m_axi_arlen(m_axi_arlen),
         .m_axi_arsize(m_axi_arsize),
         .m_axi_arburst(m_axi_arburst),
+        .m_axi_arlock(m_axi_arlock),
+        .m_axi_arcache(m_axi_arcache),
+        .m_axi_arprot(m_axi_arprot),
+        .m_axi_arid(m_axi_arid),
         .m_axi_rdata(m_axi_rdata),
+        .m_axi_rresp(m_axi_rresp),
+        .m_axi_rid(m_axi_rid),
         .m_axi_rvalid(m_axi_rvalid),
         .m_axi_rready(m_axi_rready),
         .m_axi_rlast(m_axi_rlast),
@@ -96,14 +114,20 @@ module tb_phaseb;
         .m_axi_awlen(m_axi_awlen),
         .m_axi_awsize(m_axi_awsize),
         .m_axi_awburst(m_axi_awburst),
+        .m_axi_awlock(m_axi_awlock),
+        .m_axi_awcache(m_axi_awcache),
+        .m_axi_awprot(m_axi_awprot),
+        .m_axi_awid(m_axi_awid),
         .m_axi_wdata(m_axi_wdata),
         .m_axi_wvalid(m_axi_wvalid),
         .m_axi_wready(m_axi_wready),
         .m_axi_wlast(m_axi_wlast),
         .m_axi_wstrb(m_axi_wstrb),
+        .m_axi_wid(m_axi_wid),
         .m_axi_bvalid(m_axi_bvalid),
         .m_axi_bready(m_axi_bready),
-        .m_axi_bresp(m_axi_bresp)
+        .m_axi_bresp(m_axi_bresp),
+        .m_axi_bid(m_axi_bid)
     );
 
     // Instantiate DDR model
@@ -116,6 +140,8 @@ module tb_phaseb;
         .s_axi_arsize(m_axi_arsize),
         .s_axi_arburst(m_axi_arburst),
         .s_axi_rdata(m_axi_rdata),
+        .s_axi_rresp(m_axi_rresp),
+        .s_axi_rid(m_axi_rid),
         .s_axi_rvalid(m_axi_rvalid),
         .s_axi_rready(m_axi_rready),
         .s_axi_rlast(m_axi_rlast),
@@ -133,6 +159,7 @@ module tb_phaseb;
         .s_axi_bvalid(m_axi_bvalid),
         .s_axi_bready(m_axi_bready),
         .s_axi_bresp(m_axi_bresp),
+        .s_axi_bid(m_axi_bid),
         .dbg_addr(dbg_addr),
         .dbg_data(dbg_data)
     );

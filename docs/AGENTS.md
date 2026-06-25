@@ -1,326 +1,112 @@
-# FPGA Design Skill
+# Project State
 
-## Overview
+## Qwen2-0.5B FPGA Accelerator — Zynq 7010
 
-This skill automates FPGA development workflows using Xilinx Vivado Design Suite and Vitis HLS with a three-layer feedback system.
+Quad-core Verilog RTL: INT16×INT16 (general), Q8_0 dequant (logits), Q5_0 block decode (attn_q/k/o, ffn_gate/up), Q6_K block decode (ffn_down even), Q4_K block decode (ffn_down odd), with AXI4-Lite memory-mapped I/O.
 
-> **Note**: The primary implementation has moved from HLS to Verilog RTL (`verilog/matmul_top.v`, `verilog/matmul_q8_core.v`, `verilog/matmul_q4k_core.v`). The HLS kernel (`hls/matmul_q8.cpp`) is now legacy. See `verilog/DESIGN.md` for the current design.
+**Model**: Q4_K_M (mixed quantization). See AGENTS.md top-level for tensor types table.
 
-## Hardware Target
+## Architecture
 
-- **Device**: Xilinx Zynq 7010 (xc7z010clg400-1)
-- **Constraints**:
-  - DSP slices: 80 (0 used by Q8 core, 8 by Q4K core, 72 spare)
-  - BRAM: 240 KB (60 × BRAM 18K blocks, 3 used)
-  - LUTs: 17,600 (~3.5K used)
-  - FF: 35,200 (~9.7K used)
-  - DDR3: 512 MB
-- **Application**: Qwen 0.5B LLM inference on edge
-
-## Supported Configurations
-
-| Config Register | Values | Description |
-|----------------|--------|-------------|
-| `op_vecmul` | 0=MatMul, 1=VecMul | Operation mode |
-| `mode_q4k` | 0=Q8_0, 1=Q4_K | Core select (bit 6 of `reg_ctrl_user`) |
-
-### Use Cases
-- **Prefill**: Matrix-matrix (batch processing)
-- **Decode**: Vector-matrix (single token generation)
-- **Q4_K path**: FFN layers (gate, up, down) — largest workload
-- **Q8_0 path**: Token embedding (logits)
-- **INT16 path**: Attention QKV + all other layers (CPU pre-dequant)
-
-## Legacy HLS Kernel: matmul_q8
-
-N=64 fixed, 8×8 systolic sub-blocking, LUT-based scale multipliers.
-
-```cpp
-void matmul_q8(
-    ap_int<8> A[N * N],                         // Q8_0 weight bytes (4 KB)
-    combined_scale_t combined_scales[N * 2],    // 128 × UQ8.8 fixed-point (256 B)
-    in_t X[N],                                  // Activation vector (INT16, 128 B)
-    acc_t Y[N],                                 // Output vector (INT64, 512 B)
-    volatile ap_uint<32> *control,              // Control register
-    volatile ap_uint<32> *status,               // Status register
-    ap_uint<1> &interrupt                       // Interrupt output
-);
+### User FSM flow (hp_fsm_top.v):
 ```
-
-### Control Register (32-bit AXI slave, Verilog top)
-| Bit | Name | Description |
-|-----|------|-------------|
-| [0] | start | Write 1 to start operation |
-| [1] | int_enable | Enable interrupt on completion |
-| [2] | reserved | — |
-| [3] | op_vecmul | 0=MatMul, 1=VecMul |
-| [5] | mode_q8path | Q8_0 direct path (FPGA dequant) |
-| [6] | mode_q4k | 0=Q8_0 core, 1=Q4_K core |
-| [31:7] | reserved | Reserved |
-
-### Status Register (32-bit AXI slave)
-| Value | Name | Description |
-|-------|------|-------------|
-| 0 | STATUS_IDLE | Idle, ready for command |
-| 1 | STATUS_RUNNING | Computation in progress |
-| 2 | STATUS_DONE | Computation completed |
-| 3 | STATUS_ERROR | Error occurred |
-
-### Communication Protocol
-1. **CPU**: Write A (Q8_0 weights), combined_scales, X (activation) to AXI master ports
-2. **CPU**: Write control register (start=1, int_enable=1)
-3. **FPGA**: Set status=STATUS_RUNNING
-4. **FPGA**: Q8→INT16 dequant (LUT) + INT16 systolic matmul
-5. **FPGA**: Set status=STATUS_DONE, trigger interrupt if enabled
-6. **CPU**: Read Y (result) from AXI master port
-
-### Interrupt Behavior
-- Long operations (>10μs): Interrupt driven (CPU free during computation)
-- Short operations: Poll status register (avoid interrupt overhead)
-
-### Data Types (Q8_0 kernel)
-- `in_t`: ap_int<16> (INT16 activation / dequantized weight)
-- `prod_t`: ap_int<32> (INT16×INT16 product)
-- `acc_t`: ap_int<64> (INT64 accumulator — avoids overflow in 64-deep dot product)
-
-### Architecture
-- 8×8 systolic array (64 DSP)
-- Blocked matrix multiplication (8×8 sub-blocks)
-- BRAM for weight and activation buffers (Zynq 7010 has no URAM)
-
-## Software FPGA Simulation (`sim/tmac_gguf.cpp`)
-
-A standalone C++17 simulation of the full inference pipeline with FPGA accelerator modeling.
-
-### Build
-```bash
-cd sim && g++ -std=c++17 -pthread -O2 -o tmac_gguf tmac_gguf.cpp matmul_q8.cpp
+IDLE → FETCH_DESC → LOAD_ACT → WRITE_RES → DONE → (restart IDLE or FETCH_DESC)
 ```
+Multi-burst HP reads: each burst capped at 64 bytes (AXI3: 16 beats × 32-bit ARSIZE=2).
 
-### Usage
-```bash
-echo 9707 | ./tmac_gguf /path/to/model.tmac                    # FP32 (ground truth)
-echo 9707 | ./tmac_gguf /path/to/model.tmac --fpga-int16       # INT16 FPGA sim (all layers via CPU pre-dequant)
-echo 9707 | ./tmac_gguf /path/to/model.tmac --fpga-q4k         # Q4_K path (FFN layers) + INT16 fallback
-echo 9707 | ./tmac_gguf /path/to/model.tmac --fpga-q8          # Q8_0 logits path + INT16 fallback
-echo 9707 | ./tmac_gguf /path/to/model.tmac --fpga-q4k --fpga-q8  # Both Q4K + Q8 + INT16 fallback
-echo 9707 | ./tmac_gguf /path/to/model.tmac --generate 10      # Autoregressive generation
-echo 9707 | ./tmac_gguf /path/to/model.tmac --dump-layers      # Layer-by-layer dump
-```
+### CPU-OP Descriptor Protocol
+Descriptor type 15 (tensor_type=15) triggers CPU interrupt. FSM pauses in `PH_CPU_OP_WAIT` until CPU completes RMSNorm/RoPE/SoftMax/SwiGLU and resumes.
 
-### Flags
-| Flag | Description |
-|------|-------------|
-| `--fpga` / `--fpga-int16` | INT16 matmul (CPU pre-dequant, default FPGA mode) |
-| `--fpga-q4k` | Q4_K pre-dequant path (FFN layers) + INT16 fallback for everything else |
-| `--fpga-q8` | Q8_0 direct path (logits only, FPGA receives raw Q8_0 bytes) |
-| `--generate N` | Generate N tokens autoregressively |
-| `--perf` | Enable pipeline profiling (Chrome trace JSON + bottleneck analysis) |
-| `--dump-layers` | Save hidden state after each layer to `/tmp/` |
+### Descriptor Chain (32 bytes each, DDR)
+| Offset | Field | Size |
+|--------|-------|------|
+| 0x00 | next_addr | 4 |
+| 0x04 | weight_addr | 4 |
+| 0x08 | act_addr | 4 |
+| 0x0C | result_addr | 4 |
+| 0x10 | reserved | 4 |
+| 0x14 | reserved | 4 |
+| 0x18 | act_total_bytes | 4 |
+| 0x1C | reserved | 4 |
 
-### INT8 vs INT16 Accuracy (Qwen2-0.5B, single token)
-| Metric | INT8 | INT16 |
-|--------|------|-------|
-| Max logit diff vs FP32 | 35.6 | **0.24** |
-| Mean logit diff | 12.4 | **0.035** |
-| Top-5 token match | 0/5 | **5/5** |
-| Top-1 correct | No | **Yes** |
+## Register Map (hp_fsm_top, AXI4-Lite @ 0x43C00000)
 
-**Why INT8 fails**: SwiGLU in the FFN amplifies quantization error multiplicatively (silu(gate)×up), causing catastrophic divergence by layer 3. INT8's 256 levels are insufficient.
+| Offset | Name | Access | Description |
+|--------|------|--------|-------------|
+| 0x00 | reg_start | W | Bit[0] = start (auto-clears) |
+| 0x14 | reg_status | R | [15]=busy, [9]=wr_done, [8]=rd_done |
+| 0x18 | reg_desc_base | R/W | Descriptor base address |
+| 0x1C | reg_desc_tail | R/W | Tail index |
+| 0x20 | reg_desc_head | R | Head index (read-only) |
+| 0x28 | reg_debug | R | [31:28]=state, [27]=rd_done, [26]=wr_done, [25]=rd_busy, [24]=wr_busy, [23:16]=act_remaining, [15:8]=rd_len, [7:0]=act_byte_idx |
+| 0x2C | reg_clk_cnt | R | Free-running clock counter |
+| 0x30 | reg_clk_cnt_slow | R | Clock counter ÷ 1024 |
 
-**Why INT16 works**: 65536 levels (256× finer) keep SwiGLU error bounded. Zynq 7010 DSP48E1 handles INT16×INT16 in one slice.
+### FSM states: 0=IDLE, 1=FETCH_DESC, 2=FETCH_DESC_W, 3=LOAD_ACT, 4=LOAD_ACT_W, 5=WRITE_RES, 6=WRITE_RES_W, 7=DONE
 
-### Timing (single token, Apple M2)
-| Mode | CPU Time | Est. FPGA Time (150 MHz) | FPGA Speedup |
-|------|----------|-------------------------|--------------|
-| FP32 naive | 11.0s | — | — |
-| INT16 sim | 19.7s | 51.5 ms | ~214× vs CPU |
-| Q8_0 sim | 23.5s | 482.8 ms | ~49× vs CPU |
+## RTL Changes (2026-06-21)
 
-**Note**: Q8_0 path is slower in simulation because ARM-side does full dequant to compute row_max_abs + combined scales. On real FPGA, ARM only does memcpy (no math), and the 82 ms FPGA time covers all 906,836 tiles × 214 cycles/tile @ 150 MHz.
+1. **DONE→FETCH_DESC restart** (`hp_fsm_top.v`): DONE state checks `reg_start` and transitions to FETCH_DESC, clearing `reg_status[15:8]`. Enables chain restart without bitstream reload.
 
-## LLM Inference Application
+2. **rd_len wrap guard** (`hp_fsm_top.v`): `(act_remaining >> 2) - 1` underflows when `act_remaining < 4` (produces rd_len=0xFF). Fixed with `>=4` / `>0` / `==0` branches. Prevents ARLEN=255 (PS7 AXI3 rejects >16 beats).
 
-### Memory Analysis
-```
-Parameters: 0.5B parameters, 373.7 MB (TMAC format, Q5_0/Q6_K mixed)
-Activations + KV cache: ~150-200 MB
-Total: ~400-450 MB (within 512 MB DDR)
-```
+3. **Debug register always live**: `reg_debug[31:0]` continuously shows FSM state, rd/wr status, act_remaining, rd_len, byte_idx — not just latched.
 
-### Performance Targets
-| Mode | Latency | Throughput |
-|------|---------|------------|
-| Prefill | ~48ms/token | ~20 tokens/s |
-| Decode | ~35ms/token | ~28 tokens/s |
+## Key Hardware Findings
 
-### Resource Usage (Zynq 7010) — Q8_0 LUT Path
-| Resource | Used | Available | Usage |
-|----------|------|----------|-------|
-| DSP | 64 | 80 | 80% |
-| LUT | ~14K | 17,600 | ~80% |
-| BRAM | ~36 KB | 135 KB | ~27% |
-| FF | ~16K | 35,200 | ~45% |
+- **PS7 HP0 is AXI3**: max 16 beats per burst. ARLEN > 15 causes silent AR rejection (no ARREADY).
+- **HP0 is 32-bit** on Zynq-7010 (x16 DDR3): `AFI0_CTRL[7:6]` (64-bit enable) is read-only. RDATA[63:32] always 0.
+- **ps7_init hangs on re-run**: `ps7_pll_init_data_3_0` can't re-lock already-configured PLLs. Power-cycle required.
+- **`rst -processor` corrupts DAP**: irreversibly until power-cycle. Always use `stop` instead.
+- **FCLK_CLK0 enable**: DAP can't set `FPGA_CLK_CTRL[7]`. ARM boot code workaround (load to 0x00000000, wrpc, con, stop).
 
-## Directory Structure
-
-```
-/Users/arctic/fpga/
-├── verilog/
-│   ├── matmul_top.v          # Dual-core top (Q8_0 + Q4_K), AXI4-Lite + BRAM
-│   ├── matmul_q8_core.v      # Q8_0 compute core (3-stage FSM, LUT dequant)
-│   ├── matmul_q4k_core.v     # Q4_K compute core (INT16×INT16, 2 BRAMs)
-│   ├── axilite_slave.v       # AXI4-Lite slave + register file
-│   └── tb_matmul_q8.v/.q4k.v # Testbenches (all pass)
-├── sim/
-│   ├── tmac_gguf.cpp         # Main inference engine
-│   ├── fpga_sim.hpp          # FPGA simulator: MatmulAccel, AXI-Lite, timing model
-│   └── test_integration.cpp  # Integration test (3/3 pass)
-├── hls/
-│   ├── matmul_q8.cpp         # Legacy HLS kernel (primary implementation moved to Verilog)
-│   ├── matmul_q8.hpp         # Q8 kernel type/constant defines
-│   ├── matmul_int16.cpp      # INT16 kernel (legacy)
-│   ├── matmul_int8.cpp       # INT8 kernel (deprecated)
-│   ├── script_q8.tcl         # Q8 kernel synthesis script
-│   ├── script_int16.tcl      # INT16 kernel synthesis script
-│   ├── script.tcl            # INT8 kernel synthesis script (deprecated)
-│   └── hls_config.tcl        # Shared HLS directives
-├── vivado/
-│   ├── block_design.tcl      # Vivado block design
-│   └── hls_ip.tcl            # HLS IP integration
-├── scripts/
-│   ├── test_integration.sh   # C++ + Verilog integration test suite
-│   ├── design_iteration.sh   # Iteration loop wrapper
-│   ├── feedback_parser.py    # Three-layer feedback parser
-│   └── README.md             # Scripts documentation
-└── docs/
-    ├── AGENTS.md              # This file
-    ├── architecture.md        # System architecture
-    └── Q4_K_IMPLEMENTATION_PLAN.md  # Implementation plan (archived)
-```
-
-## Three-Layer Feedback System
-
-### Layer 1: Console Output
-Real-time stdout/stderr from Vivado/Vitis HLS compilation
-
-### Layer 2: Report Files
-- HLS: `solution/solution.xml`, `solution/solution_report.xml`
-- Vivado: `design_2_utilization_routed.rpt`, `design_2_timing_summary.rpt`
-
-### Layer 3: Tcl Query Interface
-Direct queries to Vivado for design exploration
-
-## Commands
-
-### HLS Synthesis
-```bash
-cd /Users/arctic/fpga && ./scripts/design_iteration.sh hls
-```
-
-### Vivado Implementation
-```bash
-cd /Users/arctic/fpga && ./scripts/design_iteration.sh vivado
-```
-
-### Full Pipeline
-```bash
-cd /Users/arctic/fpga && ./scripts/design_iteration.sh all
-```
-
-### Get Structured Feedback
-```bash
-python3 /Users/arctic/fpga/scripts/feedback_parser.py
-```
-
-### Iteration Loop
-```bash
-cd /Users/arctic/fpga && ./scripts/design_iteration.sh all
-```
-
-## Feedback Parser Output (JSON)
-
-```json
-{
-  "timestamp": "2026-05-05 10:30:00",
-  "hls": {
-    "latency_cycles": 1234,
-    "DSP_used": 45,
-    "DSP_percent": 20.5,
-    "LUT_used": 1234,
-    "LUT_percent": 4.4,
-    "BRAM_used": 5,
-    "BRAM_percent": 8.3
-  },
-  "vivado_util": {
-    "utilized": {"LUT": 5000, "DSP": 45, "BRAM": 5, "FF": 8000},
-    "percent": {"LUT": 17.9, "DSP": 20.5, "BRAM": 8.3, "FF": 22.7}
-  },
-  "vivado_timing": {
-    "wns": 2.5,
-    "tns": 0.0,
-    "ws": 1.2
-  },
-  "recommendations": [
-    {
-      "type": "DSP",
-      "severity": "warning",
-      "issue": "DSP utilization at 85% (threshold: 80%)",
-      "action": "Reduce unroll factor in HLS pragma"
-    }
-  ]
-}
-```
-
-## Optimization Strategies
-
-| Issue | Detection | Action |
-|-------|-----------|--------|
-| DSP > 80% | HLS report / feedback | Reduce unroll factor or systolic array size |
-| LUT > 85% | Vivado utilization | Enable logic optimization, reduce vecmul UNROLL factor |
-| Latency too high | HLS latency > 10000 | Add PIPELINE pragma |
-| WNS < 0 | Vivado timing | Increase clock period or balance registers |
-| BRAM > 70% | Vivado utilization | Memory partitioning |
-
-## Typical HLS Pragmas (Q8_0 LUT Path)
-
-```cpp
-// Pipeline the inner loop
-#pragma HLS PIPELINE II=1
-
-// Unroll for parallel systolic execution
-#pragma HLS UNROLL factor=8
-
-// Force multipliers to LUT (preserve DSPs for systolic array)
-// Set in TCL: config_bind -mul_style luts
-
-// BRAM for weight storage (Zynq 7010 has no URAM)
-#pragma HLS RESOURCE variable=A core=RAM_2P_BRAM
-
-// Array partitioning
-#pragma HLS ARRAY_PARTITION variable=data dim=1 factor=4
-```
-
-## Iteration Workflow
-
-1. **Run**: Execute current design (HLS or Vivado)
-2. **Capture**: Collect Layer 1 console output
-3. **Parse**: Run `feedback_parser.py` for Layer 2 reports
-4. **Analyze**: Review JSON output for metrics and recommendations
-5. **Modify**: Update source code or pragmas
-6. **Repeat**: Until constraints are met
-
-## Quick Test
+## Build Commands
 
 ```bash
-# Full pipeline with feedback
-cd /Users/arctic/fpga && ./scripts/design_iteration.sh all
+# Proj build
+C:\Xilinx\Vivado\2023.1\bin\vivado.bat -mode batch -source vivado_integration/build_bd.tcl
 
-# Clean and rebuild
-rm -rf logs && ./scripts/design_iteration.sh all
+# Test run (after power-cycle)
+C:\Xilinx\Vivado\2023.1\bin\xsdb.bat vivado_integration/sw/run_hp_fsm_test.tcl
+
+# Verilog simulation (iVerilog — d:\iVerilog\bin)
+make -C verilog all
+
+# Vivado xsim (C:\Xilinx\Vivado\2023.1\bin\xsim.bat)
+xsim tb_hw_fsm --runall
 ```
 
-## Tool Paths
+## Test Scripts (vivado_integration/sw/)
 
-- Vitis HLS: `/opt/Xilinx/Vitis_HLS/2023.1/bin/vitis_hls`
-- Vivado: `/opt/Xilinx/Vivado/2023.1/bin/vivado`
+See `docs/test_infrastructure.md` for full catalog. Key scripts:
+- `run_hp_loopback.tcl` — HP read+write loopback (proven on hw)
+- `run_hp_fsm_test.tcl` — Descriptor chain FSM test
+- `test_multiburst.tcl` — Multi-burst HP read test (in temp dir)
+
+## File Inventory
+
+### Verilog RTL
+- `verilog/matmul_q8_core.v` — Q8_0 compute: 512×64 wmem, dequant LUT, 3-stage FSM
+- `verilog/matmul_q4k_core.v` — Q4_K: 2304-byte block buffer, S24.8, 56×256 tile
+- `verilog/matmul_q5_0_core.v` — Q5_0: 8×896 tile, 224 blocks, row_scale normalization
+- `verilog/matmul_q6_k_core.v` — Q6_K: 32×256 tile, super_scale + sub-block scales
+- `verilog/matmul_int16_core.v` — INT16×INT16: 512×128 wmem, 3-stage FSM
+- `vivado_integration/rtl/hp_fsm_top.v` — Top FSM: AXI4-Lite, HP read/write masters, descriptor chain, multi-burst
+- `vivado_integration/rtl/hp_loopback_top.v` — HP loopback test module
+
+### C++ Simulation
+- `sim/tmac_gguf.cpp` — Full inference pipeline, FPGA dispatch
+- `sim/fpga_sim.hpp` — MatmulAccel, decode logic
+- `sim/test_integration.cpp` — Integration tests
+
+### Documentation
+- `docs/test_infrastructure.md` — Register maps, script catalog, standardized flows
+- `docs/debug_procedures.md` — XSDB reference, DAP error recovery, FSM debug
+- `verilog/DESIGN.md` — Verilog architecture and timing
+- `docs/architecture.md` — Model and quantization formats
+
+## Pending
+
+- **Verify multi-burst rd_len fix on hardware** — bitstream rebuilt, needs power-cycle + test
+- **CPU boot crash (Prefetch Abort @ 0xFEBAB2B0)** — blocked until HP path verified
+- End-to-end inference with all 5 compute cores

@@ -1,4 +1,4 @@
-# Vivado block design: matmul_top with AXI4-Lite (GP0) + AXI HP (HP0, async clock)
+# Vivado block design: HP loopback test — read from DDR-A, write to DDR-B
 # Usage: vivado -mode batch -source build_bd.tcl
 
 set origin "D:/Users/u/tmac-zynq-fpga"
@@ -9,13 +9,11 @@ set ver_dir  "$origin/verilog"
 file mkdir $proj_dir
 create_project -force matmul_bd $proj_dir -part xc7z010clg400-1
 
-# Add RTL sources (AXI HP + INT16 only)
+# Add RTL sources (matmul_top: HP + all 5 compute cores)
 add_files -fileset sources_1 [list \
-    [file normalize "$rtl_dir/axi_hp_int16_top.v"] \
-    [file normalize "$rtl_dir/axi_wrap_int16.v"] \
-    [file normalize "$ver_dir/matmul_int16_core.v"] \
     [file normalize "$ver_dir/axihp_read_master.v"] \
     [file normalize "$ver_dir/axihp_write_master.v"] \
+    [file normalize "$rtl_dir/hp_fsm_top.v"] \
 ]
 update_compile_order -fileset sources_1
 
@@ -26,6 +24,17 @@ create_bd_design "system"
 create_bd_cell -type ip -vlnv xilinx.com:ip:processing_system7:5.5 ps7
 set_property CONFIG.PCW_FPGA0_PERIPHERAL_FREQMHZ 100.0 [get_bd_cells ps7]
 set_property CONFIG.PCW_UIPARAM_DDR_PARTNO "MT41J256M16 RE-125" [get_bd_cells ps7]
+
+# HP0 config MUST be set BEFORE apply_bd_automation — automation parses HP0
+# parameters to configure the internal AXI data path muxing. Setting them
+# after automation leaves the internal mux at default 32-bit even if the
+# XML parameter reports 64.
+set_property CONFIG.PCW_USE_S_AXI_HP0 1 [get_bd_cells ps7]
+set_property CONFIG.PCW_S_AXI_HP0_DATA_WIDTH 64 [get_bd_cells ps7]
+set_property CONFIG.PCW_S_AXI_HP0_ID_WIDTH 6 [get_bd_cells ps7]
+set_property CONFIG.PCW_S_AXI_HP0_BASEADDR 0x00000000 [get_bd_cells ps7]
+set_property CONFIG.PCW_S_AXI_HP0_HIGHADDR 0x3FFFFFFF [get_bd_cells ps7]
+
 apply_bd_automation -rule xilinx.com:bd_rule:processing_system7 \
     -config {make_external "FIXED_IO, DDR"} [get_bd_cells ps7]
 
@@ -57,14 +66,6 @@ set_property CONFIG.PCW_UART0_PERIPHERAL_ENABLE 1 [get_bd_cells ps7]
 set_property CONFIG.PCW_UART0_UART0_IO "MIO 14 .. 15" [get_bd_cells ps7]
 set_property CONFIG.PCW_UART1_PERIPHERAL_ENABLE 0 [get_bd_cells ps7]
 
-# HP0: primary PL↔DDR port. Uses FCLK_CLK1 (async from PS internal clock)
-# to ensure boot ROM allocates write FIFO blocks (synchronous clock disables FIFO).
-set_property CONFIG.PCW_USE_S_AXI_HP0 1 [get_bd_cells ps7]
-set_property CONFIG.PCW_S_AXI_HP0_DATA_WIDTH 64 [get_bd_cells ps7]
-set_property CONFIG.PCW_S_AXI_HP0_ID_WIDTH 6 [get_bd_cells ps7]
-set_property CONFIG.PCW_S_AXI_HP0_BASEADDR 0x00000000 [get_bd_cells ps7]
-set_property CONFIG.PCW_S_AXI_HP0_HIGHADDR 0x3FFFFFFF [get_bd_cells ps7]
-
 # PL fabric clocks: FCLK_CLK0 = 100 MHz (fabric logic),
 # FCLK_CLK1 = 100 MHz (async domain for HP0, avoids FIFO bypass)
 set_property CONFIG.PCW_EN_CLK0_PORT 1 [get_bd_cells ps7]
@@ -73,8 +74,8 @@ set_property CONFIG.PCW_EN_CLK1_PORT 1 [get_bd_cells ps7]
 set_property CONFIG.PCW_FCLK_CLK1_BUF TRUE [get_bd_cells ps7]
 set_property CONFIG.PCW_FPGA1_PERIPHERAL_FREQMHZ 100.0 [get_bd_cells ps7]
 
-# ======== axi_hp_int16_top RTL module ========
-create_bd_cell -type module -reference axi_hp_int16_top axi_hp_top
+# ======== hp_fsm_top (descriptor FSM, no compute cores) ========
+create_bd_cell -type module -reference hp_fsm_top axi_hp_top
 
 # ======== AXI4-Lite interconnect (GP0 → control) ========
 create_bd_cell -type ip -vlnv xilinx.com:ip:axi_interconnect:2.1 axi_lite
@@ -84,17 +85,14 @@ set_property CONFIG.NUM_SI 1 [get_bd_cells axi_lite]
 connect_bd_intf_net [get_bd_intf_pins ps7/M_AXI_GP0] [get_bd_intf_pins axi_lite/S00_AXI]
 connect_bd_intf_net [get_bd_intf_pins axi_lite/M00_AXI] [get_bd_intf_pins axi_hp_top/S_AXI]
 
-# ======== AXI HP interconnect (top → PS7 HP0 = DDR, read + write path) ========
-# HP0 clock domain uses FCLK_CLK1 (async) so boot ROM allocates write FIFO blocks.
-create_bd_cell -type ip -vlnv xilinx.com:ip:axi_interconnect:2.1 axi_hp
-set_property CONFIG.NUM_MI 1 [get_bd_cells axi_hp]
-set_property CONFIG.NUM_SI 1 [get_bd_cells axi_hp]
-set_property CONFIG.PROTOCOL "AXI3" [get_bd_cells axi_hp]
-set_property CONFIG.DATA_WIDTH 64 [get_bd_cells axi_hp]
-set_property CONFIG.ADDR_WIDTH 32 [get_bd_cells axi_hp]
-
-connect_bd_intf_net [get_bd_intf_pins axi_hp_top/M_AXI_HP] [get_bd_intf_pins axi_hp/S00_AXI]
-connect_bd_intf_net [get_bd_intf_pins axi_hp/M00_AXI] [get_bd_intf_pins ps7/S_AXI_HP0]
+# ======== PS7 HP0 direct connection (no interconnect) ========
+# Both sides are AXI3 on the same FCLK_CLK0 domain, so no CDC or protocol adaptation needed.
+# Using an AXI interconnect previously caused S00_DATA_WIDTH auto-detection issues (default 32
+# when side is 64), inserting a 64→32 data width converter that dropped the upper 32 bits.
+# CRITICAL: Force M_AXI_HP data width to 64. Vivado BD does NOT parse DATA_WIDTH from
+# X_INTERFACE_PARAMETER in the Verilog RTL — it defaults to 32 unless explicitly set here.
+set_property CONFIG.DATA_WIDTH 64 [get_bd_intf_pins axi_hp_top/M_AXI_HP]
+connect_bd_intf_net [get_bd_intf_pins axi_hp_top/M_AXI_HP] [get_bd_intf_pins ps7/S_AXI_HP0]
 
 # ======== Clocks ========
 # Fabric clock domain (FCLK_CLK0): GP0, AXI Lite, module logic, read master
@@ -103,47 +101,42 @@ connect_bd_net [get_bd_pins ps7/FCLK_CLK0] [get_bd_pins axi_lite/ACLK]
 connect_bd_net [get_bd_pins ps7/FCLK_CLK0] [get_bd_pins axi_lite/S00_ACLK]
 connect_bd_net [get_bd_pins ps7/FCLK_CLK0] [get_bd_pins axi_lite/M00_ACLK]
 connect_bd_net [get_bd_pins ps7/FCLK_CLK0] [get_bd_pins axi_hp_top/clk]
-connect_bd_net [get_bd_pins ps7/FCLK_CLK0] [get_bd_pins axi_hp/S00_ACLK]
 
-# HP0 clock domain (FCLK_CLK1, async): forces boot ROM to allocate write FIFO blocks
-connect_bd_net [get_bd_pins ps7/FCLK_CLK1] [get_bd_pins axi_hp/ACLK]
-connect_bd_net [get_bd_pins ps7/FCLK_CLK1] [get_bd_pins axi_hp/M00_ACLK]
-connect_bd_net [get_bd_pins ps7/FCLK_CLK1] [get_bd_pins ps7/S_AXI_HP0_ACLK]
+# HP0 clock: PS7 HP0 receives FCLK_CLK0 (same as PL logic)
+connect_bd_net [get_bd_pins ps7/FCLK_CLK0] [get_bd_pins ps7/S_AXI_HP0_ACLK]
 
 # ======== Resets ========
 connect_bd_net [get_bd_pins ps7/FCLK_RESET0_N] [get_bd_pins axi_lite/ARESETN]
 connect_bd_net [get_bd_pins ps7/FCLK_RESET0_N] [get_bd_pins axi_lite/S00_ARESETN]
 connect_bd_net [get_bd_pins ps7/FCLK_RESET0_N] [get_bd_pins axi_lite/M00_ARESETN]
 connect_bd_net [get_bd_pins ps7/FCLK_RESET0_N] [get_bd_pins axi_hp_top/rst_n]
-connect_bd_net [get_bd_pins ps7/FCLK_RESET0_N] [get_bd_pins axi_hp/ARESETN]
-connect_bd_net [get_bd_pins ps7/FCLK_RESET0_N] [get_bd_pins axi_hp/S00_ARESETN]
-connect_bd_net [get_bd_pins ps7/FCLK_RESET0_N] [get_bd_pins axi_hp/M00_ARESETN]
 
 
 # Validate
 validate_bd_design
 
-# Address mapping
-# GP0 → axi_hp_top control at 0x43C00000
-set ctrl_seg [get_bd_addr_segs -quiet axi_hp_top/S_AXI/reg0]
-if {$ctrl_seg eq ""} {
-    assign_bd_address
-} else {
-    create_bd_addr_seg -range 0x00010000 -offset 0x43C00000 \
-        [get_bd_addr_spaces ps7/Data] $ctrl_seg SEG_hp_top_ctrl
-}
-# HP0: axi_hp_top → PS7 S_AXI_HP0 → DDR 0x00000000-0x1FFFFFFF
-set hp_seg [get_bd_addr_segs -quiet ps7/S_AXI_HP0/HP0_DDR_LOW]
-if {$hp_seg eq ""} { set hp_seg [get_bd_addr_segs -quiet ps7/S_AXI_HP0/Reg] }
-if {$hp_seg ne ""} {
-    create_bd_addr_seg -range 0x20000000 -offset 0x00000000 \
-        [get_bd_addr_spaces axi_hp_top/M_AXI_HP] $hp_seg SEG_hp_top_ddr
-    puts "HP0 DDR mapped OK"
-} else {
-    puts "ERROR: Cannot find PS7 HP0 address segment!"
-    puts "Available HP0 segments: [get_bd_addr_segs -quiet ps7/S_AXI_HP0/*]"
-    assign_bd_address
-}
+# Address mapping — assign both GP0 and HP0 segments manually
+# Get the slave segment objects
+set gp0_seg [get_bd_addr_segs -of_objects [get_bd_intf_pins axi_hp_top/S_AXI]]
+set hp0_seg [get_bd_addr_segs -of_objects [get_bd_intf_pins ps7/S_AXI_HP0]]
+
+puts "GP0 slave seg: $gp0_seg"
+puts "HP0 slave seg: $hp0_seg"
+
+# GP0: CPU→PL control registers at 0x43C00000
+create_bd_addr_seg -range 64K -offset 0x43C00000 \
+    [get_bd_addr_spaces ps7/Data] \
+    $gp0_seg \
+    SEG_axi_hp_top_ctrl
+
+# HP0: PL→DDR at 0x00000000 (256 MB)
+create_bd_addr_seg -range 0x20000000 -offset 0x00000000 \
+    [get_bd_addr_spaces axi_hp_top/M_AXI_HP] \
+    $hp0_seg \
+    SEG_axi_hp_top_HP0_DDR
+
+puts "GP0 control: [get_bd_addr_segs -quiet -of_objects [get_bd_addr_spaces ps7/Data]]"
+puts "HP0 DDR:     [get_bd_addr_segs -quiet -of_objects [get_bd_addr_spaces axi_hp_top/M_AXI_HP]]"
 
 save_bd_design
 
@@ -176,5 +169,25 @@ write_checkpoint -force "$proj_dir/post_impl.dcp"
 
 # XSA
 write_hw_platform -fixed -include_bit -force "$proj_dir/matmul_bd.xsa"
+
+# Patch generated ps7_init.tcl to enable FCLK_CLK0 and FCLK_CLK1
+# (Vivado-generated init code excludes clock enable bits from the mask)
+# MUST be at the very end — any subsequent Vivado step regenerates the file.
+set ps7_init_file [file normalize "$proj_dir/matmul_bd.gen/sources_1/bd/system/ip/system_ps7_0/ps7_init.tcl"]
+if {[file exists $ps7_init_file]} {
+    set fd [open $ps7_init_file r]
+    set content [read $fd]
+    close $fd
+    # Replace mask + value for FPGA_CLK_CTRL (0xF8000170): add CLK0_EN + CLK1_EN
+    regsub -all {mask_write 0XF8000170 0x03F03F30 0x00400400} $content {mask_write 0XF8000170 0x03F83FB0 0x00480480} content
+    # Same for FPGA_CLK_CTRL2 (0xF8000180, CLK3)
+    regsub -all {mask_write 0XF8000180 0x03F03F30 0x00400400} $content {mask_write 0XF8000180 0x03F83FB0 0x00480480} content
+    set fd [open $ps7_init_file w]
+    puts -nonewline $fd $content
+    close $fd
+    puts "ps7_init.tcl patched: CLK0_EN + CLK1_EN added"
+} else {
+    puts "WARNING: ps7_init.tcl not found at $ps7_init_file"
+}
 
 puts "=== DONE ==="

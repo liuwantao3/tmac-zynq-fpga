@@ -29,35 +29,60 @@ module matmul_int16_core (
     reg [5:0] k;
     reg [2:0] g;
 
-    (* ram_style = "distributed" *) reg [63:0] wmem_lo [0:511];
-    (* ram_style = "distributed" *) reg [63:0] wmem_hi [0:511];
+    (* preserve = "true" *) reg [63:0] wmem_lo [0:511];
+    (* preserve = "true" *) reg [63:0] wmem_hi [0:511];
 
     reg [127:0] wmem_rdata;
     always @(posedge clk) begin
         wmem_rdata <= {wmem_hi[{k, g}], wmem_lo[{k, g}]};
     end
 
-    always @(posedge clk) begin
+    reg [7:0] wmem_lo_we;
+    reg [7:0] wmem_hi_we;
+    reg [8:0] wmem_wa;
+    always @* begin
+        wmem_lo_we = 0;
+        wmem_hi_we = 0;
+        wmem_wa = wt_addr[12:4];
         if (wt_we) begin
-            case (wt_addr[12:9])
-                4'd0: wmem_lo[wt_addr[8:0]][7:0]   <= wt_din;
-                4'd1: wmem_lo[wt_addr[8:0]][15:8]  <= wt_din;
-                4'd2: wmem_lo[wt_addr[8:0]][23:16] <= wt_din;
-                4'd3: wmem_lo[wt_addr[8:0]][31:24] <= wt_din;
-                4'd4: wmem_lo[wt_addr[8:0]][39:32] <= wt_din;
-                4'd5: wmem_lo[wt_addr[8:0]][47:40] <= wt_din;
-                4'd6: wmem_lo[wt_addr[8:0]][55:48] <= wt_din;
-                4'd7: wmem_lo[wt_addr[8:0]][63:56] <= wt_din;
-                4'd8: wmem_hi[wt_addr[8:0]][7:0]   <= wt_din;
-                4'd9: wmem_hi[wt_addr[8:0]][15:8]  <= wt_din;
-                4'd10: wmem_hi[wt_addr[8:0]][23:16] <= wt_din;
-                4'd11: wmem_hi[wt_addr[8:0]][31:24] <= wt_din;
-                4'd12: wmem_hi[wt_addr[8:0]][39:32] <= wt_din;
-                4'd13: wmem_hi[wt_addr[8:0]][47:40] <= wt_din;
-                4'd14: wmem_hi[wt_addr[8:0]][55:48] <= wt_din;
-                4'd15: wmem_hi[wt_addr[8:0]][63:56] <= wt_din;
+            case (wt_addr[3:0])
+                4'd0: wmem_lo_we[0] = 1;
+                4'd1: wmem_lo_we[1] = 1;
+                4'd2: wmem_lo_we[2] = 1;
+                4'd3: wmem_lo_we[3] = 1;
+                4'd4: wmem_lo_we[4] = 1;
+                4'd5: wmem_lo_we[5] = 1;
+                4'd6: wmem_lo_we[6] = 1;
+                4'd7: wmem_lo_we[7] = 1;
+                4'd8: wmem_hi_we[0] = 1;
+                4'd9: wmem_hi_we[1] = 1;
+                4'd10: wmem_hi_we[2] = 1;
+                4'd11: wmem_hi_we[3] = 1;
+                4'd12: wmem_hi_we[4] = 1;
+                4'd13: wmem_hi_we[5] = 1;
+                4'd14: wmem_hi_we[6] = 1;
+                4'd15: wmem_hi_we[7] = 1;
             endcase
         end
+    end
+
+    always @(posedge clk) begin
+        if (wmem_lo_we[0]) wmem_lo[wmem_wa][7:0]   <= wt_din;
+        if (wmem_lo_we[1]) wmem_lo[wmem_wa][15:8]  <= wt_din;
+        if (wmem_lo_we[2]) wmem_lo[wmem_wa][23:16] <= wt_din;
+        if (wmem_lo_we[3]) wmem_lo[wmem_wa][31:24] <= wt_din;
+        if (wmem_lo_we[4]) wmem_lo[wmem_wa][39:32] <= wt_din;
+        if (wmem_lo_we[5]) wmem_lo[wmem_wa][47:40] <= wt_din;
+        if (wmem_lo_we[6]) wmem_lo[wmem_wa][55:48] <= wt_din;
+        if (wmem_lo_we[7]) wmem_lo[wmem_wa][63:56] <= wt_din;
+        if (wmem_hi_we[0]) wmem_hi[wmem_wa][7:0]   <= wt_din;
+        if (wmem_hi_we[1]) wmem_hi[wmem_wa][15:8]  <= wt_din;
+        if (wmem_hi_we[2]) wmem_hi[wmem_wa][23:16] <= wt_din;
+        if (wmem_hi_we[3]) wmem_hi[wmem_wa][31:24] <= wt_din;
+        if (wmem_hi_we[4]) wmem_hi[wmem_wa][39:32] <= wt_din;
+        if (wmem_hi_we[5]) wmem_hi[wmem_wa][47:40] <= wt_din;
+        if (wmem_hi_we[6]) wmem_hi[wmem_wa][55:48] <= wt_din;
+        if (wmem_hi_we[7]) wmem_hi[wmem_wa][63:56] <= wt_din;
     end
 
     reg signed [15:0] act_reg [0:63];
@@ -75,8 +100,9 @@ module matmul_int16_core (
     reg [5:0]  p1_row_base;
     reg signed [15:0] p1_act;
     reg        p1_valid;
+    reg [127:0] p1_wmem_rdata;
 
-    reg signed [31:0] p2_partial [0:7];
+    (* use_dsp = "yes" *) reg signed [31:0] p2_partial [0:7];
     reg [5:0]  p2_row_base;
     reg        p2_valid;
 
@@ -145,14 +171,14 @@ module matmul_int16_core (
                         acc[p2_row_base+7] <= acc[p2_row_base+7] + p2_partial[7];
                     end
                     if (p1_valid) begin
-                        p2_partial[0] <= $signed(p1_act) * $signed(wmem_rdata[0*16 +: 16]);
-                        p2_partial[1] <= $signed(p1_act) * $signed(wmem_rdata[1*16 +: 16]);
-                        p2_partial[2] <= $signed(p1_act) * $signed(wmem_rdata[2*16 +: 16]);
-                        p2_partial[3] <= $signed(p1_act) * $signed(wmem_rdata[3*16 +: 16]);
-                        p2_partial[4] <= $signed(p1_act) * $signed(wmem_rdata[4*16 +: 16]);
-                        p2_partial[5] <= $signed(p1_act) * $signed(wmem_rdata[5*16 +: 16]);
-                        p2_partial[6] <= $signed(p1_act) * $signed(wmem_rdata[6*16 +: 16]);
-                        p2_partial[7] <= $signed(p1_act) * $signed(wmem_rdata[7*16 +: 16]);
+                        p2_partial[0] <= $signed(p1_act) * $signed(p1_wmem_rdata[0*16 +: 16]);
+                        p2_partial[1] <= $signed(p1_act) * $signed(p1_wmem_rdata[1*16 +: 16]);
+                        p2_partial[2] <= $signed(p1_act) * $signed(p1_wmem_rdata[2*16 +: 16]);
+                        p2_partial[3] <= $signed(p1_act) * $signed(p1_wmem_rdata[3*16 +: 16]);
+                        p2_partial[4] <= $signed(p1_act) * $signed(p1_wmem_rdata[4*16 +: 16]);
+                        p2_partial[5] <= $signed(p1_act) * $signed(p1_wmem_rdata[5*16 +: 16]);
+                        p2_partial[6] <= $signed(p1_act) * $signed(p1_wmem_rdata[6*16 +: 16]);
+                        p2_partial[7] <= $signed(p1_act) * $signed(p1_wmem_rdata[7*16 +: 16]);
                         p2_row_base <= p1_row_base; p2_valid <= 1;
                     end else begin
                         p2_valid <= 0;
@@ -160,6 +186,7 @@ module matmul_int16_core (
                     p1_g <= g; p1_k <= k;
                     p1_row_base <= {g, 3'b0};
                     p1_act <= act_reg[k]; p1_valid <= 1;
+                    p1_wmem_rdata <= wmem_rdata;
                     if (g == 7) begin
                         g <= 0;
                         if (k == 63) state <= DRAIN; else k <= k + 1;
@@ -180,14 +207,14 @@ module matmul_int16_core (
                         acc[p2_row_base+7] <= acc[p2_row_base+7] + p2_partial[7];
                     end
                     if (p1_valid) begin
-                        p2_partial[0] <= $signed(p1_act) * $signed(wmem_rdata[0*16 +: 16]);
-                        p2_partial[1] <= $signed(p1_act) * $signed(wmem_rdata[1*16 +: 16]);
-                        p2_partial[2] <= $signed(p1_act) * $signed(wmem_rdata[2*16 +: 16]);
-                        p2_partial[3] <= $signed(p1_act) * $signed(wmem_rdata[3*16 +: 16]);
-                        p2_partial[4] <= $signed(p1_act) * $signed(wmem_rdata[4*16 +: 16]);
-                        p2_partial[5] <= $signed(p1_act) * $signed(wmem_rdata[5*16 +: 16]);
-                        p2_partial[6] <= $signed(p1_act) * $signed(wmem_rdata[6*16 +: 16]);
-                        p2_partial[7] <= $signed(p1_act) * $signed(wmem_rdata[7*16 +: 16]);
+                        p2_partial[0] <= $signed(p1_act) * $signed(p1_wmem_rdata[0*16 +: 16]);
+                        p2_partial[1] <= $signed(p1_act) * $signed(p1_wmem_rdata[1*16 +: 16]);
+                        p2_partial[2] <= $signed(p1_act) * $signed(p1_wmem_rdata[2*16 +: 16]);
+                        p2_partial[3] <= $signed(p1_act) * $signed(p1_wmem_rdata[3*16 +: 16]);
+                        p2_partial[4] <= $signed(p1_act) * $signed(p1_wmem_rdata[4*16 +: 16]);
+                        p2_partial[5] <= $signed(p1_act) * $signed(p1_wmem_rdata[5*16 +: 16]);
+                        p2_partial[6] <= $signed(p1_act) * $signed(p1_wmem_rdata[6*16 +: 16]);
+                        p2_partial[7] <= $signed(p1_act) * $signed(p1_wmem_rdata[7*16 +: 16]);
                         p2_row_base <= p1_row_base; p2_valid <= 1;
                     end else begin
                         p2_valid <= 0;

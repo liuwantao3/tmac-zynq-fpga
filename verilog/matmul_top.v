@@ -4,55 +4,121 @@ module matmul_top (
     input  wire         clk,
     input  wire         rst_n,
 
-    // AXI4-Lite slave interface
+    // AXI4-Lite slave interface (GP0)
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 S_AXI AWVALID" *)
     input  wire         s_axil_awvalid,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 S_AXI AWREADY" *)
     output reg          s_axil_awready,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 S_AXI AWADDR" *)
     input  wire [15:0]  s_axil_awaddr,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 S_AXI WVALID" *)
     input  wire         s_axil_wvalid,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 S_AXI WREADY" *)
     output reg          s_axil_wready,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 S_AXI WDATA" *)
     input  wire [31:0]  s_axil_wdata,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 S_AXI WSTRB" *)
     input  wire [3:0]   s_axil_wstrb,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 S_AXI BVALID" *)
     output reg          s_axil_bvalid,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 S_AXI BREADY" *)
     input  wire         s_axil_bready,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 S_AXI BRESP" *)
     output reg  [1:0]   s_axil_bresp,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 S_AXI ARVALID" *)
     input  wire         s_axil_arvalid,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 S_AXI ARREADY" *)
     output reg          s_axil_arready,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 S_AXI ARADDR" *)
     input  wire [15:0]  s_axil_araddr,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 S_AXI RVALID" *)
     output reg          s_axil_rvalid,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 S_AXI RREADY" *)
     input  wire         s_axil_rready,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 S_AXI RDATA" *)
     output reg  [31:0]  s_axil_rdata,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 S_AXI RRESP" *)
     output reg  [1:0]   s_axil_rresp,
 
     // Interrupt
     output reg          interrupt,
 
     // AXI HP read master (DDR → PL)
+    (* X_INTERFACE_PARAMETER = "XIL_INTERFACENAME M_AXI_HP, PROTOCOL AXI3, ID_WIDTH 6, DATA_WIDTH 64" *)
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 M_AXI_HP ARADDR" *)
     output wire [31:0]  m_axi_araddr,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 M_AXI_HP ARVALID" *)
     output wire         m_axi_arvalid,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 M_AXI_HP ARREADY" *)
     input  wire         m_axi_arready,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 M_AXI_HP ARLEN" *)
     output wire [7:0]   m_axi_arlen,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 M_AXI_HP ARSIZE" *)
     output wire [2:0]   m_axi_arsize,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 M_AXI_HP ARBURST" *)
     output wire [1:0]   m_axi_arburst,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 M_AXI_HP ARLOCK" *)
+    output wire [1:0]   m_axi_arlock,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 M_AXI_HP ARCACHE" *)
+    output wire [3:0]   m_axi_arcache,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 M_AXI_HP ARPROT" *)
+    output wire [2:0]   m_axi_arprot,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 M_AXI_HP ARID" *)
+    output wire [5:0]   m_axi_arid,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 M_AXI_HP RDATA" *)
     input  wire [63:0]  m_axi_rdata,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 M_AXI_HP RRESP" *)
+    input  wire [1:0]   m_axi_rresp,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 M_AXI_HP RID" *)
+    input  wire [5:0]   m_axi_rid,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 M_AXI_HP RVALID" *)
     input  wire         m_axi_rvalid,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 M_AXI_HP RREADY" *)
     output wire         m_axi_rready,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 M_AXI_HP RLAST" *)
     input  wire         m_axi_rlast,
 
     // AXI HP write master (PL → DDR)
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 M_AXI_HP AWADDR" *)
     output wire [31:0]  m_axi_awaddr,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 M_AXI_HP AWVALID" *)
     output wire         m_axi_awvalid,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 M_AXI_HP AWREADY" *)
     input  wire         m_axi_awready,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 M_AXI_HP AWLEN" *)
     output wire [7:0]   m_axi_awlen,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 M_AXI_HP AWSIZE" *)
     output wire [2:0]   m_axi_awsize,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 M_AXI_HP AWBURST" *)
     output wire [1:0]   m_axi_awburst,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 M_AXI_HP AWLOCK" *)
+    output wire [1:0]   m_axi_awlock,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 M_AXI_HP AWCACHE" *)
+    output wire [3:0]   m_axi_awcache,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 M_AXI_HP AWPROT" *)
+    output wire [2:0]   m_axi_awprot,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 M_AXI_HP AWID" *)
+    output wire [5:0]   m_axi_awid,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 M_AXI_HP WDATA" *)
     output wire [63:0]  m_axi_wdata,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 M_AXI_HP WVALID" *)
     output wire         m_axi_wvalid,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 M_AXI_HP WREADY" *)
     input  wire         m_axi_wready,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 M_AXI_HP WLAST" *)
     output wire         m_axi_wlast,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 M_AXI_HP WSTRB" *)
     output wire [7:0]   m_axi_wstrb,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 M_AXI_HP WID" *)
+    output wire [5:0]   m_axi_wid,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 M_AXI_HP BVALID" *)
     input  wire         m_axi_bvalid,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 M_AXI_HP BREADY" *)
     output wire         m_axi_bready,
-    input  wire  [1:0]  m_axi_bresp
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 M_AXI_HP BRESP" *)
+    input  wire  [1:0]  m_axi_bresp,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 M_AXI_HP BID" *)
+    input  wire  [5:0]  m_axi_bid
 );
 
     // ======================================================================
@@ -82,6 +148,21 @@ module matmul_top (
     reg [31:0] reg_desc_tail;
     reg [31:0] reg_desc_head;
     reg [31:0] reg_chain_ctrl;
+
+    // Cross-block register write request flags (consolidated in single always block)
+    reg        axil_we_ctrl_user;
+    reg [31:0] axil_wdata_ctrl_user;
+    reg        axil_we_chain_ctrl;
+    reg [31:0] axil_wdata_chain_ctrl;
+    reg        axil_we_ap_ctrl;
+    reg [31:0] axil_wdata_ap_ctrl;
+    reg        axil_re_isr_clear0;
+    reg        fsm_we_ctrl_user;
+    reg [31:0] fsm_wdata_ctrl_user;
+    reg        fsm_chain_clr0;
+    reg        fsm_chain_set2;
+    reg        fsm_chain_clr2;
+    reg        axil_reset_head_pulse;
 
     // ======================================================================
     // Mode wires  — bit[8:4] of reg_ctrl_user
@@ -122,9 +203,9 @@ module matmul_top (
     // ======================================================================
     // INT16 core signals
     // ======================================================================
-    reg  [12:0] int16_wt_addr;
-    reg  [7:0]  int16_wt_din;
-    reg         int16_wt_we;
+    wire [12:0] int16_wt_addr = wt_addr;
+    wire [7:0]  int16_wt_din  = wt_din;
+    wire        int16_wt_we   = wt_we;
     wire        int16_done, int16_busy;
     wire [47:0] int16_res_dout;
 
@@ -288,18 +369,23 @@ module matmul_top (
             s_axil_wready  <= 0;
             s_axil_bvalid  <= 0;
             s_axil_bresp   <= 0;
-            reg_ap_ctrl    <= 32'h0000_0004;
             reg_gie        <= 0;
             reg_ier        <= 0;
-            reg_isr        <= 0;
-            reg_ctrl_user  <= 0;
             reg_desc_base  <= 0;
             reg_desc_tail  <= 0;
-            reg_chain_ctrl <= 0;
             waddr_buf      <= 0;
             wdata_buf      <= 0;
             wstrb_buf      <= 0;
+            axil_we_ap_ctrl    <= 0;
+            axil_we_ctrl_user  <= 0;
+            axil_we_chain_ctrl <= 0;
+            axil_re_isr_clear0 <= 0;
         end else begin
+            // Auto-clear AXI write flags (pulse — cleared before write_reg sets them)
+            axil_we_ap_ctrl    <= 0;
+            axil_we_ctrl_user  <= 0;
+            axil_we_chain_ctrl <= 0;
+            axil_re_isr_clear0 <= 0;
             case (wstate)
                 W_IDLE: begin
                     s_axil_awready <= 1;
@@ -370,22 +456,25 @@ module matmul_top (
         input [3:0]  strb;
         begin
             case (addr)
-                REG_AP_CTRL:   reg_ap_ctrl   <= data;
+                REG_AP_CTRL:   begin
+                    axil_we_ap_ctrl    <= 1;
+                    axil_wdata_ap_ctrl <= data;
+                end
                 REG_GIE:       reg_gie       <= data;
                 REG_IER:       reg_ier       <= data;
-                REG_CTRL_USER: reg_ctrl_user <= data;
+                REG_CTRL_USER: begin
+                    axil_we_ctrl_user    <= 1;
+                    axil_wdata_ctrl_user <= data;
+                end
                 REG_DESC_BASE: reg_desc_base <= data;
                 REG_DESC_TAIL: reg_desc_tail <= data;
                 REG_CHAIN_CTRL: begin
-                    reg_chain_ctrl <= data;
-                    if (data[1]) begin
-                        reg_desc_head <= 0;
-                        reg_chain_ctrl[2] <= 0;
-                    end
+                    axil_we_chain_ctrl    <= 1;
+                    axil_wdata_chain_ctrl <= data;
                 end
                 REG_ISR: begin
                     if (data[0])
-                        reg_isr[0] <= 0;
+                        axil_re_isr_clear0 <= 1;
                 end
             endcase
         end
@@ -455,26 +544,33 @@ module matmul_top (
     wire [7:0]  hp_read_data;
     wire        hp_read_valid;
     reg         hp_read_ready;
+    reg [2:0]   beat_byte_cnt;  // bytes stored in current beat (0-4)
     reg         hp_read_start_raw;
 
     axihp_read_master u_hp_read (
-        .clk         (clk),
-        .rst_n       (rst_n),
-        .start       (hp_read_start_raw),
-        .src_addr    (hp_read_addr),
-        .burst_len   (hp_read_len),
-        .done        (hp_read_done),
-        .busy        (hp_read_busy),
-        .data_out    (hp_read_data),
-        .data_valid  (hp_read_valid),
-        .data_ready  (hp_read_ready),
+        .clk          (clk),
+        .rst_n        (rst_n),
+        .start        (hp_read_start_raw),
+        .src_addr     (hp_read_addr),
+        .burst_len    (hp_read_len),
+        .done         (hp_read_done),
+        .busy         (hp_read_busy),
+        .data_out     (hp_read_data),
+        .data_valid   (hp_read_valid),
+        .data_ready   (hp_read_ready),
+        .m_axi_arid   (m_axi_arid),
         .m_axi_araddr (m_axi_araddr),
         .m_axi_arvalid(m_axi_arvalid),
         .m_axi_arready(m_axi_arready),
         .m_axi_arlen  (m_axi_arlen),
         .m_axi_arsize (m_axi_arsize),
         .m_axi_arburst(m_axi_arburst),
+        .m_axi_arlock (m_axi_arlock),
+        .m_axi_arcache(m_axi_arcache),
+        .m_axi_arprot (m_axi_arprot),
         .m_axi_rdata  (m_axi_rdata),
+        .m_axi_rresp  (m_axi_rresp),
+        .m_axi_rid    (m_axi_rid),
         .m_axi_rvalid (m_axi_rvalid),
         .m_axi_rready (m_axi_rready),
         .m_axi_rlast  (m_axi_rlast)
@@ -495,30 +591,36 @@ module matmul_top (
     wire        hp_write_ready;
 
     axihp_write_master u_hp_write (
-        .clk          (clk),
-        .rst_n        (rst_n),
-        .start        (hp_write_start),
-        .dst_addr     (hp_write_addr),
-        .word_count   (hp_write_count),
-        .busy         (hp_write_busy),
-        .done         (hp_write_done),
-        .wdata        (hp_write_data),
-        .wvalid       (hp_write_valid),
-        .wready       (hp_write_ready),
-        .m_axi_awaddr (m_axi_awaddr),
-        .m_axi_awvalid(m_axi_awvalid),
-        .m_axi_awready(m_axi_awready),
-        .m_axi_awlen  (m_axi_awlen),
-        .m_axi_awsize (m_axi_awsize),
-        .m_axi_awburst(m_axi_awburst),
-        .m_axi_wdata  (m_axi_wdata),
-        .m_axi_wvalid (m_axi_wvalid),
-        .m_axi_wready (m_axi_wready),
-        .m_axi_wlast  (m_axi_wlast),
-        .m_axi_wstrb  (m_axi_wstrb),
-        .m_axi_bvalid (m_axi_bvalid),
-        .m_axi_bready (m_axi_bready),
-        .m_axi_bresp  (m_axi_bresp)
+        .clk            (clk),
+        .rst_n          (rst_n),
+        .start          (hp_write_start),
+        .dst_addr       (hp_write_addr),
+        .word_count     (hp_write_count),
+        .busy           (hp_write_busy),
+        .done           (hp_write_done),
+        .wdata          (hp_write_data),
+        .wvalid         (hp_write_valid),
+        .wready         (hp_write_ready),
+        .m_axi_awid     (m_axi_awid),
+        .m_axi_awaddr   (m_axi_awaddr),
+        .m_axi_awvalid  (m_axi_awvalid),
+        .m_axi_awready  (m_axi_awready),
+        .m_axi_awlen    (m_axi_awlen),
+        .m_axi_awsize   (m_axi_awsize),
+        .m_axi_awburst  (m_axi_awburst),
+        .m_axi_awlock   (m_axi_awlock),
+        .m_axi_awcache  (m_axi_awcache),
+        .m_axi_awprot   (m_axi_awprot),
+        .m_axi_wid      (m_axi_wid),
+        .m_axi_wdata    (m_axi_wdata),
+        .m_axi_wvalid   (m_axi_wvalid),
+        .m_axi_wready   (m_axi_wready),
+        .m_axi_wlast    (m_axi_wlast),
+        .m_axi_wstrb    (m_axi_wstrb),
+        .m_axi_bvalid   (m_axi_bvalid),
+        .m_axi_bready   (m_axi_bready),
+        .m_axi_bresp    (m_axi_bresp),
+        .m_axi_bid      (m_axi_bid)
     );
 
     // ======================================================================
@@ -656,8 +758,14 @@ module matmul_top (
             burst_bytes_rem   <= 0;
             desc_byte_idx     <= 0;
             hp_read_ready     <= 0;
+            beat_byte_cnt     <= 0;
             hp_write_start    <= 0;
             hp_write_valid    <= 0;
+            fsm_we_ctrl_user  <= 0;
+            fsm_wdata_ctrl_user <= 0;
+            fsm_chain_clr0    <= 0;
+            fsm_chain_set2    <= 0;
+            fsm_chain_clr2    <= 0;
         end else begin
             // Default clears
             wt_we             <= 0;
@@ -667,6 +775,14 @@ module matmul_top (
     hp_write_start    <= 0;
     core_start_pulse  <= 0;
     desc_irq          <= 0;
+            fsm_we_ctrl_user  <= 0;
+            fsm_chain_clr0    <= 0;
+            fsm_chain_set2    <= 0;
+            fsm_chain_clr2    <= 0;
+
+            // AXI reset head request (pulse from consolidated block)
+            if (axil_reset_head_pulse)
+                reg_desc_head <= 0;
 
             case (ph_state)
                 // ==========================================================
@@ -677,7 +793,7 @@ module matmul_top (
                         $display("[TB] PH_IDLE: chain started head=%0d tail=%0d",
                             reg_desc_head, reg_desc_tail);
                         desc_chain_enable <= 1;
-                        reg_chain_ctrl[0] <= 0;
+                        fsm_chain_clr0 <= 1;
                         if (reg_desc_head == reg_desc_tail) begin
                             $display("[TB] PH_IDLE: no descriptors");
                         end else begin
@@ -693,26 +809,50 @@ module matmul_top (
                 PH_FETCH_DESC: begin
                     desc_byte_idx <= 0;
                     hp_read_addr <= reg_desc_base + reg_desc_head * 32;
-                    hp_read_len  <= 8'd3;  // 4 beats = 32 bytes
+                    hp_read_len  <= 8'd7;  // 8 beats x 4 bytes = 32 bytes
                     hp_read_start_raw <= 1;
                     ph_state <= PH_FETCH_WAIT;
                 end
 
                 // ==========================================================
                 // PH_FETCH_WAIT: drain descriptor bytes from HP read master
+                //
+                // beat_byte_cnt tracks bytes stored per AXI beat (max 4).
+                // The first hp_read_valid cycle has hp_read_ready=0 (NBA
+                // delay), so we skip it.  Subsequent cycles with both valid
+                // and ready asserted store exactly 4 bytes per beat.
                 // ==========================================================
                 PH_FETCH_WAIT: begin
                     if (hp_read_valid) begin
                         hp_read_ready <= 1;
-                        if (desc_byte_idx < 32) begin
+                        // hp_read_ready is from previous cycle's NBA; skip
+                        // the first valid cycle to let data_ready handshake.
+                        if (hp_read_ready && beat_byte_cnt < 4 && desc_byte_idx < 32) begin
+                            $display("[TB] FETCH @%0t idx=%0d data=0x%02x buf_idx=%0d rdata=0x%08x",
+                                $time, desc_byte_idx, hp_read_data,
+                                u_hp_read.buf_idx, u_hp_read.rdata_buf[31:0]);
                             desc_buf[desc_byte_idx] <= hp_read_data;
                             desc_byte_idx <= desc_byte_idx + 1;
+                            beat_byte_cnt <= beat_byte_cnt + 1;
                         end
                     end else begin
                         hp_read_ready <= 0;
+                        beat_byte_cnt <= 0;
                     end
                     if (hp_read_done) begin
                         // Descriptor fully read — parse fields
+                        $display("[TB] DESC_BUF: %02x %02x %02x %02x %02x %02x %02x %02x",
+                            desc_buf[0],desc_buf[1],desc_buf[2],desc_buf[3],
+                            desc_buf[4],desc_buf[5],desc_buf[6],desc_buf[7]);
+                        $display("[TB] DESC_BUF: %02x %02x %02x %02x %02x %02x %02x %02x",
+                            desc_buf[8],desc_buf[9],desc_buf[10],desc_buf[11],
+                            desc_buf[12],desc_buf[13],desc_buf[14],desc_buf[15]);
+                        $display("[TB] DESC_BUF: %02x %02x %02x %02x %02x %02x %02x %02x",
+                            desc_buf[16],desc_buf[17],desc_buf[18],desc_buf[19],
+                            desc_buf[20],desc_buf[21],desc_buf[22],desc_buf[23]);
+                        $display("[TB] DESC_BUF: %02x %02x %02x %02x %02x %02x %02x %02x",
+                            desc_buf[24],desc_buf[25],desc_buf[26],desc_buf[27],
+                            desc_buf[28],desc_buf[29],desc_buf[30],desc_buf[31]);
                         desc_next_addr <= {desc_buf[3], desc_buf[2], desc_buf[1], desc_buf[0]};
                         desc_weight_addr <= {desc_buf[7], desc_buf[6], desc_buf[5], desc_buf[4]};
                         desc_act_addr <= {desc_buf[11],desc_buf[10],desc_buf[9], desc_buf[8]};
@@ -742,16 +882,17 @@ module matmul_top (
 
                         // Set mode from tensor type (GGML type values)
                         case (desc_tensor_type)
-                            0:  reg_ctrl_user <= 32'h0000_0010;  // INT16
-                            6:  reg_ctrl_user <= 32'h0000_0080;  // Q5_0
-                            8:  reg_ctrl_user <= 32'h0000_0020;  // Q8_0
-                            12: reg_ctrl_user <= 32'h0000_0040;  // Q4_K
-                            14: reg_ctrl_user <= 32'h0000_0100;  // Q6_K
+                            0:  fsm_wdata_ctrl_user <= 32'h0000_0010;  // INT16
+                            6:  fsm_wdata_ctrl_user <= 32'h0000_0080;  // Q5_0
+                            8:  fsm_wdata_ctrl_user <= 32'h0000_0020;  // Q8_0
+                            12: fsm_wdata_ctrl_user <= 32'h0000_0040;  // Q4_K
+                            14: fsm_wdata_ctrl_user <= 32'h0000_0100;  // Q6_K
                         endcase
+                        fsm_we_ctrl_user <= 1;
 
                         // CPU-OP (type=15): signal CPU and wait for resume
                         if (desc_tensor_type == 8'd15) begin
-                            reg_chain_ctrl[2] <= 1;
+                            fsm_chain_set2 <= 1;
                             desc_irq <= 1;
                             ph_state <= PH_CPU_OP_WAIT;
                         end else begin
@@ -768,7 +909,7 @@ module matmul_top (
                     act_byte_cnt <= 0;
                     if (desc_act_total_bytes > 0) begin
                         hp_read_addr <= desc_act_addr;
-                        hp_read_len  <= (desc_act_total_bytes >> 3) - 1;
+                        hp_read_len  <= (desc_act_total_bytes >> 2) - 1;
                         hp_read_start_raw <= 1;
                         ph_state <= PH_LOAD_ACT_WAIT;
                     end else begin
@@ -782,15 +923,18 @@ module matmul_top (
                 PH_LOAD_ACT_WAIT: begin
                     if (hp_read_valid) begin
                         hp_read_ready <= 1;
-                        // Accumulate 2 bytes into 16-bit act value
-                        if (act_byte_cnt[0] == 0) begin
-                            scale_accum[7:0] <= hp_read_data;
-                            act_byte_cnt <= act_byte_cnt + 1;
-                        end else begin
-                            scale_accum[15:8] <= hp_read_data;
-                            act_buf[act_wr_ptr] <= {hp_read_data, scale_accum[7:0]};
-                            act_wr_ptr <= act_wr_ptr + 1;
-                            act_byte_cnt <= act_byte_cnt + 1;
+                        // Guard: skip first valid cycle (hp_read_ready NBA delay)
+                        if (hp_read_ready) begin
+                            // Accumulate 2 bytes into 16-bit act value
+                            if (act_byte_cnt[0] == 0) begin
+                                scale_accum[7:0] <= hp_read_data;
+                                act_byte_cnt <= act_byte_cnt + 1;
+                            end else begin
+                                scale_accum[15:8] <= hp_read_data;
+                                act_buf[act_wr_ptr] <= {hp_read_data, scale_accum[7:0]};
+                                act_wr_ptr <= act_wr_ptr + 1;
+                                act_byte_cnt <= act_byte_cnt + 1;
+                            end
                         end
                     end else begin
                         hp_read_ready <= 0;
@@ -817,14 +961,14 @@ module matmul_top (
                 // PH_WEIGHT_START: issue one HP read burst for weight data
                 // ==========================================================
                 PH_WEIGHT_START: begin
-                    if (burst_bytes_rem > 2048) begin
+                    if (burst_bytes_rem > 1024) begin
                         hp_read_addr <= burst_addr;
-                        hp_read_len  <= 8'd255;  // 256 beats = 2048 bytes
-                        burst_addr   <= burst_addr + 2048;
-                        burst_bytes_rem <= burst_bytes_rem - 2048;
+                        hp_read_len  <= 8'd255;  // 256 beats x 4 bytes = 1024 bytes
+                        burst_addr   <= burst_addr + 1024;
+                        burst_bytes_rem <= burst_bytes_rem - 1024;
                     end else begin
                         hp_read_addr <= burst_addr;
-                        hp_read_len  <= (burst_bytes_rem >> 3) - 1;
+                        hp_read_len  <= (burst_bytes_rem >> 2) - 1;
                         burst_bytes_rem <= 0;
                     end
                     hp_read_start_raw <= 1;
@@ -838,33 +982,36 @@ module matmul_top (
                 PH_WEIGHT_WAIT: begin
                     if (hp_read_valid) begin
                         hp_read_ready <= 1;
-                        if (weight_loading) begin
-                            // Still in block data phase
-                            wt_we   <= 1;
-                            wt_addr <= write_count[12:0];
-                            wt_din  <= hp_read_data;
-                            write_count <= write_count + 1;
-                            if (write_count >= tile_block_bytes - 1) begin
-                                weight_loading <= 0;
-                                scale_byte_cnt <= 0;
-                            end
-                        end else begin
-                            // Scale data phase — accumulate 2 bytes per 16-bit scale
-                            // Only load desc_tile_res_rows scales; skip padding bytes
-                            if (scale_wr_ptr < desc_tile_res_rows) begin
-                                if (scale_byte_cnt == 0) begin
-                                    scale_accum[7:0] <= hp_read_data;
-                                    scale_byte_cnt <= 1;
-                                end else begin
-                                    scale_accum[15:8] <= hp_read_data;
-                                    sc_we   <= 1;
-                                    sc_din  <= {hp_read_data, scale_accum[7:0]};
-                                    sc_addr <= scale_wr_ptr;
-                                    scale_wr_ptr <= scale_wr_ptr + 1;
+                        // Guard: skip first valid cycle (hp_read_ready NBA delay)
+                        if (hp_read_ready) begin
+                            if (weight_loading) begin
+                                // Still in block data phase
+                                wt_we   <= 1;
+                                wt_addr <= write_count[12:0];
+                                wt_din  <= hp_read_data;
+                                write_count <= write_count + 1;
+                                if (write_count >= tile_block_bytes - 1) begin
+                                    weight_loading <= 0;
                                     scale_byte_cnt <= 0;
                                 end
+                            end else begin
+                                // Scale data phase — accumulate 2 bytes per 16-bit scale
+                                // Only load desc_tile_res_rows scales; skip padding bytes
+                                if (scale_wr_ptr < desc_tile_res_rows) begin
+                                    if (scale_byte_cnt == 0) begin
+                                        scale_accum[7:0] <= hp_read_data;
+                                        scale_byte_cnt <= 1;
+                                    end else begin
+                                        scale_accum[15:8] <= hp_read_data;
+                                        sc_we   <= 1;
+                                        sc_din  <= {hp_read_data, scale_accum[7:0]};
+                                        sc_addr <= scale_wr_ptr;
+                                        scale_wr_ptr <= scale_wr_ptr + 1;
+                                        scale_byte_cnt <= 0;
+                                    end
+                                end
+                                // else: skip padding bytes (discard)
                             end
-                            // else: skip padding bytes (discard)
                         end
                     end else begin
                         hp_read_ready <= 0;
@@ -927,9 +1074,14 @@ module matmul_top (
                 // PH_WRITE_RESULT: write result_buf to DDR via HP write master
                 // ==========================================================
                 PH_WRITE_RESULT: begin
-                    $display("[TB] PH_WRITE_RESULT: addr=0x%08x rows=%0d tile=%0d",
+                    $display("[TB] @%0t PH_WRITE_RESULT: addr=0x%08x rows=%0d tile=%0d hp_write_start before set=%d",
+                        $time,
                         desc_result_addr + (tile_count * desc_tile_res_rows * 8),
-                        desc_tile_res_rows, tile_count);
+                        desc_tile_res_rows, tile_count, hp_write_start);
+                    $display("[TB] result_buf[0]=0x%012h res_dout=0x%012h core_done=%d draining=%d",
+                        result_buf[0], res_dout, core_done, draining);
+                    $display("[TB] result_buf[1..3]=0x%012h 0x%012h 0x%012h",
+                        result_buf[1], result_buf[2], result_buf[3]);
                     hp_write_addr <= desc_result_addr + (tile_count * desc_tile_res_rows * 8);
                     hp_write_count <= desc_tile_res_rows;
                     hp_write_start <= 1;
@@ -947,6 +1099,12 @@ module matmul_top (
                 //   1: wait for write master ready, advance to next word
                 // ==========================================================
                 PH_WRITE_WAIT: begin
+                    // debug: print signals on first cycle and every 10 words
+                    if (res_write_active && (result_wr_idx == 0 || result_wr_idx % 10 == 0) && res_wr_state == 0) begin
+                        $display("[TB] @%0t PH_WRITE_WAIT: idx=%0d/%0d state=0 done=%d busy=%d ready=%d wr_state=%d",
+                            $time, result_wr_idx, desc_tile_res_rows,
+                            hp_write_done, hp_write_busy, hp_write_ready, res_wr_state);
+                    end
                     if (res_write_active) begin
                         if (result_wr_idx < desc_tile_res_rows) begin
                             case (res_wr_state)
@@ -976,7 +1134,7 @@ module matmul_top (
                         hp_write_valid <= 0;
                     end
                     if (hp_write_done) begin
-                        $display("[TB] PH_WRITE_WAIT: done tile=%0d", tile_count);
+                        $display("[TB] @%0t PH_WRITE_WAIT: done tile=%0d", $time, tile_count);
                         res_write_active <= 0;
                         hp_write_valid <= 0;
                         tile_count <= tile_count + 1;
@@ -995,7 +1153,7 @@ module matmul_top (
                     reg_desc_head <= reg_desc_head + 1;
                     if (reg_desc_head + 1 >= reg_desc_tail) begin
                         // Chain complete
-                        reg_chain_ctrl[2] <= 1;
+                        fsm_chain_set2 <= 1;
                         desc_chain_busy <= 0;
                         desc_irq <= 1;
                         ph_state <= PH_IDLE;
@@ -1009,8 +1167,8 @@ module matmul_top (
                 // ==========================================================
                 PH_CPU_OP_WAIT: begin
                     if (reg_chain_ctrl[0]) begin
-                        reg_chain_ctrl[0] <= 0;
-                        reg_chain_ctrl[2] <= 0;
+                        fsm_chain_clr0 <= 1;
+                        fsm_chain_clr2 <= 1;
                         desc_irq <= 0;
                         ph_state <= PH_ADVANCE_DESC;
                     end
@@ -1064,22 +1222,51 @@ module matmul_top (
     end
 
     // ======================================================================
-    // AP_CTRL done/idle/ready bits
-    // ======================================================================
-    always @(*) begin
-        reg_ap_ctrl[3:1] = {~desc_chain_busy && ~core_busy,
-                            ~desc_chain_busy && ~core_busy,
-                            core_done && !draining};
-    end
-
-    // ======================================================================
-    // Interrupt generation (chain completion)
+    // Consolidated register block — single driver for shared registers
+    // Handles: reg_ap_ctrl, reg_isr, reg_ctrl_user, reg_chain_ctrl
+    // Reads flags from AXI and desc FSMs (flags driven only by source blocks)
     // ======================================================================
     always @(posedge clk or negedge rst_n) begin
-        if (!rst_n)
-            reg_isr <= 0;
-        else if (desc_irq && reg_gie[0] && reg_ier[0])
-            reg_isr[0] <= 1;
+        if (!rst_n) begin
+            reg_ap_ctrl      <= 32'h0000_0004;
+            reg_isr          <= 0;
+            reg_ctrl_user    <= 0;
+            reg_chain_ctrl   <= 0;
+            axil_reset_head_pulse <= 0;
+        end else begin
+            // AXI writes (highest priority)
+            if (axil_we_ap_ctrl)
+                reg_ap_ctrl <= axil_wdata_ap_ctrl;
+            if (axil_we_ctrl_user)
+                reg_ctrl_user <= axil_wdata_ctrl_user;
+            if (axil_we_chain_ctrl) begin
+                reg_chain_ctrl <= axil_wdata_chain_ctrl;
+                axil_reset_head_pulse <= axil_wdata_chain_ctrl[1];
+            end else begin
+                axil_reset_head_pulse <= 0;
+            end
+            if (axil_re_isr_clear0)
+                reg_isr[0] <= 0;
+
+            // FSM writes (lower priority)
+            if (fsm_we_ctrl_user)
+                reg_ctrl_user <= fsm_wdata_ctrl_user;
+            if (fsm_chain_clr0)
+                reg_chain_ctrl[0] <= 0;
+            if (fsm_chain_set2)
+                reg_chain_ctrl[2] <= 1;
+            if (fsm_chain_clr2)
+                reg_chain_ctrl[2] <= 0;
+
+            // Auto-update ap_ctrl status bits (always wins for bits[3:1])
+            reg_ap_ctrl[3] <= ~desc_chain_busy && ~core_busy;
+            reg_ap_ctrl[2] <= ~desc_chain_busy && ~core_busy;
+            reg_ap_ctrl[1] <= core_done && !draining;
+
+            // ISR logic
+            if (desc_irq && reg_gie[0] && reg_ier[0])
+                reg_isr[0] <= 1;
+        end
     end
 
     always @(posedge clk or negedge rst_n) begin

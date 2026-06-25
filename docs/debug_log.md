@@ -157,50 +157,61 @@ while (*(volatile unsigned*)(OCM_BASE + offset));  // ARM spins
 
 ---
 
-## Decision: Switch from HP to ACP
+## RETRACTED: Switch from HP to ACP
 
-### Why HP is Dead for Writes
-- AFI0_FIFO_PARTITION and AFI1_FIFO_PARTITION both = 0x00000007 (write=0 blocks)
-- Boot ROM locks these registers write-once after reset
-- No software workaround (bypass mode, channel enable, etc.) overcomes 0-block write FIFO
-- AXI interconnect provides speculative completion responses — data silently dropped
+**Retracted (2026-06-20).** HP0 writes DO work — see workaround below. This section is kept for historical context.
 
-### ACP Alternative
-The **Accelerator Coherency Port (ACP)** on Zynq-7010:
-- 64-bit AXI3 slave port on PS7 (same protocol as HP)
-- Connects directly to SCU (Snoop Control Unit) — **no AFI FIFO**
-- No FIFO partitioning — reads and writes both work
-- **Cache coherent** — automatic L1/L2 snooping. ARM doesn't need to flush cache before PL reads, and PL writes are immediately visible to ARM.
-- Same burst capability: up to 16-beat, 64-bit bursts
+### Original Diagnosis (superseded)
+Earlier testing suggested HP writes failed due to 0-block write FIFO. The AXI interconnect was believed to provide speculative completion responses. Subsequent testing showed single-beat writes bypass this limitation.
 
-### Comparison
+---
 
-| Aspect | HP0/HP1 | ACP |
-|--------|---------|-----|
-| Write path | **Dead** (0-block FIFO) | **Works** (no FIFO) |
-| Read throughput | 64-bit burst, good | 64-bit burst, same |
-| Cache coherence | Manual L1+L2 flush | Automatic via SCU snooping |
-| FIFO partition | 8 total, all to reads | None needed |
-| Protocol | AXI3 | AXI3 |
-| ARID/AWID | Don't care | Must set for coherency level |
+## HP0 Write FIFO Workaround: Single-Beat AXI Writes
 
-### ACP ID Bits
-ACP uses ARID[3:0] / AWID[3:0] to control coherency:
-- ID[0] = 1: Allocate in L2 cache on read
-- ID[1] = 1: Allocate in L1 cache on read (pollutes cache for weight data)
-- ID[2] = 1: Write snoops L1 cache
-- ID[3] = 1: Write-back L2 cache
+### Problem
+`AFI0_FIFO_PARTITION` (0xF8008004) = `0x00000007` → write channel = 0 out of 8 FIFO entries. Boot ROM sets this during DDR init; write-once after reset.
 
-Recommended: ID = 0x0 for weights (non-cacheable reads), ID = 0xF for activations/results (fully coherent).
+### Why Burst Writes Fail
+Multi-beat burst (AWLEN > 0) requires the interconnect to buffer all beats before forwarding to DDR. With 0 FIFO entries, there is **no buffer space**. The AXI handshakes complete (speculative AWREADY/WREADY/BVALID), but data never reaches DDR.
 
-### Implementation Plan (Next Phase)
-1. Modify `build_bd.tcl`: Enable `PCW_USE_S_AXI_ACP = 1`, route `axi_hp_top/M_AXI_HP → ps7/S_AXI_ACP`
-2. Modify `axihp_read_master.v`: Drive ARID[3:0] with configurable ID value
-3. Modify `axihp_write_master.v`: Drive AWID[3:0] with configurable ID value
-4. Modify `axi_hp_int16_top.v`: Add ID registers, drive ID bits on read/write masters
-5. Remove HP0/HP1 from `build_bd.tcl` (or keep as read-only fallback)
-6. Update `ps7_init.tcl`: Remove AFI1 enable (no longer needed), ensure ACP clock enabled
-7. Verify: Simulate ACP read/write in iVerilog, then hardware test
+### Workaround: Single-Beat Writes (AWLEN=0)
+Each AXI write is a **single-beat transaction** (AWLEN=0, AWSIZE=2 → 4 bytes). The interconnect sinks each beat directly to the DDR controller without FIFO buffering:
+
+- Single-beat writes are **non-posted** — forwarded immediately to the DDR port
+- 0-block FIFO only constrains **burst buffering**, not individual beat delivery
+
+### Implementation (`axihp_write_master.v`)
+```
+Each 64-bit word from the FSM is split into two 32-bit single-beat AXI writes:
+  AW_L → W_L: capture word[31:0], send as 32-bit beat (WSTRB[3:0])
+  B_L  → AW_U: send word[63:32] from hold_wdata (WSTRB[7:4])
+```
+- `AWSIZE=2`, `AWLEN=8'd0`, `AWBURST=INCR`
+- 5-state FSM: `IDLE → AW_L → W_L → B_L → AW_U → B_U`
+- `wready` asserted **once per word** (W_L only, not W_U)
+- The FSM (`hp_fsm_top.v:340`) computes `wr_count = act_total_bytes / 8`
+
+### Verification
+
+| Date | Test | Result |
+|------|------|--------|
+| 2026-06-20 | HP loopback (8 words, 16×32-bit AXI transactions) | ✅ All DDR data correct |
+| 2026-06-21 | FSM single descriptor | ✅ STATUS=0x300, HEAD=1 |
+| 2026-06-21 | FSM 2-descriptor chain | ✅ HEAD=2, both results correct |
+| 2026-06-21 | FSM end-to-end | ✅ STATUS=0x300, data at 0x200 matching |
+
+### What Doesn't Work (and Why We Don't Care)
+
+| Attempt | Result | Reason |
+|---------|--------|--------|
+| Write `AFI0_PART=0x44` | **Ignored** — write-once after boot | Boot ROM lock |
+| Write `AFI0_WR_CHANNEL_CTRL=1` | Writable but useless | No FIFO to enable |
+| Enable bypass `AFI0_CTRL[1]=1` | Ineffective | Bypass doesn't allocate FIFO |
+| Switch to HP1 | Same 0-block FIFO | Both HP ports identical |
+| Write `AFI0_PART` via OCM before DDR init | Sometimes works | Requires custom boot sequence |
+
+### Why Not ACP
+ACP was considered (no AFI FIFO, cache-coherent) but HP0 writes work reliably with single-beat transactions. ACP would add block design changes, AXI ID routing, and risk of L1/L2 cache pollution — with no performance benefit.
 
 ---
 

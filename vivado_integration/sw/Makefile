@@ -5,15 +5,24 @@ OBJDUMP = $(LLVM_DIR)/llvm-objdump.exe
 OBJCOPY = $(LLVM_DIR)/llvm-objcopy.exe
 SIZE = $(LLVM_DIR)/llvm-size.exe
 
-CFLAGS  = --target=armv7a-none-eabi -mthumb -mcpu=cortex-a9 -O2 -g -nostdlib -ffreestanding -I.
-LDFLAGS = -T link.ld
+CFLAGS  = --target=armv7a-none-eabi -mcpu=cortex-a9 -O2 -g -nostdlib -ffreestanding
+LDFLAGS = -T link.ld -Map=hp_baremetal.map
 
-OBJS = startup.o main.o
+OBJS_COMMON = startup.o
 
-all: test_int16.elf test_int16.bin
+all: hp_baremetal.elf hp_baremetal.bin test_int16.elf test_int16.bin
 
-test_int16.elf: $(OBJS) link.ld
-	$(LD) $(LDFLAGS) $(OBJS) -o $@
+# Baremetal HP test (no BSP, MMU off before main)
+hp_baremetal.elf: $(OBJS_COMMON) hp_baremetal.o link.ld
+	$(LD) $(LDFLAGS) $(OBJS_COMMON) hp_baremetal.o -o $@
+	$(SIZE) $@
+
+hp_baremetal.bin: hp_baremetal.elf
+	$(OBJCOPY) -O binary $< $@
+
+# Legacy int16 test
+test_int16.elf: $(OBJS_COMMON) main.o link.ld
+	$(LD) $(LDFLAGS) $(OBJS_COMMON) main.o -o $@
 	$(SIZE) $@
 
 test_int16.bin: test_int16.elf
