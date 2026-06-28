@@ -3,44 +3,47 @@
 
 #include <stdint.h>
 
-// AXI address map for axi_wrap_int16
-// Base address set by Vivado block design (typically 0x43C0_0000)
+// AXI address map for hp_fsm_top.v (base = 0x43C0_0000)
 #ifndef IP_BASE
 #define IP_BASE 0x43C00000
 #endif
 
-// Control registers (0x0000-0x0FFF)
-#define REG_AP_CTRL   0x00
-#define REG_GIE       0x04
-#define REG_IER       0x08
-#define REG_ISR       0x0C
-#define REG_CTRL_USER 0x10
-#define REG_STATUS    0x14
+// HP FSM registers
+#define REG_START         0x00  // [0]: write 1 to start chain (auto-clears)
+#define REG_STATUS        0x14  // [8]=rd_done, [9]=wr_done, [15]=busy
+#define REG_DESC_BASE     0x18  // descriptor chain base DDR address
+#define REG_DESC_TAIL     0x1C  // tail index (write 1 to enable chain)
+#define REG_DESC_HEAD     0x20  // current descriptor index (read-only)
+#define REG_DEBUG         0x28  // debug status word (see bitfields below)
+#define REG_CLK_CNT       0x2C  // free-running clock cycle counter
+#define REG_CLK_CNT_SLOW  0x30  // clock counter divided by 1024
+#define REG_ACT_INFO      0x34  // act_addr from last descriptor
+#define REG_DESC_INFO     0x38  // {8'h0, act_total_bytes[23:0]}
+#define REG_Q8_DEBUG      0x3C  // Q8 core debug word
+#define REG_Q8_NUM_GROUPS 0x40  // [3:0]: column groups (0=single, 14=full 64x896)
 
-// AP_CTRL bits
-#define AP_START  0
-#define AP_DONE   1
-#define AP_IDLE   2
-#define AP_READY  3
+// REG_DEBUG bitfields
+#define DBG_STATE_MASK    0x1F000000  // [31:28] FSM state (5 bits)
+#define DBG_RD_DONE       0x08000000  // [27] rd_done (sticky)
+#define DBG_WR_DONE       0x04000000  // [26] wr_done (sticky)
+#define DBG_RD_BUSY       0x02000000  // [25] rd_busy
+#define DBG_WR_BUSY       0x01000000  // [24] wr_busy
+#define DBG_Q8_BUSY       0x00800000  // [23] q8_busy
+#define DBG_WR_DBG_STATE  0x00700000  // [22:20] write master FSM state
+#define DBG_RD_DBG_STATE  0x000E0000  // [19:17] read master FSM state
+#define DBG_Q8_DONE       0x00010000  // [16] q8_done
+#define DBG_WT_BYTE_IDX   0x0000FF00  // [15:8] weight byte index
+#define DBG_ACT_BYTE_IDX  0x000000FF  // [7:0] activation byte index
 
-// STATUS values
-#define STATUS_IDLE     0
-#define STATUS_LOADING  1
-#define STATUS_COMPUTE  2
-
-// Act buffer write (0x1000-0x107C, up to 64 × INT16)
-#define ACT_BASE 0x1000
-
-// Weight buffer write (0x2000-0x3FFF, 2048 × 32-bit = 8192 bytes)
-#define WT_BASE 0x2000
-#define WT_SIZE 2048
-
-// Result read (0x4000-0x40FC lo, 0x4200-0x427C hi)
-#define RES_LO_BASE 0x4000
-#define RES_HI_BASE 0x4200
-
-// Act readback (0x5000-0x507C)
-#define ACT_RD_BASE 0x5000
+// REG_Q8_DEBUG bitfields
+#define Q8DBG_STATE_MASK  0x1F000000  // [31:28] FSM state
+#define Q8DBG_Q8_BUSY     0x08000000  // [27] q8_busy
+#define Q8DBG_Q8_DONE     0x04000000  // [26] q8_done (pulse)
+#define Q8DBG_Q8_START    0x02000000  // [25] q8_start (pulse)
+#define Q8DBG_Q8_ACT_WE   0x01000000  // [24] q8_act_we (active during COPY_ACT_TO_CORE)
+#define Q8DBG_Q8_RES_IDX  0x00FF0000  // [23:16] result read index (0..63)
+#define Q8DBG_Q8_MISC     0x0000FF00  // [15:8] {copy_act_idx[2:0], q8_sc_we, sc_byte_idx[0], 3'b0}
+#define Q8DBG_WT_BYTE_IDX 0x000000FF  // [7:0] weight byte index
 
 // Memory-mapped I/O accessors
 static inline void reg_write(uint32_t base, uint32_t off, uint32_t val) {

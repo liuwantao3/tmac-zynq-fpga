@@ -1,4 +1,4 @@
-# HP FSM Comprehensive Hardware Test (7 tests matching tb_hw_fsm_comprehensive.v)
+# HP FSM Comprehensive Hardware Test (7 baseline + 1 Q8 compute test)
 # Power-cycle the board before running!
 # C:\Xilinx\Vivado\2023.1\bin\xsdb.bat vivado_integration/sw/run_hp_fsm_comprehensive.tcl
 
@@ -26,6 +26,8 @@ set REG_CLK_CNT   0x2C
 set REG_CLK_SLW   0x30
 set REG_ACT_INFO  0x34
 set REG_DESC_INFO 0x38
+set REG_Q8_DEBUG  0x3C
+set REG_Q8_NUM_GROUPS 0x40
 
 proc gp0_read {reg} {
     global GP0_BASE
@@ -38,15 +40,22 @@ proc gp0_write {reg val} {
 }
 
 # Write descriptor at physical addr
-proc write_desc {addr next_addr act_addr res_addr bytes} {
+# type: 15 = CPU_OP (default), 0 = Q8 compute, others = reserved
+proc write_desc {addr next_addr weight_addr act_addr res_addr bytes {tensor_type 15}} {
     write32 $addr                  $next_addr   ;# bytes 0-3:  next_addr
-    write32 [expr $addr + 4]       0            ;# bytes 4-7:  weight_addr
+    write32 [expr $addr + 4]       $weight_addr ;# bytes 4-7:  weight_addr
     write32 [expr $addr + 8]       $act_addr    ;# bytes 8-11: act_addr
-    write32 [expr $addr + 12]      $res_addr    ;# bytes 12-15:result_addr
-    write32 [expr $addr + 16]      0            ;# bytes 16-19: reserved
+    write32 [expr $addr + 12]      $res_addr    ;# bytes 12-15: result_addr
+    # tensor_type stored as 16-bit at bytes 16-17 (little-endian)
+    write32 [expr $addr + 16]      $tensor_type ;# bytes 16-19: {reserved[15:0], tensor_type}
     write32 [expr $addr + 20]      0            ;# bytes 20-23: reserved
     write32 [expr $addr + 24]      $bytes       ;# bytes 24-27: act_total_bytes
     write32 [expr $addr + 28]      0            ;# bytes 28-31: reserved
+}
+
+# Shorthand for CPU_OP descriptor
+proc write_desc_cpu {addr next_addr act_addr res_addr bytes} {
+    write_desc $addr $next_addr 0 $act_addr $res_addr $bytes 15
 }
 
 # Write incrementing pattern (nbytes must be multiple of 4)
@@ -159,8 +168,8 @@ proc run_chain {desc_base expected_head} {
         set head [gp0_read $REG_DESC_HEAD]
         set clk [gp0_read $REG_CLK_CNT]
         puts "  TIMEOUT: STATUS=[format 0x%08x $status] DEBUG=[format 0x%08x $dbg] HEAD=$head CLK_CNT=[format 0x%08x $clk]"
-        set state [expr ($dbg >> 28) & 0xF]
-        set state_names {IDLE FETCH_DESC FETCH_DESC_W LOAD_ACT LOAD_ACT_W WRITE_RES WRITE_RES_W DONE}
+        set state [expr ($dbg >> 28) & 0x1F]
+        set state_names {IDLE FETCH_DESC FETCH_DESC_W LOAD_ACT LOAD_ACT_W WRITE_RES WRITE_RES_W DONE LOAD_WEIGHT LOAD_WEIGHT_W LOAD_SCALES LOAD_SCALES_W COPY_ACT_TO_CORE COMPUTE COMPUTE_W READ_RES READ_RES_ACC COPY_ACC_TO_BUF}
         if {$state < [llength $state_names]} { set sname [lindex $state_names $state] } else { set sname "UNK" }
         puts "  FSM state=$state ($sname)"
         return 0
@@ -170,7 +179,7 @@ proc run_chain {desc_base expected_head} {
 
 # ===== MAIN =====
 puts "=============================================="
-puts "  HP FSM Comprehensive Hardware Test (7 tests)"
+puts "  HP FSM Comprehensive Hardware Test (7+1 tests)"
 puts "=============================================="
 
 configparams force-mem-accesses 1
@@ -239,7 +248,7 @@ set fail_count 0
 # Test 1: Basic 64 bytes (regression — matches working hardware test)
 # ===================================================================
 puts "\n--- Test 1: Basic 64 bytes ---"
-write_desc 0x00100000 0 0x00101000 0x00102000 64
+write_desc_cpu 0x00100000 0 0x00101000 0x00102000 64
 write_pattern_inc 0x00101000 64
 zero_fill 0x00102000 64
 if {[run_chain 0x00100000 1]} {
@@ -254,7 +263,7 @@ if {[run_chain 0x00100000 1]} {
 # Test 2: Minimum 8 bytes (1 word)
 # ===================================================================
 puts "\n--- Test 2: Minimum 8 bytes ---"
-write_desc 0x00100020 0 0x00101040 0x00102040 8
+write_desc_cpu 0x00100020 0 0x00101040 0x00102040 8
 write32 0x00101040 0xAABBCCDD
 zero_fill 0x00102040 8
 if {[run_chain 0x00100020 1]} {
@@ -272,7 +281,7 @@ if {[run_chain 0x00100020 1]} {
 # Test 3: 128 bytes (2 HP read bursts)
 # ===================================================================
 puts "\n--- Test 3: 128 bytes (2 bursts) ---"
-write_desc 0x00100040 0 0x00101100 0x00102100 128
+write_desc_cpu 0x00100040 0 0x00101100 0x00102100 128
 write_pattern_inc 0x00101100 128
 zero_fill 0x00102100 128
 if {[run_chain 0x00100040 1]} {
@@ -286,7 +295,7 @@ if {[run_chain 0x00100040 1]} {
 # Test 4: 256 bytes max (4 HP read bursts)
 # ===================================================================
 puts "\n--- Test 4: 256 bytes max (4 bursts) ---"
-write_desc 0x00100060 0 0x00101200 0x00102200 256
+write_desc_cpu 0x00100060 0 0x00101200 0x00102200 256
 write_pattern_inc 0x00101200 256
 zero_fill 0x00102200 256
 if {[run_chain 0x00100060 1]} {
@@ -300,8 +309,8 @@ if {[run_chain 0x00100060 1]} {
 # Test 5: Chain of 2 descriptors
 # ===================================================================
 puts "\n--- Test 5: Chain of 2 descriptors ---"
-write_desc 0x00100100 0x00100120 0x00101300 0x00102300 64
-write_desc 0x00100120 0           0x00101340 0x00102340 32
+write_desc_cpu 0x00100100 0x00100120 0x00101300 0x00102300 64
+write_desc_cpu 0x00100120 0           0x00101340 0x00102340 32
 write_pattern_inc   0x00101300 64
 write_pattern_const 0x00101340 32 0xFF
 zero_fill 0x00102300 64
@@ -319,9 +328,9 @@ if {[run_chain 0x00100100 2]} {
 # Test 6: Chain of 3 descriptors
 # ===================================================================
 puts "\n--- Test 6: Chain of 3 descriptors ---"
-write_desc 0x00100140 0x00100160 0x00101400 0x00102400 48
-write_desc 0x00100160 0x00100180 0x00101430 0x00102430 64
-write_desc 0x00100180 0           0x00101470 0x00102470 40
+write_desc_cpu 0x00100140 0x00100160 0x00101400 0x00102400 48
+write_desc_cpu 0x00100160 0x00100180 0x00101430 0x00102430 64
+write_desc_cpu 0x00100180 0           0x00101470 0x00102470 40
 write_pattern_inc     0x00101400 48
 write_pattern_const   0x00101430 64 0xFF
 write_pattern_checker 0x00101470 40
@@ -342,7 +351,7 @@ if {[run_chain 0x00100140 3]} {
 # Test 7: Re-start from DONE
 # ===================================================================
 puts "\n--- Test 7: Re-start from DONE ---"
-write_desc 0x00100200 0 0x00101500 0x00102500 64
+write_desc_cpu 0x00100200 0 0x00101500 0x00102500 64
 write_pattern_inc 0x00101500 64
 zero_fill 0x00102500 64
 if {[run_chain 0x00100200 1]} {
@@ -352,7 +361,7 @@ if {[run_chain 0x00100200 1]} {
     set s1 [verify_inc 0x00102500 64 7]
     if {$s1} {
         # Second run: different descriptor, same FSM
-        write_desc 0x00100220 0 0x00101540 0x00102540 32
+        write_desc_cpu 0x00100220 0 0x00101540 0x00102540 32
         write_pattern_const 0x00101540 32 0x5A
         zero_fill 0x00102540 32
         if {[run_chain 0x00100220 1]} {
@@ -364,6 +373,68 @@ if {[run_chain 0x00100200 1]} {
             if {$s1 && $s2a && $s2b} { incr pass_count } else { incr fail_count }
         } else { incr fail_count }
     } else { incr fail_count }
+} else { incr fail_count }
+
+# ===================================================================
+# Test 8: Q8 compute — single 64x64 tile, all weights=1, scale=1.0, act=1
+#   Expected: each row sum = 64 (64 columns × 1 × 1)
+# ===================================================================
+puts "\n--- Test 8: Q8 compute (all-1s pattern) ---"
+
+set Q8_WEIGHT_ADDR  0x00103000
+set Q8_SCALE_ADDR   [expr $Q8_WEIGHT_ADDR + 4096]
+set Q8_ACT_ADDR     0x00105000
+set Q8_RES_ADDR     0x00106000
+set Q8_DESC_ADDR    0x00100240
+
+# Fill weights: all INT8 = 1 (4096 bytes = 1024 words of 0x01010101)
+write_pattern_const $Q8_WEIGHT_ADDR 4096 0x01
+
+# Fill scales: UQ8.8 1.0 = 0x0100 (256 bytes = 64 words of 0x01000100 packed)
+# Write 32-bit words at 4-byte-aligned addresses (2 scales per word)
+set sc_pair [expr {0x0100 | (0x0100 << 16)}]
+for {set j 0} {$j < 64} {incr j} {
+    write32 [expr $Q8_SCALE_ADDR + $j * 4] $sc_pair
+}
+
+# Fill activations: 64 x int16 = 1 (128 bytes, 2 per 32-bit word)
+set act_pair [expr {0x0001 | (0x0001 << 16)}]
+for {set j 0} {$j < 32} {incr j} {
+    write32 [expr $Q8_ACT_ADDR + $j * 4] $act_pair
+}
+
+# Result buffer: zero-fill 512 bytes
+zero_fill $Q8_RES_ADDR 512
+
+# Descriptor: tensor_type=0 (compute path), act_total_bytes=128
+write_desc $Q8_DESC_ADDR 0 $Q8_WEIGHT_ADDR $Q8_ACT_ADDR $Q8_RES_ADDR 128 0
+
+if {[run_chain $Q8_DESC_ADDR 1]} {
+    set status [gp0_read $REG_STATUS]
+    set head [gp0_read $REG_DESC_HEAD]
+    set q8_dbg [gp0_read $REG_Q8_DEBUG]
+    puts "  STATUS=[format 0x%08x $status] (expect 0x300) HEAD=$head (expect 1) Q8_DEBUG=[format 0x%08x $q8_dbg]"
+
+    # Verify results: each 64-bit word should = 64 (0x40) for all 64 rows
+    set ok 1
+    for {set j 0} {$j < 64} {incr j} {
+        set addr [expr $Q8_RES_ADDR + $j * 8]
+        set lo [read32 $addr]
+        set hi [read32 [expr $addr + 4]]
+        # S24.8: result = 64 = 0x40. In 64-bit word: bytes 0-5 = 48-bit result, bytes 6-7 = 0
+        # Little-endian: lo = bytes 0-3, hi = bytes 4-7
+        # lo should = 0x00000040, hi should = 0x00000000
+        if {$lo != 64 || $hi != 0} {
+            puts "  FAIL[8]: row $j addr=[format 0x%08x $addr] lo=[format 0x%08x $lo] hi=[format 0x%08x $hi] (expected lo=0x00000040 hi=0x00000000)"
+            set ok 0
+        }
+    }
+    if {$ok} {
+        puts "  Test 8: PASS (all 64 rows = 64)"
+        incr pass_count
+    } else {
+        incr fail_count
+    }
 } else { incr fail_count }
 
 # ===================================================================

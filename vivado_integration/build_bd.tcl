@@ -9,10 +9,11 @@ set ver_dir  "$origin/verilog"
 file mkdir $proj_dir
 create_project -force matmul_bd $proj_dir -part xc7z010clg400-1
 
-# Add RTL sources (matmul_top: HP + all 5 compute cores)
+# Add RTL sources
 add_files -fileset sources_1 [list \
     [file normalize "$ver_dir/axihp_read_master.v"] \
     [file normalize "$ver_dir/axihp_write_master.v"] \
+    [file normalize "$ver_dir/matmul_q8_core.v"] \
     [file normalize "$rtl_dir/hp_fsm_top.v"] \
 ]
 update_compile_order -fileset sources_1

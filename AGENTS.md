@@ -42,12 +42,20 @@ Qwen2-0.5B FPGA accelerator targeting Zynq 7010. Quad-core Verilog RTL: INT16×I
 
 10. **Cleanup (2026-06-27)** — Removed all intermediate debug artifacts: deprecated RTL (`matmul_q4k_64x896_core.v`, `matmul_top_int16.v`, `matmul_top_int16_only.v`, `top_smoke.v`, `axi_hp_int16_top.v`, `axi_wrap_int16.v`, `hp_loopback_top.v`), superseded testbenches (all `tb_hp_*.v` variants), debug scripts (`run_hp_fsm_test.tcl`, `run_hp_loopback.tcl`, `run_hp.tcl`, etc.), CPU debug code (`hp_test.c`, `enable_afi.S`), Vivado `.Xil/` cache, build artifacts (`.vvp`, `.vcd`, `.jou`, `.log`). Only current RTL sources, testbenches listed in the Makefile, and the comprehensive test script were kept.
 
+11. **Q8 multi-group 64×896 tile (2026-06-28)** — `hp_fsm_top.v` extended with column-group iteration to support full 64×896 tile (14 groups of 64 columns each). Added `acc_buf[0:63]` (64×48-bit running accumulator), `col_group` counter, two new FSM states `READ_RES_ACC(16)` and `COPY_ACC_TO_BUF(17)`, and `reg_q8_num_groups` register at 0x40. First group stores directly; subsequent groups accumulate; after final group, `COPY_ACC_TO_BUF` transfers acc_buf to act_buf for DDR writeback.
+
 ## Architecture Summary
 
 ### User FSM flow (matmul_top.v):
 ```
 IDLE → LOAD_WEIGHT → LOAD_ACT → COMPUTE → DRAIN → IDLE
 ```
+
+### HP FSM flow (hp_fsm_top.v, Q8 compute path):
+```
+IDLE → FETCH_DESC → LOAD_WEIGHT → LOAD_SCALES → LOAD_ACT → COPY_ACT_TO_CORE → COMPUTE → READ_RES/READ_RES_ACC → WRITE_RES → DONE
+```
+For multi-group (reg_q8_num_groups > 1): COMPUTE → READ_RES_ACC loops back to LOAD_SCALES for each group (accumulating into acc_buf), then COPY_ACC_TO_BUF → WRITE_RES.
 
 ### CPU-OP Descriptor Protocol (CPU/FPGA synchronization):
 
@@ -124,6 +132,79 @@ else → matmul_fpga_int16()   (F32 norms, fallback)
 
 All cores output S24.8 fixed-point (48-bit accumulator, zero-extended to 64-bit in DDR).
 
+### HP FSM Register Map (AXI4-Lite @ 0x43C00000):
+
+| Offset | Name | Access | Description |
+|--------|------|--------|-------------|
+| 0x00 | `REG_START` | R/W | [0]: write 1 to start descriptor chain (auto-clears when FSM leaves IDLE) |
+| 0x14 | `REG_STATUS` | R/W | [8]=rd_done, [9]=wr_done, [15]=busy (cleared in IDLE/DONE) |
+| 0x18 | `REG_DESC_BASE` | R/W | Descriptor base DDR address (32-bit) |
+| 0x1C | `REG_DESC_TAIL` | R/W | Tail index (write 1 to enable chain, unused in current FSM) |
+| 0x20 | `REG_DESC_HEAD` | R | Current descriptor index (read-only, increments after each WRITE_RES) |
+| 0x28 | `REG_DEBUG` | R | Debug status word (see below) |
+| 0x2C | `REG_CLK_CNT` | R | Free-running 32-bit clock cycle counter (increments every clk) |
+| 0x30 | `REG_CLK_CNT_SLOW` | R | Clock counter divided by 1024 (for long timeouts) |
+| 0x34 | `REG_ACT_INFO` | R | `act_addr` from last descriptor fetched |
+| 0x38 | `REG_DESC_INFO` | R | `{8'h0, act_total_bytes[23:0]}` from last descriptor |
+| 0x3C | `REG_Q8_DEBUG` | R | Q8 core debug word (see below) |
+| 0x40 | `REG_Q8_NUM_GROUPS` | R/W | [3:0]: number of column groups (0 or 1 = single-group, 14 = full 64×896) |
+
+**REG_DEBUG (0x28) bitfields:**
+| Bits | Field | Description |
+|------|-------|-------------|
+| [31:28] | `state` | FSM state (see below) |
+| [27] | `rd_done` | HP read master done (sticky, cleared on next LOAD_ACT entry) |
+| [26] | `wr_done` | HP write master done (sticky, cleared on next WRITE_RES entry) |
+| [25] | `rd_busy` | HP read master busy |
+| [24] | `wr_busy` | HP write master busy |
+| [23] | `q8_busy` | Q8 core busy |
+| [22:20] | `wr_dbg_state` | Write master FSM state (3-bit) |
+| [19:17] | `rd_dbg_state` | Read master FSM state (3-bit) |
+| [16] | `q8_done` | Q8 core done |
+| [15:8] | `wt_byte_idx[7:0]` | Weight byte index (lower 8 bits) — useful for tracking scale/act loading progress |
+| [7:0] | `act_byte_idx[7:0]` | Activation byte index — useful for tracking act_buf fill level |
+
+**REG_Q8_DEBUG (0x3C) bitfields:**
+| Bits | Field | Description |
+|------|-------|-------------|
+| [31:28] | `state` | FSM state (same as REG_DEBUG[31:28]) |
+| [27] | `q8_busy` | Q8 core busy |
+| [26] | `q8_done` | Q8 core done (pulse) |
+| [25] | `q8_start` | Q8 core start (pulse) |
+| [24] | `q8_act_we` | Q8 activation write enable (active during COPY_ACT_TO_CORE) |
+| [23:16] | `q8_res_idx` | Result read index (0..63) — active during READ_RES/READ_RES_ACC |
+| [15:8] | (various) | `{copy_act_idx[2:0], q8_sc_we, sc_byte_idx[0], padding[3:0]}` — sc_byte_idx[0] toggles each scale byte pair |
+| [7:0] | `wt_byte_idx[7:0]` | Weight byte index (same as REG_DEBUG[15:8]) |
+
+**FSM States (REG_DEBUG[31:28] or REG_Q8_DEBUG[31:28]):**
+| Value | Name | Description |
+|-------|------|-------------|
+| 0 | `IDLE` | Waiting for REG_START write |
+| 1 | `FETCH_DESC` | Starting descriptor read from DDR |
+| 2 | `FETCH_DESC_W` | Waiting for descriptor read completion |
+| 3 | `LOAD_ACT` | Starting activation data read from DDR |
+| 4 | `LOAD_ACT_W` | Waiting for activation read completion |
+| 5 | `WRITE_RES` | Starting result write to DDR |
+| 6 | `WRITE_RES_W` | Waiting for result write completion |
+| 7 | `DONE` | Chain complete (HEAD increments, next_addr check) |
+| 8 | `LOAD_WEIGHT` | Starting Q8 weight data read from DDR |
+| 9 | `LOAD_WEIGHT_W` | Waiting for weight read completion |
+| 10 | `LOAD_SCALES` | Starting Q8 scale data read from DDR |
+| 11 | `LOAD_SCALES_W` | Waiting for scale read completion, packing pairs into smem |
+| 12 | `COPY_ACT_TO_CORE` | Copying act_buf to Q8 core activation registers |
+| 13 | `COMPUTE` | Pulsing q8_start to begin computation |
+| 14 | `COMPUTE_W` | Waiting for Q8 core done |
+| 15 | `READ_RES` | Reading Q8 core results into act_buf (single-group) |
+| 16 | `READ_RES_ACC` | Reading Q8 results, accumulating into acc_buf (multi-group) |
+| 17 | `COPY_ACC_TO_BUF` | Copying acc_buf to act_buf for DDR writeback |
+
+**Key experience: Debug register field usage patterns from hardware bringup:**
+- `REG_Q8_DEBUG[26]` (q8_done) transitions 0→1 when computation completes; this is the most important signal for debug
+- `REG_Q8_DEBUG[23:16]` (q8_res_idx) should count from 0→63 during result readback; if stuck at 0, the FSM never entered READ_RES/READ_RES_ACC
+- `REG_Q8_DEBUG[15:8]` bit 0 (sc_byte_idx[0]) toggles each scale byte pair processed — if toggling stops, the scale loading DMA hung
+- `REG_DEBUG[27]` (rd_done) and [26] (wr_done) are cumulative sticky bits — clear on next entry to LOAD_ACT/WRITE_RES respectively
+- `REG_DEBUG[15:8]` vs [7:0] shows which FSM phase is active: [15:8] increments during LOAD_WEIGHT/LOAD_SCALES, [7:0] increments during LOAD_ACT
+
 ### Existing Verilog Cores:
 
 | Core | Tile | Cycle/tile | Status |
@@ -132,6 +213,7 @@ All cores output S24.8 fixed-point (48-bit accumulator, zero-extended to 64-bit 
 | `matmul_q4k_core.v` | 56×256 | ~? | ✅ Working |
 | `matmul_int16_core.v` | 64×64 | 515 | ✅ Working |
 | `matmul_top.v` | — | — | ✅ 5 cores instantiated (Q8, Q4K, Q5_0, Q6_K, INT16) |
+| `hp_fsm_top.v` | HP FSM + Q8 | N/A | ✅ Descriptor-chain DMA, Q8 compute 64×896 (14-group) |
 
 ### Missing Verilog Cores:
 
@@ -152,7 +234,13 @@ All cores output S24.8 fixed-point (48-bit accumulator, zero-extended to 64-bit 
 9. ~~**HP write path test**~~ ✅ PASSED — HP write works when PS7 is freshly initialized.
 10. ~~**Switch HP → ACP**~~ — NOT needed: HP write path works when PS7 is freshly initialized (see Key Decision 8 re: ps7_init hang root cause)
 11. ~~**HP FSM descriptor-chain test on hardware**~~ ✅ **Phase 1 COMPLETE (2026-06-27)** — all 7 tests passed on hardware: basic 64B, min 8B, 128B 2-burst, 256B 4-burst, chain of 2 desc, chain of 3 desc, re-start from DONE. Previous single-desc pass was on 2026-06-25.
-12. **Phase 2: matmul_top weight loading integration** — connect HP read master with matmul_top's weight_buf loading, run single-layer compute.
+12. **Phase 2: Q8 compute on hardware** — integrate Q8 matmul core with HP descriptor-chain FSM
+    - ~~Q8 pipeline stage fix (split dequant/p2_partial)~~ ✅ Done (2026-06-28)
+    - ~~Build bitstream (WNS +0.550)~~ ✅ Done (2026-06-28)
+    - ~~Tests 1-8 PASS on hardware~~ ✅ **Done (2026-06-28)** — Q8 all-1s pattern produces all 64 rows = 64
+    - ~~Multi-group column iteration (14 groups × 64 cols = 896 cols)~~ ✅ Done (2026-06-28)
+    - **Test 9: multi-group 64×896 tile** — build bitstream, run on hardware
+13. **Phase 3: matmul_top weight loading integration** — connect HP read master with matmul_top's weight_buf loading, run single-layer compute with all 5 cores.
 
 ## Build & Run Commands
 
@@ -267,7 +355,8 @@ python3 scripts/extract_tmac.py models/qwen2-0_5b-instruct-q4_k_m.gguf /tmp/mode
 - **HP FSM comprehensive (7 tests)** ✅ **ALL PASSED ON HARDWARE (2026-06-27)** — basic 64B, min 8B, 128B 2-burst, 256B 4-burst, chain of 2 desc, chain of 3 desc, re-start from DONE. All STATUS=0x300, all patterns verified.
 - **Testbench fix: wait_done polls HEAD instead of STATUS bits** — cumulative STATUS bits (rd_done/wr_done) stay set across descriptors, causing premature exit in chain tests. Fixed by polling HEAD register.
 - **ACP** 🔄 Not needed — HP works reliably when PS7 is freshly initialized
-- **Phase 1 complete — HP descriptor-chain DMA proven on hardware** across all edge cases (min/max sizes, chains, restart). Ready for Phase 2: matmul_top weight loading integration.
+- **Phase 1 complete — HP descriptor-chain DMA proven on hardware** across all edge cases (min/max sizes, chains, restart). Ready for Phase 2: Q8 compute integration.
+- **Phase 2 (Q8 compute)** ✅ **Tests 1-8 on hardware** (2026-06-28) — Q8 pipeline timing fix (WNS +0.550), sc_byte_idx reset bug fixed, all-1s pattern produces correct 64×64 result. Multi-group iteration implemented, pending hardware test.
 
 ### Critical: ps7_init re-execution hang
 `ps7_pll_init_data_3_0` **hangs if PLLs are already configured** from a prior session. The PLL reset sequence (bypass→power-down→reset→wait-for-lock) can't re-lock when the PLLs are already locked from a previous session. This leaves the PS7 in a partially-configured state and all subsequent ps7_init attempts also hang (DDR init's `mask_poll 0xF8000B74 0x00002000` waits for calibration that depends on PLL clock).
@@ -282,7 +371,7 @@ python3 scripts/extract_tmac.py models/qwen2-0_5b-instruct-q4_k_m.gguf /tmp/mode
 |--------|---------|---------|
 | `vivado_integration/build_bd.tcl` | Vivado batch build | `C:\Xilinx\Vivado\2023.1\bin\vivado.bat -mode batch -source vivado_integration/build_bd.tcl` |
 | `vivado_integration/sw/rebuild.tcl` | XSCT: rebuild Vitis app | `C:\Xilinx\Vitis\2023.1\bin\xsct.bat vivado_integration/sw/rebuild.tcl` |
-| `vivado_integration/sw/run_hp_fsm_comprehensive.tcl` | XSDB: all 7 HP FSM tests (basic, min, 2-burst, 4-burst, chain 2, chain 3, restart) | `C:\Xilinx\Vivado\2023.1\bin\xsdb.bat vivado_integration/sw/run_hp_fsm_comprehensive.tcl` |
+| `vivado_integration/sw/run_hp_fsm_comprehensive.tcl` | XSDB: all 7 HP FSM tests (basic, min, 2-burst, 4-burst, chain 2, chain 3, restart) + Test 8 (Q8 all-1s) | `C:\Xilinx\Vivado\2023.1\bin\xsdb.bat vivado_integration/sw/run_hp_fsm_comprehensive.tcl` |
 
 ### Debug Workflow
 
@@ -376,6 +465,39 @@ mwr -force 0xF800900C 0x00000001  ;# read channel enable
 - HP FSM is ready as building block for weight loading in compute pipeline
 - Next: integrate HP read master with matmul_top's weight_buf loading, or proceed to single-layer compute
 
+## Phase 2: Q8 Compute on Hardware
+
+### Q8 Pipeline Fix (2026-06-28)
+
+**Problem:** The Q8 core's dequant (24-bit multiply) and p2_partial (16×16 multiply) were in a single combinatorial path, causing a critical path that violated 100 MHz timing (WNS ~ -0.7 ns).
+
+**Fix:** Split into two pipeline stages by adding intermediate `dq_deq[0:7]`/`dq_act`/`dq_row_base`/`dq_valid` registers between the dequant multiply and the p2_partial multiply. Also added `DRAIN3` state for the extra pipeline depth.
+
+**Result:** WNS improved to +0.550 ns — timing closure achieved with 0 errors.
+
+### sc_byte_idx Reset Bug (2026-06-28)
+
+**Problem:** The `sc_byte_idx` counter was being reset to 0 at the start of every scale-loading burst (`sc_byte_idx <= 0` at entry to LOAD_SCALES). This caused each of the 4 bursts to overwrite `smem[0..31]` rather than writing to `smem[0..127]` progressively. Only the first 32 of 128 smem entries contained valid scale data.
+
+**Fix:** Removed the `sc_byte_idx <= 0` assignment between bursts (only keep it between column groups in READ_RES_ACC). The counter now persists across all 4 bursts within a group, correctly writing all 128 smem entries.
+
+**Board result:** Tests 1-7 (baseline DMA) all PASS unchanged. Test 8 (Q8 all-1s) now produces **all 64 rows = 64** — previously rows 0-15 gave 32 (wrong) and rows 16-63 gave 0.
+
+### Multi-group 64×896 Tile (2026-06-28)
+
+**Problem:** The original Q8 compute path only handled a single column group (64 columns). The full tile requires 14 groups × 64 cols = 896 columns.
+
+**Implementation in `hp_fsm_top.v`:**
+- Added `reg_q8_num_groups[3:0]` (R/W at address 0x40) — number of column groups
+- Added `acc_buf[0:63]` (64 × 48-bit signed) — running accumulator across groups
+- Added `col_group[3:0]` counter — tracks which group is being processed
+- Added `READ_RES_ACC(16)` state — first group stores directly, subsequent groups add
+- Added `COPY_ACC_TO_BUF(17)` state — copies acc_buf to act_buf for DDR writeback after final group
+- Scale/activation address calculations now include `col_group × 128/256` offset
+- FSM loops: LOAD_SCALES → LOAD_ACT → COPY_ACT_TO_CORE → COMPUTE → READ_RES_ACC (per group), then COPY_ACC_TO_BUF → WRITE_RES
+
+**Status:** RTL complete, syntax-verified with iVerilog (0 errors). Pending: build bitstream and hardware test.
+
 ### Previous Debug Session (2026-06-19)
 
 **Power-cycle unblocks HP write.** After all ps7_init attempts hung (PLL re-lock failure on pre-configured PLLs), power-cycling the board allowed a clean ps7_init to complete. The HP write path verified functional:
@@ -402,7 +524,7 @@ mwr -force 0xF800900C 0x00000001  ;# read channel enable
 ### Relevant Files
 
 - `vivado_integration/build_bd.tcl`: Vivado batch build — HP0 config (`PCW_S_AXI_HP0_DATA_WIDTH=64`) set before `apply_bd_automation`. Sources `hp_fsm_top.v` + `axihp_read_master.v` + `axihp_write_master.v`.
-- `vivado_integration/rtl/hp_fsm_top.v`: HP descriptor-chain FSM — AXI4-Lite slave, desc_buf (32B), act_buf (256B), FSM (IDLE→FETCH_DESC→LOAD_ACT→WRITE_RES→DONE), 32-bit HP read/write masters.
+- `vivado_integration/rtl/hp_fsm_top.v`: HP descriptor-chain FSM — AXI4-Lite slave, desc_buf (32B), act_buf (512B), Q8 matmul core + 64×896 tile (14 groups), multi-group accumulator (64×48-bit acc_buf), 32-bit HP read/write masters. 18-state FSM: IDLE→FETCH_DESC→LOAD_WEIGHT→LOAD_SCALES→LOAD_ACT→COPY_ACT_TO_CORE→COMPUTE→READ_RES_ACC (×groups)→COPY_ACC_TO_BUF→WRITE_RES→DONE.
 - `vivado_integration/sw/run_hp_fsm_comprehensive.tcl`: XSDB flow — all 7 HP FSM tests (basic, min 8B, 128B 2-burst, 256B 4-burst, chain of 2, chain of 3, re-start). Polls HEAD register for completion.
 - `vivado_integration/sw/regs.h`: Register map
 - `vivado_integration/ps7_init.tcl`: Modified — AFI1 + LVL_SHFTR_EN config in ps7_post_config
