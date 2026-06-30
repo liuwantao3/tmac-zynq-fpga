@@ -20,7 +20,7 @@
 #define REG_ACT_INFO      0x34  // act_addr from last descriptor
 #define REG_DESC_INFO     0x38  // {8'h0, act_total_bytes[23:0]}
 #define REG_Q8_DEBUG      0x3C  // Q8 core debug word
-#define REG_Q8_NUM_GROUPS 0x40  // [3:0]: column groups (0=single, 14=full 64x896)
+#define REG_Q8_NUM_GROUPS 0x10  // [3:0]: column groups (0=single, 14=full 64x896)
 
 // REG_DEBUG bitfields
 #define DBG_STATE_MASK    0x1F000000  // [31:28] FSM state (5 bits)

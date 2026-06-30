@@ -17,7 +17,10 @@ module matmul_q8_core (
     input  wire [5:0]   act_addr,
     input  wire [15:0]  act_din,
     input  wire [5:0]   res_addr,
-    output wire [47:0]  res_dout
+    output wire [47:0]  res_dout,
+    output wire [2:0]   dbg_state,
+    output wire [5:0]   dbg_k,
+    output wire [2:0]   dbg_g
 );
 
     localparam IDLE     = 3'd0;
@@ -30,6 +33,9 @@ module matmul_q8_core (
     reg [2:0] state;
     reg [5:0] k;
     reg [2:0] g;
+    assign dbg_state = state;
+    assign dbg_k = k;
+    assign dbg_g = g;
     integer wi_i;
 
     // ======================================================================

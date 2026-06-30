@@ -27,7 +27,7 @@ set REG_CLK_SLW   0x30
 set REG_ACT_INFO  0x34
 set REG_DESC_INFO 0x38
 set REG_Q8_DEBUG  0x3C
-set REG_Q8_NUM_GROUPS 0x40
+set REG_Q8_NUM_GROUPS 0x10
 
 proc gp0_read {reg} {
     global GP0_BASE
@@ -140,7 +140,7 @@ proc verify_checker {addr nbytes test_id} {
 
 # Start chain and wait for HEAD to reach expected_head
 proc run_chain {desc_base expected_head} {
-    global REG_DESC_BASE REG_DESC_TAIL REG_START REG_DESC_HEAD REG_STATUS REG_DEBUG REG_CLK_CNT
+    global REG_DESC_BASE REG_DESC_TAIL REG_START REG_DESC_HEAD REG_STATUS REG_DEBUG REG_CLK_CNT REG_Q8_DEBUG
     gp0_write $REG_DESC_BASE $desc_base
     after 10
     gp0_write $REG_DESC_TAIL 1
@@ -165,13 +165,22 @@ proc run_chain {desc_base expected_head} {
     if {!$done} {
         set status [gp0_read $REG_STATUS]
         set dbg [gp0_read $REG_DEBUG]
+        set q8_dbg [gp0_read $REG_Q8_DEBUG]
         set head [gp0_read $REG_DESC_HEAD]
         set clk [gp0_read $REG_CLK_CNT]
-        puts "  TIMEOUT: STATUS=[format 0x%08x $status] DEBUG=[format 0x%08x $dbg] HEAD=$head CLK_CNT=[format 0x%08x $clk]"
+        set col_group [expr ($dbg >> 12) & 0xF]
         set state [expr ($dbg >> 28) & 0x1F]
-        set state_names {IDLE FETCH_DESC FETCH_DESC_W LOAD_ACT LOAD_ACT_W WRITE_RES WRITE_RES_W DONE LOAD_WEIGHT LOAD_WEIGHT_W LOAD_SCALES LOAD_SCALES_W COPY_ACT_TO_CORE COMPUTE COMPUTE_W READ_RES READ_RES_ACC COPY_ACC_TO_BUF}
+        set state_names {IDLE FETCH_DESC FETCH_DESC_W LOAD_ACT LOAD_ACT_W WRITE_RES WRITE_RES_W DONE LOAD_WEIGHT LOAD_WEIGHT_W LOAD_SCALES LOAD_SCALES_W COPY_ACT_TO_CORE COMPUTE COMPUTE_W READ_RES READ_RES_ACC COPY_ACC_TO_BUF TIMEOUT_ERROR}
         if {$state < [llength $state_names]} { set sname [lindex $state_names $state] } else { set sname "UNK" }
-        puts "  FSM state=$state ($sname)"
+        set sc_byte_idx0 [expr ($q8_dbg >> 8) & 1]
+        puts "  TIMEOUT: STATUS=[format 0x%08x $status] DEBUG=[format 0x%08x $dbg] Q8_DEBUG=[format 0x%08x $q8_dbg] HEAD=$head CLK_CNT=[format 0x%08x $clk]"
+        puts "  FSM state=$state ($sname), col_group=$col_group, sc_byte_idx[7:0]=[expr $dbg & 0xFF], sc_byte_idx[0]=$sc_byte_idx0"
+        if {$state == 18} {
+            set act_info [gp0_read $REG_ACT_INFO]
+            set to_src [expr $act_info & 0x1F]
+            if {$to_src < [llength $state_names]} { set to_sname [lindex $state_names $to_src] } else { set to_sname "UNK" }
+            puts "  TIMEOUT_ERROR: source_state=$to_src ($to_sname)"
+        }
         return 0
     }
     return 1
@@ -179,7 +188,7 @@ proc run_chain {desc_base expected_head} {
 
 # ===== MAIN =====
 puts "=============================================="
-puts "  HP FSM Comprehensive Hardware Test (7+1 tests)"
+puts "  HP FSM Comprehensive Hardware Test (7+2 tests)"
 puts "=============================================="
 
 configparams force-mem-accesses 1
@@ -436,6 +445,96 @@ if {[run_chain $Q8_DESC_ADDR 1]} {
         incr fail_count
     }
 } else { incr fail_count }
+
+# ===================================================================
+# Test 9: Q8 multi-group 64x896 tile (14 groups)
+#   all weights=1, scale=1.0, act=1 → each row = 64 * 14 = 896
+# ===================================================================
+puts "\n--- Test 9a: Q8 multi-group 64x128 tile (2 groups) ---"
+
+set Q9_WEIGHT_ADDR  0x00103000
+set Q9_ACT_ADDR     0x00106000
+set Q9_RES_ADDR     0x00107000
+set Q9_DESC_ADDR    0x00100280
+
+set Q9_NUM_GROUPS 2
+set Q9_EXPECTED [expr 64 * $Q9_NUM_GROUPS]
+
+# Weight: all INT8 = 1 (same 4096 bytes as Test 8)
+write_pattern_const $Q9_WEIGHT_ADDR 4096 0x01
+
+# Scales: ${Q9_NUM_GROUPS} groups × 256 bytes, all UQ8.8 1.0 = 0x0100
+set sc_pair [expr {0x0100 | (0x0100 << 16)}]
+for {set g 0} {$g < $Q9_NUM_GROUPS} {incr g} {
+    set grp_scale_addr [expr $Q9_WEIGHT_ADDR + 4096 + $g * 256]
+    for {set j 0} {$j < 64} {incr j} {
+        write32 [expr $grp_scale_addr + $j * 4] $sc_pair
+    }
+}
+
+# Activations: 14 groups × 128 bytes = 1792 bytes, all INT16 = 1
+set act_pair [expr {0x0001 | (0x0001 << 16)}]
+for {set g 0} {$g < $Q9_NUM_GROUPS} {incr g} {
+    set grp_act_addr [expr $Q9_ACT_ADDR + $g * 128]
+    for {set j 0} {$j < 32} {incr j} {
+        write32 [expr $grp_act_addr + $j * 4] $act_pair
+    }
+}
+
+# Result buffer: zero-fill 512 bytes
+zero_fill $Q9_RES_ADDR 512
+
+# Descriptor: tensor_type=0 (compute), act_total_bytes=128 (per group)
+write_desc $Q9_DESC_ADDR 0 $Q9_WEIGHT_ADDR $Q9_ACT_ADDR $Q9_RES_ADDR 128 0
+
+# Configure multi-group mode BEFORE starting
+gp0_write $REG_Q8_NUM_GROUPS $Q9_NUM_GROUPS
+after 10
+set num_groups_read [gp0_read $REG_Q8_NUM_GROUPS]
+puts "  reg_q8_num_groups written=$Q9_NUM_GROUPS readback=$num_groups_read (expect $Q9_NUM_GROUPS)"
+
+if {[run_chain $Q9_DESC_ADDR 1]} {
+    set status [gp0_read $REG_STATUS]
+    set head [gp0_read $REG_DESC_HEAD]
+    set q8_dbg [gp0_read $REG_Q8_DEBUG]
+    set dbg [gp0_read $REG_DEBUG]
+    puts "  STATUS=[format 0x%08x $status] (expect 0x300) HEAD=$head (expect 1)"
+    puts "  REG_DEBUG=[format 0x%08x $dbg] REG_Q8_DEBUG=[format 0x%08x $q8_dbg]"
+
+    # Quick check first 4 rows to diagnose
+    set expected $Q9_EXPECTED
+    set ok 1
+    for {set j 0} {$j < 4} {incr j} {
+        set addr [expr $Q9_RES_ADDR + $j * 8]
+        set lo [read32 $addr]
+        set hi [read32 [expr $addr + 4]]
+        puts "  row $j: lo=[format 0x%08x $lo] hi=[format 0x%08x $hi]"
+        if {$lo != $expected || $hi != 0} {
+            set ok 0
+        }
+    }
+
+    # Full 64-row check
+    for {set j 4} {$j < 64} {incr j} {
+        set addr [expr $Q9_RES_ADDR + $j * 8]
+        set lo [read32 $addr]
+        set hi [read32 [expr $addr + 4]]
+        if {$lo != $expected || $hi != 0} {
+            set ok 0
+        }
+    }
+    if {$ok} {
+        puts "  Test 9a: PASS (all 64 rows = $Q9_EXPECTED)"
+        incr pass_count
+    } else {
+        puts "  Test 9a: MISMATCH (rows shown above)"
+        incr fail_count
+    }
+} else { incr fail_count }
+
+# Reset num_groups back to 0 for any subsequent tests
+gp0_write $REG_Q8_NUM_GROUPS 0
+after 10
 
 # ===================================================================
 # Summary

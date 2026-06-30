@@ -123,12 +123,14 @@ module hp_fsm_top (
     reg [31:0] reg_act_info;       // 0x34: act_addr from descriptor
     reg [31:0] reg_desc_info;      // 0x38: {8'h0, act_total_bytes[23:0]}
     reg [31:0] reg_q8_debug;       // 0x3C: Q8 core debug status
-    reg  [3:0] reg_q8_num_groups;  // 0x40[3:0]: number of column groups (0=single)
+    reg  [3:0] reg_q8_num_groups;  // 0x10[3:0]: number of column groups (0=single)
 
     // ===== HP Read Master =====
     wire       rd_busy, rd_done, rd_valid;
     wire [7:0] rd_data;
     wire [2:0] rd_dbg_state;
+    wire [7:0] rd_beat_cnt;
+    wire [1:0] rd_buf_idx;
     reg        rd_start, rd_ready;
     reg [31:0] rd_addr;
     reg [7:0]  rd_len;
@@ -139,6 +141,7 @@ module hp_fsm_top (
         .burst_len(rd_len),
         .done(rd_done), .busy(rd_busy),
         .dbg_state(rd_dbg_state),
+        .dbg_beat_cnt(rd_beat_cnt), .dbg_buf_idx(rd_buf_idx),
         .data_out(rd_data), .data_valid(rd_valid), .data_ready(rd_ready),
         .m_axi_arid(m_axi_arid), .m_axi_araddr(m_axi_araddr),
         .m_axi_arvalid(m_axi_arvalid), .m_axi_arready(m_axi_arready),
@@ -181,6 +184,9 @@ module hp_fsm_top (
     // ===== Q8 Compute Core =====
     wire       q8_busy, q8_done;
     wire [47:0] q8_res_dout;
+    wire [2:0]  q8_core_state;
+    wire [5:0]  q8_core_k;
+    wire [2:0]  q8_core_g;
 
     reg        q8_start;
     reg        q8_wt_we;
@@ -201,7 +207,8 @@ module hp_fsm_top (
         .wt_we(q8_wt_we), .wt_addr(q8_wt_addr), .wt_din(q8_wt_din),
         .sc_we(q8_sc_we), .sc_addr(q8_sc_addr), .sc_din(q8_sc_din),
         .act_we(q8_act_we), .act_addr(q8_act_addr), .act_din(q8_act_din),
-        .res_addr(q8_res_addr), .res_dout(q8_res_dout)
+        .res_addr(q8_res_addr), .res_dout(q8_res_dout),
+        .dbg_state(q8_core_state), .dbg_k(q8_core_k), .dbg_g(q8_core_g)
     );
 
     // ===== Buffer =====
@@ -229,6 +236,8 @@ module hp_fsm_top (
     reg signed [47:0] acc_buf [0:63];  // running accumulator across column groups
     reg [3:0]  col_group;              // current column group (0..13)
     reg [5:0]  copy_acc_idx;           // acc_buf → act_buf copy index
+    reg [15:0] timeout_cnt;            // shared timeout counter for all wait states
+    reg [4:0]  timeout_src;            // state that triggered timeout (latched at timeout)
 
     // ===== FSM =====
     localparam IDLE           = 5'd0;
@@ -249,6 +258,7 @@ module hp_fsm_top (
     localparam READ_RES       = 5'd15;
     localparam READ_RES_ACC   = 5'd16;
     localparam COPY_ACC_TO_BUF = 5'd17;
+    localparam TIMEOUT_ERROR  = 5'd18;
 
     // Multi-group flag: non-zero when reg_q8_num_groups > 1
     wire multi_group = (reg_q8_num_groups > 1);
@@ -313,9 +323,10 @@ module hp_fsm_top (
             q8_act_addr <= 0;
             q8_act_din <= 0;
             q8_res_addr <= 0;
-            reg_q8_num_groups <= 0;
             col_group <= 0;
             copy_acc_idx <= 0;
+            timeout_cnt <= 0;
+            timeout_src <= 0;
         end else begin
             reg_clk_cnt <= reg_clk_cnt + 1;
             reg_clk_cnt_slow <= reg_clk_cnt_slow + (|reg_clk_cnt[9:0] ? 0 : 1);
@@ -353,6 +364,7 @@ module hp_fsm_top (
                         desc_byte_idx <= desc_byte_idx + 1;
                     end
                     if (rd_done_rise) begin
+                        timeout_cnt <= 0;
                         next_addr    <= {desc_buf[3], desc_buf[2], desc_buf[1], desc_buf[0]};
                         weight_addr  <= {desc_buf[7], desc_buf[6], desc_buf[5], desc_buf[4]};
                         act_addr     <= {desc_buf[11],desc_buf[10],desc_buf[9], desc_buf[8]};
@@ -373,6 +385,12 @@ module hp_fsm_top (
                             wt_remaining  <= 4096;
                             state <= LOAD_WEIGHT;
                         end
+                    end else if (&timeout_cnt) begin
+                        timeout_cnt <= 0;
+                        timeout_src <= state;
+                        state <= TIMEOUT_ERROR;
+                    end else begin
+                        timeout_cnt <= timeout_cnt + 1;
                     end
                 end
 
@@ -408,6 +426,7 @@ module hp_fsm_top (
                         act_byte_idx <= act_byte_idx + 1;
                     end
                     if (rd_done_rise) begin
+                        timeout_cnt <= 0;
                         if (act_remaining > 64) begin
                             act_remaining <= act_remaining - 64;
                             state <= LOAD_ACT;
@@ -422,6 +441,12 @@ module hp_fsm_top (
                                 state <= COPY_ACT_TO_CORE;
                             end
                         end
+                    end else if (&timeout_cnt) begin
+                        timeout_cnt <= 0;
+                        timeout_src <= state;
+                        state <= TIMEOUT_ERROR;
+                    end else begin
+                        timeout_cnt <= timeout_cnt + 1;
                     end
                 end
 
@@ -452,6 +477,7 @@ module hp_fsm_top (
                         wt_byte_idx <= wt_byte_idx + 1;
                     end
                     if (rd_done_rise) begin
+                        timeout_cnt <= 0;
                         if (wt_remaining > 64) begin
                             wt_remaining <= wt_remaining - 64;
                             state <= LOAD_WEIGHT;
@@ -461,6 +487,12 @@ module hp_fsm_top (
                             sc_byte_idx <= 0;
                             state <= LOAD_SCALES;
                         end
+                    end else if (&timeout_cnt) begin
+                        timeout_cnt <= 0;
+                        timeout_src <= state;
+                        state <= TIMEOUT_ERROR;
+                    end else begin
+                        timeout_cnt <= timeout_cnt + 1;
                     end
                 end
 
@@ -497,6 +529,7 @@ module hp_fsm_top (
                         sc_byte_idx <= sc_byte_idx + 1;
                     end
                     if (rd_done_rise) begin
+                        timeout_cnt <= 0;
                         if (sc_remaining > 64) begin
                             sc_remaining <= sc_remaining - 64;
                             state <= LOAD_SCALES;
@@ -505,6 +538,12 @@ module hp_fsm_top (
                             act_byte_idx <= 0;
                             state <= LOAD_ACT;
                         end
+                    end else if (&timeout_cnt) begin
+                        timeout_cnt <= 0;
+                        timeout_src <= state;
+                        state <= TIMEOUT_ERROR;
+                    end else begin
+                        timeout_cnt <= timeout_cnt + 1;
                     end
                 end
 
@@ -530,6 +569,7 @@ module hp_fsm_top (
                 COMPUTE_W: begin
                     q8_start <= 0;
                     if (q8_done_rise) begin
+                        timeout_cnt <= 0;
                         q8_res_idx <= 0;
                         q8_res_addr <= 0;
                         if (multi_group) begin
@@ -537,6 +577,12 @@ module hp_fsm_top (
                         end else begin
                             state <= READ_RES;
                         end
+                    end else if (&timeout_cnt) begin
+                        timeout_cnt <= 0;
+                        timeout_src <= state;
+                        state <= TIMEOUT_ERROR;
+                    end else begin
+                        timeout_cnt <= timeout_cnt + 1;
                     end
                 end
 
@@ -633,6 +679,7 @@ module hp_fsm_top (
                     if (wr_wready && wr_wvalid)
                         byte_idx <= byte_idx + 1;
                     if (wr_done_rise) begin
+                        timeout_cnt <= 0;
                         reg_status[9] <= 1;
                         reg_desc_head <= reg_desc_head + 1;
                         if (next_addr != 0) begin
@@ -641,11 +688,29 @@ module hp_fsm_top (
                         end else begin
                             state <= DONE;
                         end
+                    end else if (&timeout_cnt) begin
+                        timeout_cnt <= 0;
+                        timeout_src <= state;
+                        state <= TIMEOUT_ERROR;
+                    end else begin
+                        timeout_cnt <= timeout_cnt + 1;
                     end
                 end
 
                 DONE: begin
                     reg_status[15] <= 1'b0;
+                    if (reg_start) begin
+                        reg_status[15:8] <= 0;
+                        reg_desc_head <= 0;
+                        desc_addr <= reg_desc_base;
+                        state <= FETCH_DESC;
+                    end
+                end
+
+                TIMEOUT_ERROR: begin
+                    reg_status[15] <= 1'b0;
+                    reg_act_info[4:0] <= timeout_src;  // expose source state
+                    // Stay here until reg_start re-triggers
                     if (reg_start) begin
                         reg_status[15:8] <= 0;
                         reg_desc_head <= 0;
@@ -665,16 +730,19 @@ module hp_fsm_top (
             reg_debug[22:20] <= wr_dbg_state;
             reg_debug[19:17] <= rd_dbg_state;
             reg_debug[16]    <= q8_done;
-            reg_debug[15:8]  <= wt_byte_idx[7:0];
-            reg_debug[7:0]   <= act_byte_idx[7:0];
+            reg_debug[15:12] <= col_group;
+            reg_debug[11:8]  <= sc_byte_idx[7:4];
+            reg_debug[7:0]   <= sc_byte_idx[7:0];
 
             reg_q8_debug[31:28] <= state;
             reg_q8_debug[27]    <= q8_busy;
             reg_q8_debug[26]    <= q8_done;
             reg_q8_debug[25]    <= q8_start;
             reg_q8_debug[24]    <= q8_act_we;
-            reg_q8_debug[23:16] <= q8_res_idx;
-            reg_q8_debug[15:8]  <= {copy_act_idx, q8_sc_we, sc_byte_idx[0]};
+            reg_q8_debug[23:21] <= q8_core_state;     // Q8 core's internal FSM state
+            reg_q8_debug[20:18] <= q8_core_g;         // Q8 core's bank counter
+            reg_q8_debug[17:12] <= q8_core_k;         // Q8 core's column counter
+            reg_q8_debug[11:8]  <= {copy_act_idx[1:0], q8_sc_we, sc_byte_idx[0]};
             reg_q8_debug[7:0]   <= wt_byte_idx[7:0];
         end
     end
@@ -695,7 +763,7 @@ module hp_fsm_top (
         if (!rst_n) begin
             awready_r <= 0; wready_r <= 0; bvalid_r <= 0; bresp_r <= 0;
             awaddr_r <= 0; wdata_r <= 0; aw_got <= 0; w_got <= 0;
-            reg_start <= 0; reg_desc_base <= 0; reg_desc_tail <= 0;
+            reg_start <= 0; reg_desc_base <= 0; reg_desc_tail <= 0; reg_q8_num_groups <= 0;
         end else begin
             awready_r <= 0; wready_r <= 0;
 
@@ -712,12 +780,12 @@ module hp_fsm_top (
 
             if (aw_got && w_got && !bvalid_r) begin
                 bvalid_r <= 1; bresp_r <= 0;
-                case (awaddr_r[15:0])
-                     0:       reg_start     <= wdata_r[0];
-                     16'h18:  reg_desc_base <= wdata_r;
-                     16'h1C:  reg_desc_tail <= wdata_r;
-                     16'h40:  reg_q8_num_groups <= wdata_r[3:0];
-                 endcase
+     case (awaddr_r[15:0])
+          0:       reg_start     <= wdata_r[0];
+          16'h10:  reg_q8_num_groups <= wdata_r[3:0];
+          16'h18:  reg_desc_base <= wdata_r;
+          16'h1C:  reg_desc_tail <= wdata_r;
+      endcase
                 aw_got <= 0; w_got <= 0;
             end
             if (bvalid_r && s_axil_bready) bvalid_r <= 0;
@@ -740,21 +808,21 @@ module hp_fsm_top (
                     if (s_axil_arvalid) begin
                         s_axil_arready <= 0;
                         rstate <= R_DATA;
-                        case (s_axil_araddr)
-                            0:       s_axil_rdata <= {28'h0, reg_start};
-                            16'h14:  s_axil_rdata <= reg_status;
-                            16'h18:  s_axil_rdata <= reg_desc_base;
-                            16'h1C:  s_axil_rdata <= reg_desc_tail;
-                            16'h20:  s_axil_rdata <= reg_desc_head;
-                            16'h28:  s_axil_rdata <= reg_debug;
-                            16'h2C:  s_axil_rdata <= reg_clk_cnt;
-                            16'h30:  s_axil_rdata <= reg_clk_cnt_slow;
-                            16'h34:  s_axil_rdata <= reg_act_info;
-                            16'h38:  s_axil_rdata <= reg_desc_info;
-                     16'h3C:  s_axil_rdata <= reg_q8_debug;
-                     16'h40:  s_axil_rdata <= {28'h0, reg_q8_num_groups};
-                             default: s_axil_rdata <= 32'h0;
-                        endcase
+                     case (s_axil_araddr)
+                         0:       s_axil_rdata <= {28'h0, reg_start};
+                         16'h10:  s_axil_rdata <= {28'h0, reg_q8_num_groups};
+                         16'h14:  s_axil_rdata <= reg_status;
+                         16'h18:  s_axil_rdata <= reg_desc_base;
+                         16'h1C:  s_axil_rdata <= reg_desc_tail;
+                         16'h20:  s_axil_rdata <= reg_desc_head;
+                         16'h28:  s_axil_rdata <= reg_debug;
+                         16'h2C:  s_axil_rdata <= reg_clk_cnt;
+                         16'h30:  s_axil_rdata <= reg_clk_cnt_slow;
+                         16'h34:  s_axil_rdata <= reg_act_info;
+                         16'h38:  s_axil_rdata <= reg_desc_info;
+                  16'h3C:  s_axil_rdata <= reg_q8_debug;
+                          default: s_axil_rdata <= 32'h0;
+                     endcase
                     end
                 end
                 R_DATA: begin

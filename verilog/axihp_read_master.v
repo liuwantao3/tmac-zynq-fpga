@@ -14,6 +14,8 @@ module axihp_read_master (
     output reg          done,
     output reg          busy,
     output wire [2:0]   dbg_state,
+    output wire [7:0]   dbg_beat_cnt,
+    output wire [1:0]   dbg_buf_idx,
 
     output wire [7:0]   data_out,
     output reg          data_valid,
@@ -49,6 +51,8 @@ module axihp_read_master (
 
     assign data_out = rdata_hold[{buf_idx, 3'b0} +: 8];
     assign dbg_state = state;
+    assign dbg_beat_cnt = beat_cnt;
+    assign dbg_buf_idx = buf_idx;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin

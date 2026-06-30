@@ -124,11 +124,18 @@ set hp0_seg [get_bd_addr_segs -of_objects [get_bd_intf_pins ps7/S_AXI_HP0]]
 puts "GP0 slave seg: $gp0_seg"
 puts "HP0 slave seg: $hp0_seg"
 
-# GP0: CPU→PL control registers at 0x43C00000
-create_bd_addr_seg -range 64K -offset 0x43C00000 \
-    [get_bd_addr_spaces ps7/Data] \
-    $gp0_seg \
-    SEG_axi_hp_top_ctrl
+# Check if gp0_seg is valid; if not, get the segment by path
+if {$gp0_seg eq ""} {
+    set gp0_seg [get_bd_addr_segs -quiet {axi_hp_top/S_AXI/reg0}]
+    puts "GP0 seg from path: $gp0_seg"
+}
+
+# GP0: CPU→PL control registers at 0x43C00000 (64K range)
+if {$gp0_seg ne ""} {
+    assign_bd_address -offset 0x43C00000 -range 64K $gp0_seg
+} else {
+    puts "ERROR: cannot find GP0 address segment"
+}
 
 # HP0: PL→DDR at 0x00000000 (256 MB)
 create_bd_addr_seg -range 0x20000000 -offset 0x00000000 \
