@@ -87,6 +87,14 @@ module matmul_q8_core (
 
     assign res_dout = acc[res_addr];
 
+`ifdef __ICARUS__
+    integer _init_i;
+    initial begin
+        for (_init_i = 0; _init_i < 512; _init_i = _init_i + 1) wmem[_init_i] = 0;
+        for (_init_i = 0; _init_i < 64; _init_i = _init_i + 1) acc[_init_i] = 0;
+    end
+`endif
+
     // ======================================================================
     // Pipeline registers (4-stage)
     //   Stage 0: address BRAM, read act + scales

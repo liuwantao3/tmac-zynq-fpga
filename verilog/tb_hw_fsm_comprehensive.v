@@ -157,7 +157,7 @@ module tb_hw_fsm_comprehensive;
         ddr_write32(desc_addr + 4,  32'h00000000);
         ddr_write32(desc_addr + 8,  act_addr);
         ddr_write32(desc_addr + 12, res_addr);
-        ddr_write32(desc_addr + 16, 32'h00000000);
+        ddr_write32(desc_addr + 16, 32'h0000000F);  // tensor_type=15 (CPU_OP)
         ddr_write32(desc_addr + 20, 32'h00000000);
         ddr_write32(desc_addr + 24, {8'h00, act_bytes});
         ddr_write32(desc_addr + 28, 32'h00000000);
@@ -277,6 +277,8 @@ module tb_hw_fsm_comprehensive;
     endtask
 
     initial begin
+        $dumpfile("tb_hw_fsm_comprehensive.vcd");
+        $dumpvars(0, tb_hw_fsm_comprehensive);
         $display("==============================================");
         $display("  HP FSM Comprehensive Test Suite (7 tests)");
         $display("==============================================");

@@ -185,6 +185,7 @@ module hp_fsm_top (
     reg        q8_start;
     reg        q8_wt_we;
     reg [11:0] q8_wt_addr;
+    reg [7:0]  q8_wt_din;
     reg        q8_sc_we;
     reg [6:0]  q8_sc_addr;
     reg [15:0] q8_sc_din;
@@ -197,7 +198,7 @@ module hp_fsm_top (
         .clk(clk), .rst_n(rst_n),
         .start(q8_start), .op_vecmul(1'b1),
         .done(q8_done), .busy(q8_busy),
-        .wt_we(q8_wt_we), .wt_addr(q8_wt_addr), .wt_din(rd_data),
+        .wt_we(q8_wt_we), .wt_addr(q8_wt_addr), .wt_din(q8_wt_din),
         .sc_we(q8_sc_we), .sc_addr(q8_sc_addr), .sc_din(q8_sc_din),
         .act_we(q8_act_we), .act_addr(q8_act_addr), .act_din(q8_act_din),
         .res_addr(q8_res_addr), .res_dout(q8_res_dout)
@@ -304,6 +305,7 @@ module hp_fsm_top (
             q8_start <= 0;
             q8_wt_we <= 0;
             q8_wt_addr <= 0;
+            q8_wt_din <= 0;
             q8_sc_we <= 0;
             q8_sc_addr <= 0;
             q8_sc_din <= 0;
@@ -445,6 +447,7 @@ module hp_fsm_top (
                     rd_ready <= rd_valid;
                     q8_wt_we <= rd_valid;
                     q8_wt_addr <= wt_byte_idx[11:0];
+                    q8_wt_din <= rd_data;    // register data to align with we/addr (1-cycle NBA offset)
                     if (rd_valid && rd_ready) begin
                         wt_byte_idx <= wt_byte_idx + 1;
                     end
@@ -530,7 +533,6 @@ module hp_fsm_top (
                         q8_res_idx <= 0;
                         q8_res_addr <= 0;
                         if (multi_group) begin
-                            col_group <= 0;
                             state <= READ_RES_ACC;
                         end else begin
                             state <= READ_RES;
@@ -575,7 +577,7 @@ module hp_fsm_top (
                             sc_remaining <= 256;
                             sc_byte_idx <= 0;
                             act_byte_idx <= 0;
-                            act_remaining <= 128;
+                            act_remaining <= act_total_bytes;
                             sc_din_lo <= 0;
                             state <= LOAD_SCALES;
                         end

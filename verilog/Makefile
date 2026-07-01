@@ -93,7 +93,7 @@ sim_cosim_q5_0: $(COSIM_Q5_0_SRC)
 # ---- HP FSM comprehensive test (7 test cases) ----
 HPFSM_TOP = tb_hw_fsm_comprehensive
 HPFSM_SRC = tb_hw_fsm_comprehensive.v ../vivado_integration/rtl/hp_fsm_top.v \
-             axihp_read_master.v axihp_write_master.v
+             axihp_read_master.v axihp_write_master.v matmul_q8_core.v
 
 sim_hpfsm: $(HPFSM_SRC)
 	$(IVERILOG) $(FLAGS) -o $(HPFSM_TOP).vvp $(HPFSM_SRC)
