@@ -42,11 +42,13 @@ Qwen2-0.5B FPGA accelerator targeting Zynq 7010. Quad-core Verilog RTL: INT16×I
 
 10. **Cleanup (2026-06-27)** — Removed all intermediate debug artifacts: deprecated RTL (`matmul_q4k_64x896_core.v`, `matmul_top_int16.v`, `matmul_top_int16_only.v`, `top_smoke.v`, `axi_hp_int16_top.v`, `axi_wrap_int16.v`, `hp_loopback_top.v`), superseded testbenches (all `tb_hp_*.v` variants), debug scripts (`run_hp_fsm_test.tcl`, `run_hp_loopback.tcl`, `run_hp.tcl`, etc.), CPU debug code (`hp_test.c`, `enable_afi.S`), Vivado `.Xil/` cache, build artifacts (`.vvp`, `.vcd`, `.jou`, `.log`). Only current RTL sources, testbenches listed in the Makefile, and the comprehensive test script were kept.
 
-11. **Q8 multi-group 64×896 tile (2026-06-28)** — `hp_fsm_top.v` extended with column-group iteration to support full 64×896 tile (14 groups of 64 columns each). Added `acc_buf[0:63]` (64×48-bit running accumulator), `col_group` counter, two new FSM states `READ_RES_ACC(16)` and `COPY_ACC_TO_BUF(17)`, and `reg_q8_num_groups` register at 0x40. First group stores directly; subsequent groups accumulate; after final group, `COPY_ACC_TO_BUF` transfers acc_buf to act_buf for DDR writeback.
+11. **Q8 multi-group 64×896 tile (2026-06-28)** — `hp_fsm_top.v` extended with column-group iteration to support full 64×896 tile (14 groups of 64 columns each). Added `acc_buf[0:63]` (64×48-bit running accumulator), `col_group` counter, two new FSM states `READ_RES_ACC(16)` and `COPY_ACC_TO_BUF(17)`, and `reg_q8_num_groups` register at 0x10. First group stores directly; subsequent groups accumulate; after final group, `COPY_ACC_TO_BUF` transfers acc_buf to act_buf for DDR writeback.
+
+12. **num_groups as descriptor parameter (2026-07-02)** — Moved `q8_num_groups` from a standalone GP0 register to a per-descriptor field at descriptor offset 20 bits [3:0]. The descriptor value takes priority; the GP0 register at 0x10 is kept as a fallback (used when descriptor value = 0) for backward compatibility. Updated `write_desc` Tcl proc to accept optional `num_groups` argument.
 
 12. **Three multi-group Q8 bugs fixed (2026-07-01)** — All found via iVerilog simulation of the comprehensive test suite after multi-group RTL was added:
     - **`q8_wt_din` not registered**: `rd_data` is a combinatorial wire from the read master, while `q8_wt_we`/`q8_wt_addr` use NBA (non-blocking assignment). Without registering `q8_wt_din`, the data changed combinatorially one cycle before we/addr settled, causing byte-offset-1 writes (byteₙ+₁ written to addressₙ). Fix: added `reg [7:0] q8_wt_din` and assigned `q8_wt_din <= rd_data` alongside `q8_wt_we <= rd_valid`.
-    - **`col_group <= 0` in COMPUTE_W**: The group counter was unconditionally reset to 0 after every COMPUTE_W completion, preventing multi-group iteration from ever reaching `reg_q8_num_groups - 1`. Fix: removed `col_group <= 0` from the COMPUTE_W → READ_RES_ACC transition.
+    - **`col_group <= 0` in COMPUTE_W**: The group counter was unconditionally reset to 0 after every COMPUTE_W completion, preventing multi-group iteration from ever reaching `q8_num_groups - 1`. Fix: removed `col_group <= 0` from the COMPUTE_W → READ_RES_ACC transition.
     - **`act_remaining <= 128` in READ_RES_ACC**: A hardcoded 128-byte constant was used when re-entering the multi-group loop, instead of `act_total_bytes` from the descriptor. This broke activation loading for groups > 0. Fix: changed to `act_remaining <= act_total_bytes`.
 
     Also fixed: `tensor_type = 15` (CPU_OP) in testbench descriptor — was 0, causing FSM to enter LOAD_WEIGHT path and read X from address 0. Added `__ICARUS__` simulation-only array init in `matmul_q8_core.v` to prevent X propagation. Added `matmul_q8_core.v` to Makefile's HPFSM_SRC (missing since Q8 integration).
@@ -62,7 +64,7 @@ IDLE → LOAD_WEIGHT → LOAD_ACT → COMPUTE → DRAIN → IDLE
 ```
 IDLE → FETCH_DESC → LOAD_WEIGHT → LOAD_SCALES → LOAD_ACT → COPY_ACT_TO_CORE → COMPUTE → READ_RES/READ_RES_ACC → WRITE_RES → DONE
 ```
-For multi-group (reg_q8_num_groups > 1): COMPUTE → READ_RES_ACC loops back to LOAD_SCALES for each group (accumulating into acc_buf), then COPY_ACC_TO_BUF → WRITE_RES.
+For multi-group (q8_num_groups > 1, from descriptor): COMPUTE → READ_RES_ACC loops back to LOAD_SCALES for each group (accumulating into acc_buf), then COPY_ACC_TO_BUF → WRITE_RES.
 
 ### CPU-OP Descriptor Protocol (CPU/FPGA synchronization):
 
@@ -154,7 +156,7 @@ All cores output S24.8 fixed-point (48-bit accumulator, zero-extended to 64-bit 
 | 0x34 | `REG_ACT_INFO` | R | `act_addr` from last descriptor fetched |
 | 0x38 | `REG_DESC_INFO` | R | `{8'h0, act_total_bytes[23:0]}` from last descriptor |
 | 0x3C | `REG_Q8_DEBUG` | R | Q8 core debug word (see below) |
-| 0x40 | `REG_Q8_NUM_GROUPS` | R/W | [3:0]: number of column groups (0 or 1 = single-group, 14 = full 64×896) |
+| 0x10 | `REG_Q8_NUM_GROUPS` | R/W | [3:0]: number of column groups (fallback, used when descriptor value = 0) |
 
 **REG_DEBUG (0x28) bitfields:**
 | Bits | Field | Description |
@@ -182,6 +184,21 @@ All cores output S24.8 fixed-point (48-bit accumulator, zero-extended to 64-bit 
 | [23:16] | `q8_res_idx` | Result read index (0..63) — active during READ_RES/READ_RES_ACC |
 | [15:8] | (various) | `{copy_act_idx[2:0], q8_sc_we, sc_byte_idx[0], padding[3:0]}` — sc_byte_idx[0] toggles each scale byte pair |
 | [7:0] | `wt_byte_idx[7:0]` | Weight byte index (same as REG_DEBUG[15:8]) |
+
+### Descriptor Format (32 bytes, 8 words):
+
+| Offset | Bits | Field | Description |
+|--------|------|-------|-------------|
+| 0 | [31:0] | `next_addr` | DDR address of next descriptor (0 = end of chain) |
+| 4 | [31:0] | `weight_addr` | DDR address of Q8 weight data (4096 bytes + scales) |
+| 8 | [31:0] | `act_addr` | DDR address of activation data (16-bit ints, tile rows × cols × 2) |
+| 12 | [31:0] | `result_addr` | DDR address for result writeback (8 bytes/row) |
+| 16 | [15:0] | `tensor_type` | 15 = CPU_OP (passthrough), 0 = Q8 compute, others reserved |
+| 16 | [31:16] | (reserved) | Upper 16 bits reserved |
+| 20 | [3:0] | `num_groups` | Q8 column groups (0 = use GP0 register fallback, 1 = single, 2+ = multi) |
+| 20 | [31:4] | (reserved) | Upper 28 bits reserved |
+| 24 | [23:0] | `act_total_bytes` | Total activation bytes to read from DDR |
+| 28 | [31:0] | (reserved) | Reserved |
 
 **FSM States (REG_DEBUG[31:28] or REG_Q8_DEBUG[31:28]):**
 | Value | Name | Description |
@@ -247,7 +264,7 @@ All cores output S24.8 fixed-point (48-bit accumulator, zero-extended to 64-bit 
     - ~~Tests 1-8 PASS on hardware~~ ✅ **Done (2026-06-28)** — Q8 all-1s pattern produces all 64 rows = 64
     - ~~Multi-group column iteration (14 groups × 64 cols = 896 cols)~~ ✅ Done (2026-06-28)
      - ~~**Multi-group bug fixes (q8_wt_din, col_group, act_remaining)**~~ ✅ Done (2026-07-01) — all verified in iVerilog simulation; comprehensive test suite passes
-     - **Test 9: multi-group 64×896 tile** — build bitstream, run on hardware
+     - ~~**Test 9a: multi-group 64×128 tile (2 groups)**~~ ✅ **PASSED ON HARDWARE (2026-07-02)** — all 64 rows = 128 (64×2), 21ms. All 9 tests PASS.
 13. **Phase 3: matmul_top weight loading integration** — connect HP read master with matmul_top's weight_buf loading, run single-layer compute with all 5 cores.
 
 ## Build & Run Commands
@@ -364,7 +381,7 @@ python3 scripts/extract_tmac.py models/qwen2-0_5b-instruct-q4_k_m.gguf /tmp/mode
 - **Testbench fix: wait_done polls HEAD instead of STATUS bits** — cumulative STATUS bits (rd_done/wr_done) stay set across descriptors, causing premature exit in chain tests. Fixed by polling HEAD register.
 - **ACP** 🔄 Not needed — HP works reliably when PS7 is freshly initialized
 - **Phase 1 complete — HP descriptor-chain DMA proven on hardware** across all edge cases (min/max sizes, chains, restart). Ready for Phase 2: Q8 compute integration.
-- **Phase 2 (Q8 compute)** ✅ **Tests 1-8 on hardware** (2026-06-28) — Q8 pipeline timing fix (WNS +0.550), sc_byte_idx reset bug fixed, all-1s pattern produces correct 64×64 result. Multi-group iteration implemented, three bugs fixed in simulation (2026-07-01), pending hardware test.
+- **Phase 2 (Q8 compute)** ✅ **ALL 9 TESTS PASS ON HARDWARE (2026-07-02)** — Q8 pipeline timing fix (WNS +0.550), sc_byte_idx reset bug fixed, all-1s pattern. Three bugs fixed (q8_wt_din reg, col_group init, act_remaining). Test 9a multi-group 2-group 64×128 tile PASS (all 64 rows = 128). Phase 2 complete.
 
 ### Critical: ps7_init re-execution hang
 `ps7_pll_init_data_3_0` **hangs if PLLs are already configured** from a prior session. The PLL reset sequence (bypass→power-down→reset→wait-for-lock) can't re-lock when the PLLs are already locked from a previous session. This leaves the PS7 in a partially-configured state and all subsequent ps7_init attempts also hang (DDR init's `mask_poll 0xF8000B74 0x00002000` waits for calibration that depends on PLL clock).
@@ -497,7 +514,7 @@ Three bugs in the multi-group Q8 iteration were found and fixed during iVerilog 
 
 1. **`q8_wt_din` not registered** — The read master's `rd_data` is a combinatorial wire, while `q8_wt_we` and `q8_wt_addr` are registered via NBA assignments. Without registering `q8_wt_din`, the data changed combinatorially one cycle before we/addr settled, writing byteₙ+₁ to addressₙ (systematic byte-offset-1 error). Fix: added `reg [7:0] q8_wt_din` and assigned `q8_wt_din <= rd_data` alongside `q8_wt_we <= rd_valid` at line 450 of `hp_fsm_top.v`.
 
-2. **`col_group <= 0` in COMPUTE_W** — The group counter was unconditionally reset to 0 after every COMPUTE_W completion, preventing multi-group iteration from ever reaching `reg_q8_num_groups - 1`. Fix: removed `col_group <= 0` from the COMPUTE_W → READ_RES_ACC transition.
+2. **`col_group <= 0` in COMPUTE_W** — The group counter was unconditionally reset to 0 after every COMPUTE_W completion, preventing multi-group iteration from ever reaching `q8_num_groups - 1`. Fix: removed `col_group <= 0` from the COMPUTE_W → READ_RES_ACC transition.
 
 3. **`act_remaining <= 128` in READ_RES_ACC** — A hardcoded 128-byte constant was left from a single-group prototype. When re-entering the multi-group loop for groups > 0, this caused activation loading to use the wrong size. Fix: changed to `act_remaining <= act_total_bytes`.
 

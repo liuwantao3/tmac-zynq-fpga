@@ -41,14 +41,15 @@ proc gp0_write {reg val} {
 
 # Write descriptor at physical addr
 # type: 15 = CPU_OP (default), 0 = Q8 compute, others = reserved
-proc write_desc {addr next_addr weight_addr act_addr res_addr bytes {tensor_type 15}} {
+# num_groups: 0 = use GP0 reg (backward compat), 1+ = Q8 column groups
+proc write_desc {addr next_addr weight_addr act_addr res_addr bytes {tensor_type 15} {num_groups 0}} {
     write32 $addr                  $next_addr   ;# bytes 0-3:  next_addr
     write32 [expr $addr + 4]       $weight_addr ;# bytes 4-7:  weight_addr
     write32 [expr $addr + 8]       $act_addr    ;# bytes 8-11: act_addr
     write32 [expr $addr + 12]      $res_addr    ;# bytes 12-15: result_addr
     # tensor_type stored as 16-bit at bytes 16-17 (little-endian)
     write32 [expr $addr + 16]      $tensor_type ;# bytes 16-19: {reserved[15:0], tensor_type}
-    write32 [expr $addr + 20]      0            ;# bytes 20-23: reserved
+    write32 [expr $addr + 20]      $num_groups  ;# bytes 20-23: {reserved[27:0], num_groups[3:0]}
     write32 [expr $addr + 24]      $bytes       ;# bytes 24-27: act_total_bytes
     write32 [expr $addr + 28]      0            ;# bytes 28-31: reserved
 }
@@ -484,14 +485,8 @@ for {set g 0} {$g < $Q9_NUM_GROUPS} {incr g} {
 # Result buffer: zero-fill 512 bytes
 zero_fill $Q9_RES_ADDR 512
 
-# Descriptor: tensor_type=0 (compute), act_total_bytes=128 (per group)
-write_desc $Q9_DESC_ADDR 0 $Q9_WEIGHT_ADDR $Q9_ACT_ADDR $Q9_RES_ADDR 128 0
-
-# Configure multi-group mode BEFORE starting
-gp0_write $REG_Q8_NUM_GROUPS $Q9_NUM_GROUPS
-after 10
-set num_groups_read [gp0_read $REG_Q8_NUM_GROUPS]
-puts "  reg_q8_num_groups written=$Q9_NUM_GROUPS readback=$num_groups_read (expect $Q9_NUM_GROUPS)"
+# Descriptor: tensor_type=0 (compute), act_total_bytes=128 (per group), num_groups=2 (multi-group)
+write_desc $Q9_DESC_ADDR 0 $Q9_WEIGHT_ADDR $Q9_ACT_ADDR $Q9_RES_ADDR 128 0 $Q9_NUM_GROUPS
 
 if {[run_chain $Q9_DESC_ADDR 1]} {
     set status [gp0_read $REG_STATUS]

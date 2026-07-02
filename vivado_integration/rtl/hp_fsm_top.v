@@ -220,6 +220,7 @@ module hp_fsm_top (
     reg [31:0] act_addr;
     reg [31:0] result_addr;
     reg [15:0] tensor_type;       // descriptor type (15=CPU_OP)
+    reg  [3:0] q8_num_groups;     // column groups from descriptor (offset 20 bits 3:0)
     reg [23:0] act_total_bytes;
     reg [23:0] act_remaining;     // bytes left to read (multi-burst tracking)
 
@@ -260,8 +261,8 @@ module hp_fsm_top (
     localparam COPY_ACC_TO_BUF = 5'd17;
     localparam TIMEOUT_ERROR  = 5'd18;
 
-    // Multi-group flag: non-zero when reg_q8_num_groups > 1
-    wire multi_group = (reg_q8_num_groups > 1);
+    // Multi-group flag: non-zero when q8_num_groups > 1 (from descriptor, fallback to GP0 reg)
+    wire multi_group = (q8_num_groups > 1);
 
     reg [4:0] state;
     reg [5:0] byte_idx;
@@ -374,6 +375,8 @@ module hp_fsm_top (
                         act_remaining  <= {desc_buf[26], desc_buf[25], desc_buf[24]};
                         reg_act_info  <= {desc_buf[11],desc_buf[10],desc_buf[9], desc_buf[8]};
                         reg_desc_info <= {8'h0, desc_buf[26], desc_buf[25], desc_buf[24]};
+                        // num_groups from descriptor byte offset 20, fallback to GP0 register
+                        q8_num_groups <= (desc_buf[20][3:0] != 0) ? desc_buf[20][3:0] : reg_q8_num_groups;
                         act_byte_idx   <= 0;
                         byte_idx       <= 0;
                         // Branch: CPU_OP → LOAD_ACT (passthrough), else → LOAD_WEIGHT (compute)
@@ -616,7 +619,7 @@ module hp_fsm_top (
                     end
                     if (q8_res_idx == 63) begin
                         q8_res_idx <= 0;
-                        if (col_group == reg_q8_num_groups - 1) begin
+                        if (col_group == q8_num_groups - 1) begin
                             copy_acc_idx <= 0;
                             state <= COPY_ACC_TO_BUF;
                         end else begin
