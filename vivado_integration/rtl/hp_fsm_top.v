@@ -485,6 +485,7 @@ module hp_fsm_top (
                             wt_remaining <= 0;
                             sc_remaining <= 256;
                             sc_byte_idx <= 0;
+                            col_group <= 0;     // reset multi-group column counter
                             state <= LOAD_SCALES;
                         end
                     end else if (&timeout_cnt) begin
@@ -731,7 +732,7 @@ module hp_fsm_top (
             reg_debug[19:17] <= rd_dbg_state;
             reg_debug[16]    <= q8_done;
             reg_debug[15:12] <= col_group;
-            reg_debug[11:8]  <= sc_byte_idx[7:4];
+            reg_debug[11:8]  <= timeout_cnt[15:12];
             reg_debug[7:0]   <= sc_byte_idx[7:0];
 
             reg_q8_debug[31:28] <= state;
