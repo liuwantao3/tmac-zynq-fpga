@@ -13,47 +13,22 @@ Qwen2-0.5B FPGA accelerator targeting Zynq 7010. Quad-core Verilog RTL: INT16×I
 | `ffn_down` (layers 0,2,4,...) | 896×4864 | Q6_K | ✅ `matmul_fpga_q6_k` | ✅ `matmul_q6_k_core.v` |
 | `ffn_down` (layers 1,3,5,...) | 896×4864 | Q4_K | ✅ `matmul_fpga_q4_k` | ✅ `matmul_q4k_core.v` (56×256 tile) |
 
-## Key Decisions (2026-05-22)
+## Key Decisions (2026-07-04)
 
-1. **Removed `matmul_q4k_2x896_core.v`** — tile [2×896] was a misunderstanding of GGUF Q4_K format. Q4_K tensor stores rows sequentially with block stride = cols/256, not contiguously by 2 rows.
+1. **Q8 core: 64-bit word write, BRAM acc banks, dequant sat removed** — Q8 core rewritten:
+   - Write port: `wt_addr[8:0]`/`wt_din[63:0]` replaces byte-lane BWE case (BRAM-friendly)
+   - Accumulator: 8× BRAM18 banks (acc_b0..acc_b7), each 512×48, banked by address[2:0]=g
+   - Dequant saturation removed: max product 127×65535=8,322,945 < 8,388,607, never saturates
+   - Pipeline: 5-stage (S0→S1a→S1b→S2a→S2b), CLEAR_ACC state for bulk BRAM clear
+   - Result: saves ~884 LUTs (384 LUTRAMs + 500 logic) vs old reg [47:0] acc[0:63]
 
-2. **Single Q4_K core with 56×256 tile** — tile = 56 rows × 256 cols = 56 blocks × 144B = 8064 bytes. Fits in 8192 weight_buf. Used for ffn_down on odd layers (1,3,5,...).
+2. **HP FSM: rd_ready <= rd_valid in LOAD_WEIGHT_W** — Fixed 0-cycle rvalid pulse: continuous `rd_ready=1` caused read master's PRESENT state to self-clear rvalid. Same delayed-handshake as LOAD_ACT_W.
 
-3. **Q5_0 tile = 8×896** — 8 rows × 896 cols = 224 blocks × 22B = 4928 bytes. Fits in 8192 weight_buf. Used for attn_q/k/o and ffn_gate/up.
+3. **Multi-group Q8: q8_wt_din reg, col_group fix, act_remaining fix** — Three bugs from multi-group (2026-07-01): unregistered wt_din (NBA timing), col_group reset in COMPUTE_W, hardcoded act_remaining in READ_RES_ACC.
 
-4. **Q6_K tile = 32×256** — 32 rows × 256 cols = 32 blocks × 210B = 6720 bytes. Fits in 8192 weight_buf. Used for ffn_down on even layers (0,2,4,...).
+4. **All 9 HW tests PASS (2026-07-04)** — Including multi-group 64×128 tile (Test 9a).
 
-5. **Q8_0 tile = 64×896** — 64 rows × 896 cols = 4100 bytes. Used for token_embd, attn_v, logits.
-
-6. **INT16 fallback** — tiles that don't fit the above paths (e.g. F32 norms, any other tensor types) fall back to `matmul_fpga_int16` which uses pure INT16×INT16 via `MatmulAccel`.
-
-7. **Vivado 2023.1** — development on Windows with Vivado 2023.1 (upgraded from 2019.2). LLVM clang 7.0 bundled with Vivado used as ARM cross-compiler (`--target=armv7a-none-eabi`). Vitis 2023.1 used for debugging/running.
-
-8. **RETRACTED: HP write path WORKS (2026-06-19)** — The earlier "HP dead" diagnosis was premature. After power-cycling the board and running clean ps7_init, the HP write completes:
-   - AFI0_CTRL=0x05 (light-weight + enable), AFI0_PART=0x44 (4R+4W)
-   - STATUS=0x1E (done + all sticky bits), DEBUG=0x0F
-   - DDR target 0x00200000 receives correct data (verified 0xA5A5A5A5 pattern)
-   
-   **Root cause of hang failures:** `ps7_pll_init_data_3_0` hangs when run on a board that already has PLLs configured from a prior session. The PLL reset sequence (bypass→disable→reset→wait-for-lock) can't complete because the PLLs are already locked. This leaves the PS7 in a partial state where ALL subsequent ps7_init attempts also hang (DDR init's `mask_poll` for calibration never completes without proper PLL clock). Recovery requires a power-cycle.
-   
-   **ACP switch not needed** — HP works reliably when PS7 is freshly initialized.
-   
-9. **M_AXI_HP declared as AXI3 (2026-06-19)** — PS7 HP ports are AXI3, not AXI4. Previous RTL declared the PL master interface as AXI4 (via default `xilinx.com:interface:aximm:1.0` protocol), causing Vivado BD to insert an `auto_pc` (AXI4→AXI3 converter). This auto_pc was hypothesized to drop R channel transactions when required AXI3 signals (ARID, WID, BID, RID) were not declared on the AXI4 interface. Fixed by adding `PROTOCOL AXI3, ID_WIDTH 6` to the interface parameter, plus AXI3-required signals: WID (6'b0), RID input, BID input.
-
-10. **Cleanup (2026-06-27)** — Removed all intermediate debug artifacts: deprecated RTL (`matmul_q4k_64x896_core.v`, `matmul_top_int16.v`, `matmul_top_int16_only.v`, `top_smoke.v`, `axi_hp_int16_top.v`, `axi_wrap_int16.v`, `hp_loopback_top.v`), superseded testbenches (all `tb_hp_*.v` variants), debug scripts (`run_hp_fsm_test.tcl`, `run_hp_loopback.tcl`, `run_hp.tcl`, etc.), CPU debug code (`hp_test.c`, `enable_afi.S`), Vivado `.Xil/` cache, build artifacts (`.vvp`, `.vcd`, `.jou`, `.log`). Only current RTL sources, testbenches listed in the Makefile, and the comprehensive test script were kept.
-
-11. **Q8 multi-group 64×896 tile (2026-06-28)** — `hp_fsm_top.v` extended with column-group iteration to support full 64×896 tile (14 groups of 64 columns each). Added `acc_buf[0:63]` (64×48-bit running accumulator), `col_group` counter, two new FSM states `READ_RES_ACC(16)` and `COPY_ACC_TO_BUF(17)`, and `reg_q8_num_groups` register at 0x10. First group stores directly; subsequent groups accumulate; after final group, `COPY_ACC_TO_BUF` transfers acc_buf to act_buf for DDR writeback.
-
-12. **num_groups as descriptor parameter (2026-07-02)** — Moved `q8_num_groups` from a standalone GP0 register to a per-descriptor field at descriptor offset 20 bits [3:0]. The descriptor value takes priority; the GP0 register at 0x10 is kept as a fallback (used when descriptor value = 0) for backward compatibility. Updated `write_desc` Tcl proc to accept optional `num_groups` argument.
-
-12. **rd_ready handshake bug in LOAD_WEIGHT_W (2026-07-04)** — The 64-bit word write change used `rd_ready <= 1` in LOAD_WEIGHT_W state, but the read master's PRESENT state sets `rvalid <= 1; if (rready) rvalid <= 0;`. With `rd_ready=1` continuously, the NBA `rvalid <= 0` always overrides `rvalid <= 1` in the same cycle, clearing the rvalid pulse to 0-width. The fix: use `rd_ready <= rd_valid` (same delayed-handshake pattern as LOAD_ACT_W) which inserts one cycle of delay, allowing PRESENT's `rvalid <= 1` to persist for one cycle before being cleared. All 9 HW tests pass.
-
-13. **Three multi-group Q8 bugs fixed (2026-07-01)** — All found via iVerilog simulation of the comprehensive test suite after multi-group RTL was added:
-    - **`q8_wt_din` not registered**: `rd_data` is a combinatorial wire from the read master, while `q8_wt_we`/`q8_wt_addr` use NBA (non-blocking assignment). Without registering `q8_wt_din`, the data changed combinatorially one cycle before we/addr settled, causing byte-offset-1 writes (byteₙ+₁ written to addressₙ). Fix: added `reg [7:0] q8_wt_din` and assigned `q8_wt_din <= rd_data` alongside `q8_wt_we <= rd_valid`.
-    - **`col_group <= 0` in COMPUTE_W**: The group counter was unconditionally reset to 0 after every COMPUTE_W completion, preventing multi-group iteration from ever reaching `q8_num_groups - 1`. Fix: removed `col_group <= 0` from the COMPUTE_W → READ_RES_ACC transition.
-    - **`act_remaining <= 128` in READ_RES_ACC**: A hardcoded 128-byte constant was used when re-entering the multi-group loop, instead of `act_total_bytes` from the descriptor. This broke activation loading for groups > 0. Fix: changed to `act_remaining <= act_total_bytes`.
-
-    Also fixed: `tensor_type = 15` (CPU_OP) in testbench descriptor — was 0, causing FSM to enter LOAD_WEIGHT path and read X from address 0. Added `__ICARUS__` simulation-only array init in `matmul_q8_core.v` to prevent X propagation. Added `matmul_q8_core.v` to Makefile's HPFSM_SRC (missing since Q8 integration).
+5. **Current build: 64.1% LUT, 7.5% BRAM, 20% DSP** — Only Q8 core + hp_fsm_top in bitstream.
 
 ## Architecture Summary
 
@@ -247,28 +222,51 @@ All cores output S24.8 fixed-point (48-bit accumulator, zero-extended to 64-bit 
 |------|------|--------|
 | None | — | All cores implemented ✅ |
 
-## Remaining Work
+## Current Status (2026-07-04)
 
-1. ~~Implement `matmul_q5_0_core.v`~~ ✅ Done
-2. ~~Implement `matmul_q6_k_core.v`~~ ✅ Done
-3. ~~Instantiate Q5_0 and Q6_K cores in `matmul_top.v`~~ ✅ Done (2026-05-27)
-4. ~~Create testbenches for Q5_0 and Q6_K cores~~ ✅ Done (2026-05-27)
-5. Vivado simulation — run with Vivado 2023.1
-6. ~~End-to-end inference test~~ ✅ Verified: all paths produce same token (11 358 3003)
-7. ~~Descriptor chain OP→OP format fix~~ ✅ Done (2026-05-27): auto-derive `act_total_bytes` from previous result when chaining
-8. **CPU boot crash (Prefetch Abort @ 0xFEBAB2B0)** — debug why CPU branches to invalid Zynq physical address before `main()`. Root cause: unknown. Abort address = 0xFEBAB2B0 (reserved range), external abort (not MMU translation — confirmed via BSP MMU disable). The abort handler falls through to `__common_startup`, creating a re-boot loop. CPU ends at PC=0x00101858 (spin loop).
-9. ~~**HP write path test**~~ ✅ PASSED — HP write works when PS7 is freshly initialized.
-10. ~~**Switch HP → ACP**~~ — NOT needed: HP write path works when PS7 is freshly initialized (see Key Decision 8 re: ps7_init hang root cause)
-11. ~~**HP FSM descriptor-chain test on hardware**~~ ✅ **Phase 1 COMPLETE (2026-06-27)** — all 7 tests passed on hardware: basic 64B, min 8B, 128B 2-burst, 256B 4-burst, chain of 2 desc, chain of 3 desc, re-start from DONE. Previous single-desc pass was on 2026-06-25.
-12. **Phase 2: Q8 compute on hardware** — integrate Q8 matmul core with HP descriptor-chain FSM
-    - ~~Q8 pipeline stage fix (split dequant/p2_partial)~~ ✅ Done (2026-06-28)
-    - ~~Build bitstream (WNS +0.550)~~ ✅ Done (2026-06-28)
-    - ~~Tests 1-8 PASS on hardware~~ ✅ **Done (2026-06-28)** — Q8 all-1s pattern produces all 64 rows = 64
-    - ~~Multi-group column iteration (14 groups × 64 cols = 896 cols)~~ ✅ Done (2026-06-28)
-     - ~~**Multi-group bug fixes (q8_wt_din, col_group, act_remaining)**~~ ✅ Done (2026-07-01) — all verified in iVerilog simulation; comprehensive test suite passes
-     - ~~**Test 9a: multi-group 64×128 tile (2 groups)**~~ ✅ **PASSED ON HARDWARE (2026-07-02)** — all 64 rows = 128 (64×2), 21ms. All 9 tests PASS.
-    - **Scale format: UQ8.8, NOT fp16 (2026-07-04)** — The Q8 dequant function in `matmul_q8_core.v:278` treats the scale as raw unsigned >> 8 (UQ8.8 format, where 0x0100 = 1.0). Tests 14/17/18 in `run_hp_fsm_extended.tcl` incorrectly used fp16 0x3C00 (= 1.0 as fp16, but raw value 15360 → dequant = 60 per column → row sum = 3840 = 0x0F00). Fixed by changing to 0x0100. The C++ simulation pipeline (`fpga_sim.hpp:1234`) also specifies UQ8.8 for scales ("combined scales UQ8.8"). The real inference pipeline must pack Q8_0 per-block fp16 scales converted to UQ8.8 before writing to DDR.
-13. **Phase 3: matmul_top weight loading integration** — connect HP read master with matmul_top's weight_buf loading, run single-layer compute with all 5 cores.
+| Resource | Used | Available | % |
+|----------|------|-----------|---|
+| Slice LUTs | 11,281 | 17,600 | 64.1 |
+| LUT as Logic | 10,534 | 17,600 | 59.9 |
+| LUT as Memory | 747 | 6,000 | 12.5 |
+| Slice Regs | 12,338 | 35,200 | 35.1 |
+| BRAM18 | 9 | 120 | 7.5 |
+| DSP48E1 | 16 | 80 | 20.0 |
+| WNS | 0.287 ns | — | OK |
+
+**Bitstream sources:** `axihp_read_master.v` + `axihp_write_master.v` + `matmul_q8_core.v` + `hp_fsm_top.v`
+
+**Hardware tests:** All 9 HP FSM tests PASS (including multi-group Q8).
+
+## Two-Track Plan
+
+### Track A: Maximize BRAM, Free LUTs
+Goal: convert all remaining LUTRAM arrays in Q8 core to BRAM banks, freeing ~1,500 LUTs.
+
+| Memory | Current | Target | BRAM18 | Saves |
+|--------|---------|--------|--------|-------|
+| wmem | 1×512×64 BRAM | 8×512×8 BRAM (one per lane) | +7 | ~200 LUTs (byte-slice mux) |
+| acc_b0..b7 | 8× BRAM18 ✅ | — | 0 | — |
+| smem | LUTRAM 128×16 8-port | 8× BRAM18 (one per lane) | +8 | ~550 LUTs |
+| act_reg | LUTRAM 64×16 1-port | 1× BRAM18 | +1 | ~32 LUTs |
+| **Total** | **9 BRAM** | **25 BRAM (12.5 tiles, 20.8%)** | **+16** | **~782 LUTs** |
+
+**Pipeline:** add PRE stage → 6-stage pipeline, DRAIN4 added. Cycles/tile: 516→518.
+
+### Track B: Wider MAC (DSP Parallelism)
+
+| Option | MACs | DSPs | LUTs | Cycles/tile |
+|--------|------|------|------|-------------|
+| Current | 8 | 16 | ~10,500 | 516 |
+| 16× col | 16 | 32 | ~13,500 | 260 |
+| 32× col | 32 | 64 | ~16,500 | 135 |
+
+### Roadmap
+1. ✅ Commit current proven baseline (19598ca)
+2. ▶ Track A: smem→BRAM, act_reg→BRAM, wmem→8×BRAM
+3. Rebuild bitstream, verify all 9 HW tests
+4. Measure actual LUT savings → decide B1 or B2
+5. Multi-core integration (Q4K/Q5_0/Q6_K/INT16) with shared BRAM weight loading
 
 ## Build & Run Commands
 
