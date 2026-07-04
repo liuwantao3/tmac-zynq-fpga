@@ -4,109 +4,153 @@
 
 Quad-core Verilog RTL: INT16×INT16 (general), Q8_0 dequant (logits), Q5_0 block decode (attn_q/k/o, ffn_gate/up), Q6_K block decode (ffn_down even), Q4_K block decode (ffn_down odd), with AXI4-Lite memory-mapped I/O.
 
-**Model**: Q4_K_M (mixed quantization). See AGENTS.md top-level for tensor types table.
+**Model**: Q4_K_M (mixed quantization). See top-level AGENTS.md for tensor types table.
 
 ## Architecture
 
-### User FSM flow (hp_fsm_top.v):
+### FSM flow (hp_fsm_top.v, 20 states):
 ```
-IDLE → FETCH_DESC → LOAD_ACT → WRITE_RES → DONE → (restart IDLE or FETCH_DESC)
+IDLE → FETCH_DESC → [tensor_type=15 ? LOAD_ACT : LOAD_WEIGHT] →
+  LOAD_WEIGHT_W → LOAD_SCALES → LOAD_SCALES_W → LOAD_ACT → LOAD_ACT_W →
+  COPY_ACT_TO_CORE → COMPUTE → COMPUTE_W →
+  [multi_group ? READ_RES_ACC(×groups) → COPY_ACC_TO_BUF : READ_RES] →
+  [act_remaining>0 ? WRITE_RES_BURST : WRITE_RES] → WRITE_RES_W → DONE
 ```
-Multi-burst HP reads: each burst capped at 64 bytes (AXI3: 16 beats × 32-bit ARSIZE=2).
+For CPU_OP (tensor_type=15): Loads activation data directly, skips weight/scales/compute.
 
 ### CPU-OP Descriptor Protocol
-Descriptor type 15 (tensor_type=15) triggers CPU interrupt. FSM pauses in `PH_CPU_OP_WAIT` until CPU completes RMSNorm/RoPE/SoftMax/SwiGLU and resumes.
+Descriptor type 15 (tensor_type=15) triggers CPU interrupt. FSM pauses until CPU completes RMSNorm/RoPE/SoftMax/SwiGLU and resumes via CHAIN_CTRL.
 
-### Descriptor Chain (32 bytes each, DDR)
-| Offset | Field | Size |
-|--------|-------|------|
-| 0x00 | next_addr | 4 |
-| 0x04 | weight_addr | 4 |
-| 0x08 | act_addr | 4 |
-| 0x0C | result_addr | 4 |
-| 0x10 | reserved | 4 |
-| 0x14 | reserved | 4 |
-| 0x18 | act_total_bytes | 4 |
-| 0x1C | reserved | 4 |
+### Descriptor Format (32 bytes, DDR)
+
+| Offset | Field | Size | Description |
+|--------|-------|------|-------------|
+| 0x00 | next_addr | 4 | Next descriptor DDR address (0 = end) |
+| 0x04 | weight_addr | 4 | Q8 weight data address (4096 bytes) |
+| 0x08 | act_addr | 4 | Activation data address |
+| 0x0C | result_addr | 4 | Result writeback address |
+| 0x10 | tensor_type | 2 | 15=CPU_OP, 0=Q8 compute, others reserved |
+| 0x12 | (reserved) | 2 | |
+| 0x14 | num_groups | 1 | Q8 column groups (0=use GP0 reg fallback) |
+| 0x15 | (reserved) | 3 | |
+| 0x18 | act_total_bytes | 4 | Total activation bytes to read |
+| 0x1C | (reserved) | 4 | |
 
 ## Register Map (hp_fsm_top, AXI4-Lite @ 0x43C00000)
 
 | Offset | Name | Access | Description |
 |--------|------|--------|-------------|
 | 0x00 | reg_start | W | Bit[0] = start (auto-clears) |
+| 0x10 | reg_q8_num_groups | R/W | [3:0] column groups (0=single) |
 | 0x14 | reg_status | R | [15]=busy, [9]=wr_done, [8]=rd_done |
-| 0x18 | reg_desc_base | R/W | Descriptor base address |
+| 0x18 | reg_desc_base | R/W | Descriptor base DDR address |
 | 0x1C | reg_desc_tail | R/W | Tail index |
 | 0x20 | reg_desc_head | R | Head index (read-only) |
-| 0x28 | reg_debug | R | [31:28]=state, [27]=rd_done, [26]=wr_done, [25]=rd_busy, [24]=wr_busy, [23:16]=act_remaining, [15:8]=rd_len, [7:0]=act_byte_idx |
-| 0x2C | reg_clk_cnt | R | Free-running clock counter |
+| 0x28 | reg_debug | R | Debug status word (see below) |
+| 0x2C | reg_clk_cnt | R | Free-running 100 MHz clock counter |
 | 0x30 | reg_clk_cnt_slow | R | Clock counter ÷ 1024 |
+| 0x34 | reg_act_info | R | act_addr from last descriptor |
+| 0x38 | reg_desc_info | R | {8'h0, act_total_bytes[23:0]} |
+| 0x3C | reg_q8_debug | R | Q8 core debug word |
 
-### FSM states: 0=IDLE, 1=FETCH_DESC, 2=FETCH_DESC_W, 3=LOAD_ACT, 4=LOAD_ACT_W, 5=WRITE_RES, 6=WRITE_RES_W, 7=DONE
+### REG_DEBUG (0x28) bitfields (RTL lines 793-804):
 
-## RTL Changes (2026-06-21)
+| Bits | Field | Description |
+|------|-------|-------------|
+| [31:27] | state | FSM state (5-bit, 0-19) |
+| [26] | rd_done | HP read master done (sticky) |
+| [25] | wr_done | HP write master done (sticky) |
+| [24] | rd_busy | HP read master busy |
+| [23] | wr_busy | HP write master busy |
+| [22] | q8_busy | Q8 core busy |
+| [21:19] | wr_dbg_state | Write master FSM state (3-bit) |
+| [18:16] | rd_dbg_state | Read master FSM state (3-bit) |
+| [15] | q8_done | Q8 core done |
+| [14:11] | col_group | Current column group (multi-group) |
+| [10:8] | timeout_cnt[15:13] | Timeout counter upper bits |
+| [7:0] | sc_byte_idx | Scale byte index |
 
-1. **DONE→FETCH_DESC restart** (`hp_fsm_top.v`): DONE state checks `reg_start` and transitions to FETCH_DESC, clearing `reg_status[15:8]`. Enables chain restart without bitstream reload.
+### REG_Q8_DEBUG (0x3C) bitfields (RTL lines 806-815):
 
-2. **rd_len wrap guard** (`hp_fsm_top.v`): `(act_remaining >> 2) - 1` underflows when `act_remaining < 4` (produces rd_len=0xFF). Fixed with `>=4` / `>0` / `==0` branches. Prevents ARLEN=255 (PS7 AXI3 rejects >16 beats).
+| Bits | Field | Description |
+|------|-------|-------------|
+| [31:27] | state | FSM state (5-bit) |
+| [26] | q8_busy | Q8 core busy |
+| [25] | q8_done | Q8 core done (pulse) |
+| [24] | q8_start | Q8 core start (pulse) |
+| [23] | q8_act_we | Q8 activation write enable |
+| [22:20] | q8_core_state | Q8 core internal FSM state |
+| [19:17] | q8_core_g | Q8 core bank counter |
+| [16:11] | q8_core_k | Q8 core column counter |
+| [10:7] | misc | {copy_act_idx[1:0], q8_sc_we, sc_byte_idx[0]} |
+| [6:0] | wt_byte_idx[6:0] | Weight byte index |
 
-3. **Debug register always live**: `reg_debug[31:0]` continuously shows FSM state, rd/wr status, act_remaining, rd_len, byte_idx — not just latched.
+### FSM States (REG_DEBUG[31:27]):
+
+| Value | State | Description |
+|-------|-------|-------------|
+| 0 | IDLE | Waiting for reg_start |
+| 1 | FETCH_DESC | Reading descriptor from DDR |
+| 2 | FETCH_DESC_W | Draining descriptor read |
+| 3 | LOAD_ACT | Starting HP read for activation data |
+| 4 | LOAD_ACT_W | Draining act data into act_buf |
+| 5 | WRITE_RES | Starting HP write for result |
+| 6 | WRITE_RES_W | Draining HP write |
+| 7 | DONE | Chain complete |
+| 8 | LOAD_WEIGHT | Starting HP read for Q8 weights |
+| 9 | LOAD_WEIGHT_W | Draining weight data into wmem |
+| 10 | LOAD_SCALES | Starting HP read for scales |
+| 11 | LOAD_SCALES_W | Draining + packing scales into smem |
+| 12 | COPY_ACT_TO_CORE | Copying act_buf to Q8 act_reg |
+| 13 | COMPUTE | Pulsing q8_start |
+| 14 | COMPUTE_W | Waiting for Q8 core done |
+| 15 | READ_RES | Reading Q8 results into act_buf (single-group) |
+| 16 | READ_RES_ACC | Reading + accumulating (multi-group) |
+| 17 | COPY_ACC_TO_BUF | Copying acc_buf to act_buf |
+| 18 | TIMEOUT_ERROR | Timeout waiting for rd/wr/q8 done |
+| 19 | WRITE_RES_BURST | Multi-burst result write |
 
 ## Key Hardware Findings
 
-- **PS7 HP0 is AXI3**: max 16 beats per burst. ARLEN > 15 causes silent AR rejection (no ARREADY).
-- **HP0 is 32-bit** on Zynq-7010 (x16 DDR3): `AFI0_CTRL[7:6]` (64-bit enable) is read-only. RDATA[63:32] always 0.
-- **ps7_init hangs on re-run**: `ps7_pll_init_data_3_0` can't re-lock already-configured PLLs. Power-cycle required.
-- **`rst -processor` corrupts DAP**: irreversibly until power-cycle. Always use `stop` instead.
-- **FCLK_CLK0 enable**: DAP can't set `FPGA_CLK_CTRL[7]`. ARM boot code workaround (load to 0x00000000, wrpc, con, stop).
+- **PS7 HP0 is AXI3**: max 16 beats per burst. ARLEN > 15 causes silent AR rejection.
+- **HP0 is 32-bit** on Zynq-7010 (x16 DDR3): RDATA[63:32] always 0.
+- **ps7_init hangs on re-run**: PLLs can't re-lock if already configured. Power-cycle required.
+- **`rst -processor` corrupts DAP**: irreversibly. Use `stop` instead.
+- **FCLK_CLK0 enable**: DAP can't set FPGA_CLK_CTRL[7]. ARM boot code workaround required.
 
 ## Build Commands
 
 ```bash
-# Proj build
+# Vivado batch build
 C:\Xilinx\Vivado\2023.1\bin\vivado.bat -mode batch -source vivado_integration/build_bd.tcl
 
-# Test run (after power-cycle)
-C:\Xilinx\Vivado\2023.1\bin\xsdb.bat vivado_integration/sw/run_hp_fsm_test.tcl
+# Hardware test (after power-cycle)
+C:\Xilinx\Vivado\2023.1\bin\xsdb.bat vivado_integration/sw/run_hp_fsm_comprehensive.tcl
 
-# Verilog simulation (iVerilog — d:\iVerilog\bin)
+# Verilog simulation
 make -C verilog all
 
-# Vivado xsim (C:\Xilinx\Vivado\2023.1\bin\xsim.bat)
-xsim tb_hw_fsm --runall
+# Vivado xsim
+C:\Xilinx\Vivado\2023.1\bin\xsim.bat tb_hw_fsm --runall
 ```
-
-## Test Scripts (vivado_integration/sw/)
-
-See `docs/test_infrastructure.md` for full catalog. Key scripts:
-- `run_hp_loopback.tcl` — HP read+write loopback (proven on hw)
-- `run_hp_fsm_test.tcl` — Descriptor chain FSM test
-- `test_multiburst.tcl` — Multi-burst HP read test (in temp dir)
 
 ## File Inventory
 
 ### Verilog RTL
-- `verilog/matmul_q8_core.v` — Q8_0 compute: 512×64 wmem, dequant LUT, 3-stage FSM
+- `verilog/matmul_q8_core.v` — Q8_0 compute: 8×BRAM18 wmem+banks, 6-stage pipeline, 524 cycles/tile
 - `verilog/matmul_q4k_core.v` — Q4_K: 2304-byte block buffer, S24.8, 56×256 tile
 - `verilog/matmul_q5_0_core.v` — Q5_0: 8×896 tile, 224 blocks, row_scale normalization
 - `verilog/matmul_q6_k_core.v` — Q6_K: 32×256 tile, super_scale + sub-block scales
 - `verilog/matmul_int16_core.v` — INT16×INT16: 512×128 wmem, 3-stage FSM
-- `vivado_integration/rtl/hp_fsm_top.v` — Top FSM: AXI4-Lite, HP read/write masters, descriptor chain, multi-burst
-- `vivado_integration/rtl/hp_loopback_top.v` — HP loopback test module
+- `vivado_integration/rtl/hp_fsm_top.v` — Top FSM: AXI4-Lite, HP read/write masters, descriptor chain, Q8 compute integration
 
 ### C++ Simulation
 - `sim/tmac_gguf.cpp` — Full inference pipeline, FPGA dispatch
 - `sim/fpga_sim.hpp` — MatmulAccel, decode logic
 - `sim/test_integration.cpp` — Integration tests
 
-### Documentation
-- `docs/test_infrastructure.md` — Register maps, script catalog, standardized flows
-- `docs/debug_procedures.md` — XSDB reference, DAP error recovery, FSM debug
-- `verilog/DESIGN.md` — Verilog architecture and timing
-- `docs/architecture.md` — Model and quantization formats
+## Test Status (2026-07-05)
 
-## Pending
-
-- **Verify multi-burst rd_len fix on hardware** — bitstream rebuilt, needs power-cycle + test
-- **CPU boot crash (Prefetch Abort @ 0xFEBAB2B0)** — blocked until HP path verified
-- End-to-end inference with all 5 compute cores
+All 9 HP FSM HW tests PASS (7 baseline DMA + 1 Q8 single-group + 1 Q8 multi-group).
+Track A BRAM conversion: 7,769 LUTs (44.1%), 17 BRAM18 (14.2%), 16 DSP (20%).
+WNS = 0.601 ns at 100 MHz.

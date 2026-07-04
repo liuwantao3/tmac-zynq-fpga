@@ -13,29 +13,28 @@ Qwen2-0.5B FPGA accelerator targeting Zynq 7010. Quad-core Verilog RTL: INT16×I
 | `ffn_down` (layers 0,2,4,...) | 896×4864 | Q6_K | ✅ `matmul_fpga_q6_k` | ✅ `matmul_q6_k_core.v` |
 | `ffn_down` (layers 1,3,5,...) | 896×4864 | Q4_K | ✅ `matmul_fpga_q4_k` | ✅ `matmul_q4k_core.v` (56×256 tile) |
 
-## Key Decisions (2026-07-04)
+## Key Decisions (2026-07-05)
 
-1. **Q8 core: 64-bit word write, BRAM acc banks, dequant sat removed** — Q8 core rewritten:
+1. **TB `wr` task: `input integer din` truncates 64-bit weight word** — Found: `tb_matmul_q8.v` declared `wr(input integer we, addr, din)` where `integer` is 32-bit signed. Passing `word = {8{val}}` (64-bit) truncated upper 32 bits, causing banks 4-7 to receive 0x00 for positive weights (all rows 4-7 = 0). Test 6 (wt=-1=0xFF) worked because sign-extension filled upper 32 bits with 1s. Fix: `input [63:0] din`. All 6 Q8 tests now PASS.
+
+2. **Break statements removed from cosim testbenches** — `tb_cosim.v`, `tb_cosim_q4k.v`, `tb_cosim_q5_0.v`, `tb_cosim_q6_k.v` used unsupported `break` in Verilog for-loop wait loops. Replaced with `poll_count` flag loop condition.
+
+3. **Q8 core: 64-bit word write, BRAM acc banks, dequant sat removed** — Q8 core rewritten:
    - Write port: `wt_addr[8:0]`/`wt_din[63:0]` replaces byte-lane BWE case (BRAM-friendly)
    - Accumulator: 8× BRAM18 banks (acc_b0..acc_b7), each 512×48, banked by address[2:0]=g
    - Dequant saturation removed: max product 127×65535=8,322,945 < 8,388,607, never saturates
-   - Pipeline: 5-stage (S0→S1a→S1b→S2a→S2b), CLEAR_ACC state for bulk BRAM clear
+   - Pipeline: 6-stage (PRE→S0→S1a→S1b→S2a→S2b), CLEAR_ACC state for bulk BRAM clear
    - Result: saves ~884 LUTs (384 LUTRAMs + 500 logic) vs old reg [47:0] acc[0:63]
 
-2. **HP FSM: rd_ready <= rd_valid in LOAD_WEIGHT_W** — Fixed 0-cycle rvalid pulse: continuous `rd_ready=1` caused read master's PRESENT state to self-clear rvalid. Same delayed-handshake as LOAD_ACT_W.
+4. **HP FSM: rd_ready <= rd_valid in LOAD_WEIGHT_W** — Fixed 0-cycle rvalid pulse: continuous `rd_ready=1` caused read master's PRESENT state to self-clear rvalid. Same delayed-handshake as LOAD_ACT_W.
 
-3. **Multi-group Q8: q8_wt_din reg, col_group fix, act_remaining fix** — Three bugs from multi-group (2026-07-01): unregistered wt_din (NBA timing), col_group reset in COMPUTE_W, hardcoded act_remaining in READ_RES_ACC.
+5. **Multi-group Q8: q8_wt_din reg, col_group fix, act_remaining fix** — Three bugs from multi-group (2026-07-01): unregistered wt_din (NBA timing), col_group reset in COMPUTE_W, hardcoded act_remaining in READ_RES_ACC.
 
-4. **All 9 HW tests PASS (2026-07-04)** — Including multi-group 64×128 tile (Test 9a).
+6. **All core unit tests PASS (2026-07-05):** Q8 6/6, Q4K 4/4, Q5_0 32/32, Q6_K 97/97, HP FSM 7/7. INT16 smoke pre-existing failure (unrelated wmem addressing).
 
-5. **Current build: 64.1% LUT, 7.5% BRAM, 20% DSP** — Only Q8 core + hp_fsm_top in bitstream.
+7. **Track A BRAM conversion complete (2026-07-05):** All LUTRAM arrays converted to BRAM — 7,769 LUTs (44.1%), 17 BRAM18 (14.2%), 16 DSP (20%). WNS=0.601ns. All 9 HW tests PASS.
 
 ## Architecture Summary
-
-### User FSM flow (matmul_top.v):
-```
-IDLE → LOAD_WEIGHT → LOAD_ACT → COMPUTE → DRAIN → IDLE
-```
 
 ### HP FSM flow (hp_fsm_top.v, Q8 compute path):
 ```
@@ -222,55 +221,58 @@ All cores output S24.8 fixed-point (48-bit accumulator, zero-extended to 64-bit 
 |------|------|--------|
 | None | — | All cores implemented ✅ |
 
-## Current Status (2026-07-04)
+## Current Status (2026-07-05) — After Track A BRAM Conversion
 
-| Resource | Used | Available | % |
-|----------|------|-----------|---|
-| Slice LUTs | 11,281 | 17,600 | 64.1 |
-| LUT as Logic | 10,534 | 17,600 | 59.9 |
-| LUT as Memory | 747 | 6,000 | 12.5 |
-| Slice Regs | 12,338 | 35,200 | 35.1 |
-| BRAM18 | 9 | 120 | 7.5 |
-| DSP48E1 | 16 | 80 | 20.0 |
-| WNS | 0.287 ns | — | OK |
+| Resource | Used | Available | % | Delta vs 2026-07-04 |
+|----------|------|-----------|---|-------------------|
+| Slice LUTs | **7,769** | 17,600 | **44.1** | -3,512 (31%) |
+| LUT as Logic | **7,710** | 17,600 | **43.8** | -2,824 |
+| LUT as Memory | **59** | 6,000 | **0.98** | -688 (92%) |
+| Slice Regs | 12,293 | 35,200 | 34.9 | -45 |
+| BRAM18 | **17** | 120 | **14.2** | +8 |
+| DSP48E1 | 16 | 80 | 20.0 | 0 |
+| **WNS** | **0.601 ns** | 10 ns | OK | +0.314 |
 
 **Bitstream sources:** `axihp_read_master.v` + `axihp_write_master.v` + `matmul_q8_core.v` + `hp_fsm_top.v`
 
-**Hardware tests:** All 9 HP FSM tests PASS (including multi-group Q8).
+**Hardware tests:** All 9 HP FSM tests PASS (including multi-group Q8). Track A achieved 3,512 LUTs freed (31% reduction), 92% of memory LUTs eliminated, and timing improved from WNS 0.287ns to 0.601ns.
 
 ## Two-Track Plan
 
-### Track A: Maximize BRAM, Free LUTs
-Goal: convert all remaining LUTRAM arrays in Q8 core to BRAM banks, freeing ~1,500 LUTs.
+### Track A: BRAM Conversion ✅ COMPLETE (2026-07-05)
+All LUTRAM arrays in Q8 core converted to BRAM banks. Results:
 
-| Memory | Current | Target | BRAM18 | Saves |
-|--------|---------|--------|--------|-------|
-| wmem | 1×512×64 BRAM | 8×512×8 BRAM (one per lane) | +7 | ~200 LUTs (byte-slice mux) |
-| acc_b0..b7 | 8× BRAM18 ✅ | — | 0 | — |
-| smem | LUTRAM 128×16 8-port | 8× BRAM18 (one per lane) | +8 | ~550 LUTs |
-| act_reg | LUTRAM 64×16 1-port | 1× BRAM18 | +1 | ~32 LUTs |
-| **Total** | **9 BRAM** | **25 BRAM (12.5 tiles, 20.8%)** | **+16** | **~782 LUTs** |
+| Memory | Before | After | BRAM18 Delta |
+|--------|--------|-------|-------------|
+| wmem | 1×512×64 BRAM | 8×512×8 BRAM | +7 (packed) |
+| acc | 8× BRAM18 | 8× BRAM18 | 0 |
+| smem | LUTRAM 128×16 | BRAM18 | +1 (packed) |
+| act_reg | LUTRAM 64×16 | BRAM18 | 0 (packed) |
+| **Total** | **9 BRAM** | **17 BRAM** | **+8** |
 
-**Pipeline:** add PRE stage → 6-stage pipeline, DRAIN4 added. Cycles/tile: 516→518.
+Savings: 3,512 LUTs (31%), 688 LUTRAM (92%), timing +0.314ns.
 
 ### Track B: Wider MAC (DSP Parallelism)
 
 | Option | MACs | DSPs | LUTs | Cycles/tile |
 |--------|------|------|------|-------------|
-| Current | 8 | 16 | ~10,500 | 516 |
-| 16× col | 16 | 32 | ~13,500 | 260 |
-| 32× col | 32 | 64 | ~16,500 | 135 |
+| Current | 8 | 16 | 7,769 | 524 |
+| 16× col | 16 | 32 | ~10,500 | 260 |
+| 32× col | 32 | 64 | ~14,000 | 135 |
 
 ### Roadmap
-1. ✅ Commit current proven baseline (19598ca)
-2. ▶ Track A: smem→BRAM, act_reg→BRAM, wmem→8×BRAM
-3. Rebuild bitstream, verify all 9 HW tests
-4. Measure actual LUT savings → decide B1 or B2
-5. Multi-core integration (Q4K/Q5_0/Q6_K/INT16) with shared BRAM weight loading
+1. ✅ Q8 BRAM-acc baseline: all core unit tests PASS (Q8 6/6, Q4K 4/4, Q5_0 32/32, Q6_K 97/97, HP FSM 7/7)
+2. ✅ Track A: smem→BRAM, act_reg→BRAM, wmem→8×BRAM (6-stage pipeline proven)
+3. ✅ Rebuild bitstream, verify all 9 HW tests — ALL PASS
+4. ✅ Measured: 3,512 LUTs saved (31%), 688 LUTRAM (92%), WNS 0.601ns
+5. ▶ Multi-core integration (Q4K/Q5_0/Q6_K/INT16) with shared BRAM weight loading
 
 ## Build & Run Commands
 
 ```bash
+# PATH setup
+$env:Path = "D:\Program Files\Git\bin;$env:Path"   # git
+
 # Verilog tests (iVerilog — d:\iVerilog\bin)
 make -C verilog all                     # Q8 + Q4K + Q5_0 + INT16 smoke
 
@@ -315,7 +317,7 @@ python3 scripts/extract_tmac.py models/qwen2-0_5b-instruct-q4_k_m.gguf /tmp/mode
 
 ### Verilog RTL
 - `verilog/matmul_top.v` — Quad-core top: AXI4-Lite slave (inline, replaces orphan axilite_slave.v), 8192-byte weight_buf, loading FSM, mode mux (Q8/Q4K/Q5_0/Q6_K/INT16)
-- `verilog/matmul_q8_core.v` — Q8_0 compute core: 512×64-bit wmem, dequant LUT, 3-stage FSM
+- `verilog/matmul_q8_core.v` — Q8_0 compute core: 8×512×8 wmem (BRAM banks), dequant LUT, 6-stage pipeline
 - `verilog/matmul_q4k_core.v` — Q4_K block decode: 2304-byte block buffer, S24.8 fixed-point, 56×256 tile
 - `verilog/matmul_q5_0_core.v` — Q5_0 block decode: 8×896 tile, 224 blocks/tile, row_scale normalization
 - `verilog/matmul_q6_k_core.v` — Q6_K block decode: 32×256 tile, 32 blocks/tile, super_scale + per-sub-block scales

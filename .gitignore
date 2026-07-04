@@ -33,11 +33,15 @@ vivado/*.str
 
 # Vivado projects & logs (any location)
 .Xil/
+.Xil/Vivado-*/
 **/proj_synth*/
 matmul_proj/
 vivado_*.jou
 vivado_*.backup.jou
 vivado.jou
+webtalk*
+*.xml
+*.html
 
 # Vivado local test files
 verilog/matmul_top_int16_only.v

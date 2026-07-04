@@ -152,13 +152,10 @@ module tb_cosim;
             @(negedge clk); start <= 0;
 
             // ---- Wait for done (poll with timeout) ----
-            poll_count = 0;
-            for (i = 0; i < 2000; i = i + 1) begin
-                if (done) begin
-                    poll_count = i;
-                    break;
-                end
+            poll_count = 2000;
+            for (i = 0; i < 2000 && poll_count == 2000; i = i + 1) begin
                 @(posedge clk);
+                if (done) poll_count = i + 1;
             end
 
             // ---- Read and compare results ----

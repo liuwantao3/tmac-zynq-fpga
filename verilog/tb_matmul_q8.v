@@ -44,7 +44,7 @@ module tb_matmul_q8;
 
     integer i, row, col, errors, total;
 
-    task wr(input integer we, addr, din);
+    task wr(input integer we, addr, input [63:0] din);
         begin
             @(negedge clk);
             if (we == 0) begin wt_we <= 1; wt_addr <= addr; wt_din <= din; end
@@ -84,8 +84,7 @@ module tb_matmul_q8;
         begin
             @(negedge clk); start <= 1;
             @(negedge clk); start <= 0;
-            for (i = 0; i < 2000; i = i + 1) begin
-                if (done) break;
+            for (i = 0; i < 2000 && !done; i = i + 1) begin
                 @(posedge clk);
             end
             if (i >= 2000) $display("  TIMEOUT");

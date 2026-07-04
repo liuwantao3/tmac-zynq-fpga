@@ -187,35 +187,37 @@ Expected after HP operation: `0x0F` = all FIFO status OK.
 
 ## FSM State Debug via DEBUG Register
 
-The DEBUG register (0x28) exposes live FSM state. When the FSM hangs, decode it:
+The DEBUG register (0x28) exposes live FSM state (RTL hp_fsm_top.v:793-804). When the FSM hangs, decode it:
 
 ```tcl
 set dbg [read32 0x43C00028]
-set state   [expr ($dbg >> 28) & 0xF]
-set rd_done [expr ($dbg >> 27) & 1]
-set wr_done [expr ($dbg >> 26) & 1]
-set rd_busy [expr ($dbg >> 25) & 1]
-set wr_busy [expr ($dbg >> 24) & 1]
-set rem     [expr ($dbg >> 16) & 0xFF]
-set rd_len  [expr ($dbg >> 8) & 0xFF]
-set idx     [expr $dbg & 0xFF]
+set state   [expr ($dbg >> 27) & 0x1F]     # [31:27] = 5-bit FSM state
+set rd_done [expr ($dbg >> 26) & 1]        # [26] = rd_done
+set wr_done [expr ($dbg >> 25) & 1]        # [25] = wr_done
+set rd_busy [expr ($dbg >> 24) & 1]        # [24] = rd_busy
+set wr_busy [expr ($dbg >> 23) & 1]        # [23] = wr_busy
+set q8_busy [expr ($dbg >> 22) & 1]        # [22] = q8_busy
+set q8_done [expr ($dbg >> 15) & 1]        # [15] = q8_done
+set col_grp [expr ($dbg >> 11) & 0xF]      # [14:11] = col_group
+set sc_idx  [expr $dbg & 0xFF]             # [7:0] = sc_byte_idx
 puts "state=$state rd_done=$rd_done wr_done=$wr_done rd_busy=$rd_busy wr_busy=$wr_busy"
-puts "act_remaining=$rem rd_len=$rd_len act_byte_idx=$idx"
+puts "q8_busy=$q8_busy q8_done=$q8_done col_group=$col_grp sc_byte_idx=$sc_idx"
 ```
 
-### Hang State Interpretation
+### Hang State Interpretation (see docs/AGENTS.md for full 20-state table)
 
-| State value | State name | If hung, cause |
-|-------------|------------|---------------|
-| 0 | `IDLE` | FSM never started (check reg_start write) |
-| 1 | `FETCH_DESC` | HP read burst not completing (check AFI/DDR) |
-| 2 | `FETCH_DESC_W` | Descriptor data not draining (check rd_valid handshake) |
-| 3 | `LOAD_ACT` | HP read burst not starting (check AXI3 burst limit) |
-| 4 | `LOAD_ACT_W` | Act data not draining (rd_busy=1 and rd_done=0 → AXI3 burst rejected) |
-| 5 | `WRITE_RES` | HP write burst not starting (check wr_addr alignment) |
-| 6 | `WRITE_RES_W` | Write not completing (check wr_busy) |
-| 7 | `DONE` | Chain incomplete (check reg_start loopback) |
-| All F's | — | AXI4-Lite read error (PL not clocked) |
+| State | Name | If hung, cause |
+|-------|------|---------------|
+| 0 | IDLE | FSM never started (check reg_start) |
+| 1 | FETCH_DESC | HP read not completing (check AFI/DDR) |
+| 3-4 | LOAD_ACT/_W | Act data not draining (rd_busy=1, rd_done=0 → AXI3 burst rejected) |
+| 5-6 | WRITE_RES/_W | Write not completing (check wr_busy) |
+| 7 | DONE | Chain incomplete (check start loopback) |
+| 8-9 | LOAD_WEIGHT/_W | Weight HP read hung |
+| 10-11 | LOAD_SCALES/_W | Scale HP read hung |
+| 14 | COMPUTE_W | Q8 core timeout (check q8_done_rise) |
+| 18 | TIMEOUT_ERROR | FSM hit timeout limit |
+| All F's | — | PL not clocked |
 
 ---
 

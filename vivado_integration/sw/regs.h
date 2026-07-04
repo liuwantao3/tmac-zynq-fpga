@@ -22,18 +22,19 @@
 #define REG_Q8_DEBUG      0x3C  // Q8 core debug word
 #define REG_Q8_NUM_GROUPS 0x10  // [3:0]: column groups (0=single, 14=full 64x896)
 
-// REG_DEBUG bitfields
-#define DBG_STATE_MASK    0x1F000000  // [31:28] FSM state (5 bits)
-#define DBG_RD_DONE       0x08000000  // [27] rd_done (sticky)
-#define DBG_WR_DONE       0x04000000  // [26] wr_done (sticky)
-#define DBG_RD_BUSY       0x02000000  // [25] rd_busy
-#define DBG_WR_BUSY       0x01000000  // [24] wr_busy
-#define DBG_Q8_BUSY       0x00800000  // [23] q8_busy
-#define DBG_WR_DBG_STATE  0x00700000  // [22:20] write master FSM state
-#define DBG_RD_DBG_STATE  0x000E0000  // [19:17] read master FSM state
-#define DBG_Q8_DONE       0x00010000  // [16] q8_done
-#define DBG_WT_BYTE_IDX   0x0000FF00  // [15:8] weight byte index
-#define DBG_ACT_BYTE_IDX  0x000000FF  // [7:0] activation byte index
+// REG_DEBUG bitfields (matches hp_fsm_top.v:793-804)
+#define DBG_STATE_MASK    0xF8000000  // [31:27] FSM state (5 bits)
+#define DBG_RD_DONE       0x04000000  // [26] rd_done (sticky)
+#define DBG_WR_DONE       0x02000000  // [25] wr_done (sticky)
+#define DBG_RD_BUSY       0x01000000  // [24] rd_busy
+#define DBG_WR_BUSY       0x00800000  // [23] wr_busy
+#define DBG_Q8_BUSY       0x00400000  // [22] q8_busy
+#define DBG_WR_DBG_STATE  0x00380000  // [21:19] write master FSM state
+#define DBG_RD_DBG_STATE  0x00070000  // [18:16] read master FSM state
+#define DBG_Q8_DONE       0x00008000  // [15] q8_done
+#define DBG_COL_GROUP     0x00007800  // [14:11] col_group
+#define DBG_TIMEOUT       0x00000700  // [10:8] timeout_cnt[15:13]
+#define DBG_SC_BYTE_IDX   0x000000FF  // [7:0] sc_byte_idx
 
 // REG_Q8_DEBUG bitfields
 #define Q8DBG_STATE_MASK  0x1F000000  // [31:28] FSM state
