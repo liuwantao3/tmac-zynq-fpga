@@ -156,21 +156,21 @@ module hp_fsm_top (
     );
 
     // ===== HP Write Master =====
-    wire       wr_busy, wr_done, wr_data_ready;
+    wire       wr_busy, wr_done, wr_wready;
     wire [2:0] wr_dbg_state;
     reg        wr_start;
-    wire [7:0] wr_data_in;
-    reg        wr_data_valid;
-    reg [31:0] wr_addr;
-    reg [7:0]  wr_burst_len;
+    wire [63:0] wr_wdata;
+    reg         wr_wvalid;
+    reg [31:0]  wr_addr;
+    reg [15:0]  wr_word_cnt;
 
     axihp_write_master u_wr (
         .clk(clk), .rst_n(rst_n),
         .start(wr_start), .dst_addr(wr_addr),
-        .burst_len(wr_burst_len),
+        .word_count(wr_word_cnt),
         .busy(wr_busy), .done(wr_done),
         .dbg_state(wr_dbg_state),
-        .data_in(wr_data_in), .data_valid(wr_data_valid), .data_ready(wr_data_ready),
+        .wdata(wr_wdata), .wvalid(wr_wvalid), .wready(wr_wready),
         .m_axi_awid(m_axi_awid), .m_axi_awaddr(m_axi_awaddr),
         .m_axi_awvalid(m_axi_awvalid), .m_axi_awready(m_axi_awready),
         .m_axi_awlen(m_axi_awlen), .m_axi_awsize(m_axi_awsize),
@@ -287,7 +287,10 @@ module hp_fsm_top (
     end
     assign rd_done_rise = rd_done && !rd_done_d;
     assign wr_done_rise = wr_done && !wr_done_d;
-    assign wr_data_in = act_buf[wr_byte_offset];
+    assign wr_wdata = {act_buf[wr_byte_offset + 7], act_buf[wr_byte_offset + 6],
+                       act_buf[wr_byte_offset + 5], act_buf[wr_byte_offset + 4],
+                       act_buf[wr_byte_offset + 3], act_buf[wr_byte_offset + 2],
+                       act_buf[wr_byte_offset + 1], act_buf[wr_byte_offset]};
     assign q8_done_rise = q8_done && !q8_done_d;
 
     always @(posedge clk or negedge rst_n) begin
@@ -299,8 +302,8 @@ module hp_fsm_top (
             reg_q8_debug <= 0;
             rd_start <= 0; rd_ready <= 0;
             rd_addr <= 0; rd_len <= 0;
-            wr_start <= 0; wr_data_valid <= 0;
-            wr_addr <= 0; wr_burst_len <= 0;
+            wr_start <= 0; wr_wvalid <= 0;
+            wr_addr <= 0; wr_word_cnt <= 0;
             byte_idx <= 0;
             desc_byte_idx <= 0;
             act_byte_idx <= 0;
@@ -347,7 +350,7 @@ module hp_fsm_top (
             reg_clk_cnt <= reg_clk_cnt + 1;
             reg_clk_cnt_slow <= reg_clk_cnt_slow + (|reg_clk_cnt[9:0] ? 0 : 1);
             rd_start <= 0; rd_ready <= 0;
-            wr_start <= 0; wr_data_valid <= 0;
+            wr_start <= 0; wr_wvalid <= 0;
             reg_status[15] <= 1'b1;  // default busy
             // Default-off for Q8 core control signals
             q8_start <= 0;
@@ -672,7 +675,7 @@ module hp_fsm_top (
                     end
                 end
 
-                // === Write result to DDR (byte-stream, multi-burst) ===
+                // === Write result to DDR (64-bit word, multi-burst) ===
                 // Initiates the first burst; subsequent bursts loop through WRITE_RES_BURST.
                 WRITE_RES: begin
                     reg_status[9] <= 0;
@@ -690,15 +693,15 @@ module hp_fsm_top (
                         reg_wr_addr_dbg <= wr_burst_addr;
                         reg_wr_data_dbg <= {act_buf[3], act_buf[2], act_buf[1], act_buf[0]};
                         wr_addr <= wr_burst_addr;
-                        wr_burst_len <= 8'd15;
+                        wr_word_cnt <= 16'd8;    // 8 words x 8 bytes = 64 bytes
                         wr_start <= 1;
                         wr_burst_bytes <= 9'd64;
                         state <= WRITE_RES_W;
-                    end else if (wr_remaining >= 4) begin
+                    end else if (wr_remaining >= 8) begin
                         reg_wr_addr_dbg <= wr_burst_addr;
                         reg_wr_data_dbg <= {act_buf[3], act_buf[2], act_buf[1], act_buf[0]};
                         wr_addr <= wr_burst_addr;
-                        wr_burst_len <= (wr_remaining[7:0] >> 2) - 1;
+                        wr_word_cnt <= {8'd0, wr_remaining[7:3]};  // remaining / 8
                         wr_start <= 1;
                         wr_burst_bytes <= wr_remaining[8:0];
                         state <= WRITE_RES_W;
@@ -714,18 +717,18 @@ module hp_fsm_top (
                     end
                 end
 
-                // Feed bytes to write master for current burst, then loop
+                // Feed 64-bit words to write master for current burst
                 WRITE_RES_W: begin
                     wr_start <= 0;
-                    wr_data_valid <= (byte_idx < wr_burst_bytes);
-                    if (wr_data_ready && wr_data_valid) begin
+                    wr_wvalid <= 1;
+                    if (wr_wready && wr_wvalid) begin
                         byte_idx <= byte_idx + 1;
-                        wr_byte_offset <= wr_byte_offset + 1;
+                        wr_byte_offset <= wr_byte_offset + 8;
                     end
                     if (wr_done_rise) begin
                         timeout_cnt <= 0;
+                        wr_wvalid <= 0;
                         wr_burst_addr <= wr_burst_addr + wr_burst_bytes;
-                        // Check before subtracting so burst-size comparison works
                         if (wr_remaining > wr_burst_bytes) begin
                             wr_remaining <= wr_remaining - wr_burst_bytes;
                             state <= WRITE_RES_BURST;

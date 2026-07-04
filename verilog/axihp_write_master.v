@@ -1,21 +1,21 @@
 `timescale 1ns / 1ps
 
-// AXI HP Write Master — byte-stream input, INCR burst output, AWSIZE=2
+// AXI HP Write Master — 64-bit wdata, INCR burst, AWSIZE=3 (8 bytes/beat)
+// Zynq-7010 HP port with x16 DDR3: HP0 is 32-bit, RDATA[63:32]=0.
+// AWSIZE=3 sends 8 bytes per beat — the Zynq HP port handles this
+// by performing two 32-bit DDR accesses per beat.
 module axihp_write_master (
     input  wire         clk,
     input  wire         rst_n,
-
     input  wire         start,
     input  wire [31:0]  dst_addr,
-    input  wire [7:0]   burst_len,
-    output reg          done,
+    input  wire [15:0]  word_count,
     output reg          busy,
+    output reg          done,
+    input  wire [63:0]  wdata,
+    input  wire         wvalid,
+    output reg          wready,
     output wire [2:0]   dbg_state,
-
-    input  wire [7:0]   data_in,
-    input  wire         data_valid,
-    output reg          data_ready,
-
     output reg  [5:0]   m_axi_awid,
     output reg  [31:0]  m_axi_awaddr,
     output reg          m_axi_awvalid,
@@ -38,149 +38,89 @@ module axihp_write_master (
     input  wire  [5:0]  m_axi_bid
 );
 
-    localparam [2:0] IDLE   = 0;
-    localparam [2:0] FILL   = 1;
-    localparam [2:0] XFER   = 2;
-    localparam [2:0] B_WAIT = 3;
-    localparam [2:0] FINISH = 4;
+    localparam [1:0] IDLE = 0, AW = 1, W = 2, B = 3;
+    reg [1:0] state;
+    reg [15:0] beat_cnt;
+    reg [15:0] beats_total;
 
-    reg [2:0] state;
-    reg [7:0] bytebuf [0:63];
-    reg [6:0] fill_cnt;
-    reg [7:0] beat_cnt;
-    reg [7:0] total_beats;
-    reg [31:0] base_addr;
-    reg       aw_grant;
-    reg       w_last_done;
-
-    assign dbg_state = state;
-
-    wire [6:0] fill_target = {total_beats[5:0], 2'b00} - 7'd1;
-
-    // cur_beat uses registered beat_cnt (no speculative advance from wready)
-    wire [7:0]  cur_beat = beat_cnt;
-    wire [31:0] wdata_beat = {bytebuf[{cur_beat[5:0], 2'b00} + 3],
-                              bytebuf[{cur_beat[5:0], 2'b00} + 2],
-                              bytebuf[{cur_beat[5:0], 2'b00} + 1],
-                              bytebuf[{cur_beat[5:0], 2'b00} + 0]};
-    wire [63:0] wdata_steer = (base_addr[2] ^ cur_beat[0]) ? {wdata_beat, 32'd0} : {32'd0, wdata_beat};
-    wire [7:0]  wstrb_steer = (base_addr[2] ^ cur_beat[0]) ? 8'hF0 : 8'h0F;
+    assign dbg_state = {1'b0, state};
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            state        <= IDLE;
-            busy         <= 0;
-            done         <= 0;
-            data_ready   <= 0;
+            state         <= IDLE;
+            busy          <= 0;
+            done          <= 0;
             m_axi_awvalid <= 0;
-            m_axi_wvalid <= 0;
-            m_axi_bready <= 0;
-            m_axi_awid   <= 6'd0;
-            m_axi_awlock <= 2'd0;
+            m_axi_wvalid  <= 0;
+            m_axi_bready  <= 0;
+            wready        <= 0;
+            beat_cnt      <= 0;
+            beats_total   <= 0;
+            m_axi_awid    <= 6'd0;
+            m_axi_awlock  <= 2'd0;
             m_axi_awcache <= 4'b0011;
-            m_axi_awprot <= 3'd0;
-            m_axi_wid    <= 6'd0;
-            m_axi_wlast  <= 0;
-            m_axi_wdata  <= 0;
-            m_axi_wstrb  <= 0;
-            fill_cnt     <= 0;
-            beat_cnt     <= 0;
-            total_beats  <= 0;
-            base_addr    <= 0;
-            aw_grant     <= 0;
-            w_last_done  <= 0;
+            m_axi_awprot  <= 3'd0;
+            m_axi_wid     <= 6'd0;
         end else begin
             done <= 0;
 
             case (state)
                 IDLE: begin
                     if (start && !busy) begin
-                        if (burst_len == 0) begin
-                            busy <= 0;
-                            done <= 1;
-                        end else begin
-                            busy        <= 1;
-                            total_beats <= burst_len + 1;
-                            base_addr   <= dst_addr;
-                            fill_cnt    <= 0;
-                            data_ready  <= 1;
-                            m_axi_awid  <= 6'd0;
-                            m_axi_wid   <= 6'd0;
-                            state       <= FILL;
-                        end
-                    end
-                end
-
-                // Fill byte buffer from data stream
-                FILL: begin
-                    if (data_valid && data_ready) begin
-                        bytebuf[fill_cnt[5:0]] <= data_in;
-                        fill_cnt <= fill_cnt + 1;
-                    end
-                    if (fill_cnt == fill_target) begin
-                        data_ready    <= 0;
-                        beat_cnt      <= 0;
-                        aw_grant      <= 0;
-                        w_last_done   <= 0;
-                        m_axi_awaddr  <= base_addr;
-                        m_axi_awlen   <= burst_len;
-                        m_axi_awsize  <= 3'd2;
+                        beats_total  <= word_count;
+                        busy         <= 1;
+                        m_axi_awaddr <= dst_addr;
+                        m_axi_awlen  <= (word_count > 0) ? word_count[7:0] - 1 : 8'd0;
+                        m_axi_awsize <= 3'd3;
                         m_axi_awburst <= 2'd1;
                         m_axi_awvalid <= 1;
-                        state <= XFER;
+                        beat_cnt     <= 0;
+                        state        <= AW;
                     end
                 end
 
-                // Issue AW + send W beats (overlapped for efficiency)
-                XFER: begin
-                    // AW channel
-                    if (!aw_grant) begin
-                        if (m_axi_awready) begin
-                            m_axi_awvalid <= 0;
-                            aw_grant <= 1;
+                AW: begin
+                    if (m_axi_awready) begin
+                        m_axi_awvalid <= 0;
+                        if (word_count == 0) begin
+                            m_axi_bready <= 1;
+                            state        <= B;
+                        end else begin
+                            wready <= 1;
+                            state  <= W;
                         end
                     end
+                end
 
-                    // W channel — data driven from registered beat_cnt
-                    m_axi_wdata <= wdata_steer;
-                    m_axi_wstrb <= wstrb_steer;
-                    m_axi_wlast  <= (beat_cnt == burst_len);
-
-                    if (!w_last_done) begin
+                W: begin
+                    if (wvalid && wready) begin
+                        m_axi_wdata <= wdata;
+                        m_axi_wstrb <= 8'hFF;
+                        m_axi_wlast <= (beat_cnt == beats_total - 1);
                         m_axi_wvalid <= 1;
-                        if (m_axi_wready) begin
-                            if (beat_cnt == burst_len) begin
-                                w_last_done <= 1;
-                            end else begin
-                                beat_cnt <= beat_cnt + 1;
-                            end
-                        end
+                        wready       <= 0;
                     end
-
-                    // Both AW and W complete → wait for B
-                    if (aw_grant && w_last_done) begin
+                    if (m_axi_wvalid && m_axi_wready) begin
                         m_axi_wvalid <= 0;
-                        m_axi_wlast  <= 0;
-                        m_axi_bready <= 1;
-                        state <= B_WAIT;
+                        if (m_axi_wlast) begin
+                            m_axi_bready <= 1;
+                            state        <= B;
+                        end else begin
+                            wready   <= 1;
+                            beat_cnt <= beat_cnt + 1;
+                        end
                     end
                 end
 
-                B_WAIT: begin
+                B: begin
                     if (m_axi_bvalid) begin
                         m_axi_bready <= 0;
-                        state <= FINISH;
+                        busy         <= 0;
+                        done         <= 1;
+                        state        <= IDLE;
                     end
-                end
-
-                FINISH: begin
-                    busy     <= 0;
-                    done     <= 1;
-                    beat_cnt <= 0;
-                    state    <= IDLE;
                 end
             endcase
         end
     end
-
 endmodule
