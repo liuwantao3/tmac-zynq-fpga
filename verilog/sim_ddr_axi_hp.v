@@ -92,11 +92,12 @@ module sim_ddr_axi_hp (
     //         ? R_HOLD   (wait for rready handshake; on handshake: drop rvalid=0)
     //         ? R_NEXT   (present beat N+1 data, rvalid=1) or R_DONE
     reg [2:0] rstate;
-    localparam R_IDLE  = 3'd0;
-    localparam R_START = 3'd1;
-    localparam R_HOLD  = 3'd2;
-    localparam R_NEXT  = 3'd3;
-    localparam R_DONE  = 3'd4;
+    localparam R_IDLE    = 3'd0;
+    localparam R_START   = 3'd1;
+    localparam R_PRESENT = 3'd2;  // present data for one full cycle before HOLD
+    localparam R_HOLD    = 3'd3;
+    localparam R_NEXT    = 3'd4;
+    localparam R_DONE    = 3'd5;
 
     reg [7:0] r_beat_cnt;
     reg [7:0] r_burst_len;
@@ -148,9 +149,14 @@ module sim_ddr_axi_hp (
                 end
 
                 R_START: begin
-                    // Present beat N data with rvalid=1
-                    rdata_int  <= {32'd0, mem_word(r_base_off + r_beat_cnt * r_stride)};
-                    rvalid_int <= 1;
+                    // Latch beat N data for next cycle
+                    // For ARSIZE=2 on 64-bit bus: address[2] selects byte lane.
+                    //   addr[2]=0 → RDATA[31:0], addr[2]=1 → RDATA[63:32]
+                    if (s_axi_araddr[2]) begin
+                        rdata_int  <= {mem_word(r_base_off + r_beat_cnt * r_stride), 32'd0};
+                    end else begin
+                        rdata_int  <= {32'd0, mem_word(r_base_off + r_beat_cnt * r_stride)};
+                    end
                     s_axi_rlast <= (r_beat_cnt == r_burst_len);
                     if (r_beat_cnt == 0) begin
                         $display("[DDR] RD beat0: addr=0x%08x off=%0d data=%02x %02x %02x %02x",
@@ -161,17 +167,19 @@ module sim_ddr_axi_hp (
                     $display("[DDR] START @%0t beat=%0d off=%0d data=0x%08x",
                         $time, r_beat_cnt, r_base_off + r_beat_cnt * r_stride,
                         mem_word(r_base_off + r_beat_cnt * r_stride));
+                    rstate <= R_PRESENT;
+                end
+
+                R_PRESENT: begin
+                    // Present data for a full cycle (guarantees read master sees rvalid=1)
+                    rvalid_int <= 1;
                     rstate <= R_HOLD;
                 end
 
                 R_HOLD: begin
                     // Keep data stable; on rready=1 handshake, drop rvalid.
-                    $display("[DDR] HOLD @%0t beat=%0d rready=%b rvalid=%b rstate=%d",
-                        $time, r_beat_cnt, s_axi_rready, rvalid_int, rstate);
                     if (s_axi_rready) begin
                         rvalid_int <= 0;  // drop rvalid in next cycle
-                        $display("[DDR] HOLD ADVANCE @%0t beat=%0d->%0d",
-                            $time, r_beat_cnt, r_beat_cnt+1);
                         if (r_beat_cnt == r_burst_len) begin
                             rstate <= R_DONE;
                         end else begin
@@ -182,14 +190,17 @@ module sim_ddr_axi_hp (
                 end
 
                 R_NEXT: begin
-                    // Present next beat data with rvalid=1
-                    rdata_int  <= {32'd0, mem_word(r_base_off + r_beat_cnt * r_stride)};
-                    rvalid_int <= 1;
+                    // Latch next beat data
+                    begin
+                        integer beat_off;
+                        beat_off = r_base_off + r_beat_cnt * r_stride;
+                        if (beat_off[2])
+                            rdata_int <= {mem_word(beat_off), 32'd0};
+                        else
+                            rdata_int <= {32'd0, mem_word(beat_off)};
+                    end
                     s_axi_rlast <= (r_beat_cnt == r_burst_len);
-                    $display("[DDR] NEXT beat=%0d off=%0d data=0x%08x",
-                        r_beat_cnt, r_base_off + r_beat_cnt * r_stride,
-                        mem_word(r_base_off + r_beat_cnt * r_stride));
-                    rstate <= R_HOLD;
+                    rstate <= R_PRESENT;
                 end
 
                 R_DONE: begin

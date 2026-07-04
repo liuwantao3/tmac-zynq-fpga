@@ -41,7 +41,7 @@ module tb_hw_fsm_comprehensive;
             ddr_read32 = ddr_mem[addr[31:3]][31:0];
     endfunction
 
-    // Write state machine â€” supports INCR burst (awlen > 0, wlast)
+    // Write state machine â€?supports INCR burst (awlen > 0, wlast)
     localparam WR_IDLE = 0, WR_WRITE = 1, WR_WAIT_B = 2;
     reg [1:0] wr_state;
     reg [31:0] wr_addr_cur;
@@ -72,7 +72,7 @@ module tb_hw_fsm_comprehensive;
                     if (m_axi_wlast) begin
                         wr_state <= WR_WAIT_B;
                     end else begin
-                        wr_addr_cur <= wr_addr_cur + 8;
+                        wr_addr_cur <= wr_addr_cur + 4;
                         wr_beats_rem <= wr_beats_rem - 1;
                     end
                 end
@@ -81,7 +81,7 @@ module tb_hw_fsm_comprehensive;
         end
     end
 
-    // Read state machine â€” ARSIZE=2, data on RDATA[31:0]
+    // Read state machine â€?ARSIZE=2, data on RDATA[31:0]
     reg [7:0]  rd_beats_done, rd_beats_total;
     reg [31:0] rd_addr_base;
     reg        rd_busy;
@@ -305,7 +305,7 @@ module tb_hw_fsm_comprehensive;
         pass_count = 0; fail_count = 0; test_num = 0;
 
         // ===================================================================
-        // Test 1: Basic 64 bytes (regression â€” matches working hardware test)
+        // Test 1: Basic 64 bytes (regression â€?matches working hardware test)
         // ===================================================================
         test_num = test_num + 1;
         $display("\n--- Test %0d: Basic 64 bytes ---", test_num);
@@ -321,7 +321,7 @@ module tb_hw_fsm_comprehensive;
         verify_pattern_inc(32'h00302000, 64, test_num);
 
         // ===================================================================
-        // Test 2: Minimum 8 bytes (1 word â€” edge case for write master)
+        // Test 2: Minimum 8 bytes (1 word â€?edge case for write master)
         // ===================================================================
         test_num = test_num + 1;
         $display("\n--- Test %0d: Minimum 8 bytes ---", test_num);
@@ -340,7 +340,7 @@ module tb_hw_fsm_comprehensive;
         end
 
         // ===================================================================
-        // Test 3: 128 bytes (2 HP read bursts â€” verifies multi-burst path)
+        // Test 3: 128 bytes (2 HP read bursts â€?verifies multi-burst path)
         // ===================================================================
         test_num = test_num + 1;
         $display("\n--- Test %0d: 128 bytes (2 bursts) ---", test_num);
@@ -355,7 +355,7 @@ module tb_hw_fsm_comprehensive;
         verify_pattern_inc(32'h00302100, 128, test_num);
 
         // ===================================================================
-        // Test 4: 256 bytes max (4 HP read bursts â€” max act_buf)
+        // Test 4: 256 bytes max (4 HP read bursts â€?max act_buf)
         // ===================================================================
         test_num = test_num + 1;
         $display("\n--- Test %0d: 256 bytes max (4 bursts) ---", test_num);
@@ -445,7 +445,7 @@ module tb_hw_fsm_comprehensive;
         // Verify first run result
         verify_pattern_inc(32'h00302500, 64, test_num);
 
-        // Set up second descriptor â€” must use different DDR addresses
+        // Set up second descriptor â€?must use different DDR addresses
         setup_desc(32'h00300220, 32'h00000000, 32'h00301540, 32'h00302540, 32);
         write_pattern_const(32'h00301540, 32, 8'h5A);
         zero_fill(32'h00302540, 32);
@@ -473,7 +473,7 @@ module tb_hw_fsm_comprehensive;
         #100 $finish;
     end
 
-    initial #1000000 begin
+    initial #200000 begin
         $display("TIMEOUT");
         $finish;
     end

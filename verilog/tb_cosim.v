@@ -9,8 +9,8 @@ module tb_cosim;
     wire        busy;
 
     reg         wt_we;
-    reg [11:0]  wt_addr;
-    reg [7:0]   wt_din;
+    reg [8:0]   wt_addr;
+    reg [63:0]  wt_din;
     reg         sc_we;
     reg [6:0]   sc_addr;
     reg [15:0]  sc_din;
@@ -48,7 +48,8 @@ module tb_cosim;
     //     [0]: num_tiles
     //     [1..3]: reserved
     //   Per tile (4992 B):
-    //     q8_W[4096]:  4096 × uint8_t  (col-major: [col][row])
+    //     q8_W[4096]:  4096 × uint8_t  (col-major: [col][row], transposed
+    //                   to bank-major 512×64-bit for BRAM load)
     //     scales[128]: 128 × uint16_t  (combined UQ8.8 per row×block)
     //     vec[64]:      64 × int16_t   (activations)
     //     expected[64]: 64 × int64_t   (fpga_sim reference result)
@@ -59,7 +60,7 @@ module tb_cosim;
 
     reg [7:0]  fdata [0:MAX_FILE_BYTES-1];
     integer    f, file_bytes, num_tiles, tile;
-    integer    i, k, row, col, addr;
+    integer    i, k, row, col, addr, bank;
     integer    errors, total;
     integer    poll_count;
     reg [47:0] expected_val;
@@ -107,14 +108,23 @@ module tb_cosim;
 
             $display("Tile %0d/%0d:", tile + 1, num_tiles);
 
-            // ---- Load weights: 64×64 writes (addr = row*64+col) ----
-            for (row = 0; row < 64; row = row + 1) begin
+            // ---- Load weights: 512×64-bit words (bank-major) ----
+            //   addr[8:0] = {bank[2:0], col[5:0]} = bank*64 + col
+            //   word = {fdata[col*64 + bank*8 + 7], ..., fdata[col*64 + bank*8]}
+            //   i.e. 8 consecutive rows for same column, packed into one 64-bit word
+            for (bank = 0; bank < 8; bank = bank + 1) begin
                 for (col = 0; col < 64; col = col + 1) begin
                     @(negedge clk);
                     wt_we <= 1;
-                    wt_addr <= row * 64 + col;
-                    // q8_W is stored col-major: q8_tile[col][row] at offset col*64+row
-                    wt_din <= fdata[base + col * 64 + row];
+                    wt_addr <= bank * 64 + col;
+                    wt_din <= {fdata[base + col * 64 + bank * 8 + 7],
+                               fdata[base + col * 64 + bank * 8 + 6],
+                               fdata[base + col * 64 + bank * 8 + 5],
+                               fdata[base + col * 64 + bank * 8 + 4],
+                               fdata[base + col * 64 + bank * 8 + 3],
+                               fdata[base + col * 64 + bank * 8 + 2],
+                               fdata[base + col * 64 + bank * 8 + 1],
+                               fdata[base + col * 64 + bank * 8]};
                 end
             end
             @(negedge clk); wt_we <= 0;

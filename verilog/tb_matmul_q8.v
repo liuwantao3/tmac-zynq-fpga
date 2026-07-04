@@ -8,9 +8,9 @@ module tb_matmul_q8;
     wire        done;
     wire        busy;
 
-    reg         wt_we;
-    reg [11:0]  wt_addr;
-    reg [7:0]   wt_din;
+    reg        wt_we;
+    reg [8:0]  wt_addr;
+    reg [63:0] wt_din;
     reg         sc_we;
     reg [6:0]   sc_addr;
     reg [15:0]  sc_din;
@@ -47,17 +47,19 @@ module tb_matmul_q8;
     task wr(input integer we, addr, din);
         begin
             @(negedge clk);
-            if (we == 0) begin wt_we <= 1; wt_addr <= addr; wt_din <= din[7:0]; end
+            if (we == 0) begin wt_we <= 1; wt_addr <= addr; wt_din <= din; end
             if (we == 1) begin sc_we <= 1; sc_addr <= addr; sc_din <= din[15:0]; end
             if (we == 2) begin act_we <= 1; act_addr <= addr; act_din <= din[15:0]; end
         end
     endtask
 
     task load_all_weights(input [7:0] val);
+        reg [63:0] word;
         begin
-            for (row = 0; row < 64; row = row + 1)
+            word = {8{val}};
+            for (row = 0; row < 8; row = row + 1)
                 for (col = 0; col < 64; col = col + 1)
-                    wr(0, row * 64 + col, val);
+                    wr(0, row * 64 + col, word);
             @(negedge clk); wt_we <= 0;
         end
     endtask

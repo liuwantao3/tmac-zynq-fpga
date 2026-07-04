@@ -230,10 +230,13 @@ module matmul_top (
     );
 
     // ======================================================================
-    // Q8 core signals
+    // Q8 core signals (64-bit word write interface)
     // ======================================================================
     wire        q8_done, q8_busy;
     wire [47:0] q8_res_dout;
+    reg         q8_wt_we;
+    reg [8:0]   q8_wt_addr;
+    reg [63:0]  q8_wt_din;
 
     matmul_q8_core u_core_q8 (
         .clk       (clk),
@@ -242,9 +245,9 @@ module matmul_top (
         .op_vecmul (1'b1),
         .done      (q8_done),
         .busy      (q8_busy),
-        .wt_we     (wt_we),
-        .wt_addr   (wt_addr[11:0]),
-        .wt_din    (wt_din),
+        .wt_we     (q8_wt_we),
+        .wt_addr   (q8_wt_addr),
+        .wt_din    (q8_wt_din),
         .sc_we     (sc_we),
         .sc_addr   (sc_addr[6:0]),
         .sc_din    (sc_din),
@@ -254,6 +257,17 @@ module matmul_top (
         .res_addr  (res_addr[5:0]),
         .res_dout  (q8_res_dout)
     );
+
+    // Q8 writes gated by mode_q8; Phase 3 will add HP read packing.
+    always @(posedge clk) begin
+        if (wt_we && mode_q8) begin
+            q8_wt_we   <= 1;
+            q8_wt_addr <= wt_addr[8:0];
+            q8_wt_din  <= {56'd0, wt_din};
+        end else begin
+            q8_wt_we   <= 0;
+        end
+    end
 
     // ======================================================================
     // Q4K core signals (byte-wide block_buf, auto-increment write_ptr)
@@ -555,9 +569,9 @@ module matmul_top (
         .burst_len    (hp_read_len),
         .done         (hp_read_done),
         .busy         (hp_read_busy),
-        .data_out     (hp_read_data),
-        .data_valid   (hp_read_valid),
-        .data_ready   (hp_read_ready),
+        .rdata        (hp_read_data),
+        .rvalid       (hp_read_valid),
+        .rready       (hp_read_ready),
         .m_axi_arid   (m_axi_arid),
         .m_axi_araddr (m_axi_araddr),
         .m_axi_arvalid(m_axi_arvalid),

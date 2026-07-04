@@ -1,26 +1,28 @@
 `timescale 1ns / 1ps
 
-// AXI HP Read Master — 32-bit INCR burst, byte-stream output
-// ARSIZE=2 (4 bytes/beat) on a 64-bit HP bus. Zynq-7010 with x16 DDR3
-// caps HP0 at 32-bit: RDATA[63:32] is always 0, data returns on RDATA[31:0].
-// ARSIZE=2 avoids the lost-upper-half issue.
+// AXI HP Read Master — 64-bit word output, ARSIZE=2 (32-bit AXI beats)
+// Accumulates 2 AXI beats into one 64-bit output word.
+// Matches axihp_write_master's wdata[63:0] interface.
+//
+// Zynq-7010 with x16 DDR: ARSIZE=3 loses upper 32 bits (RDATA[63:32]=0),
+// so we keep ARSIZE=2 and combine pairs internally.
+
 module axihp_read_master (
     input  wire         clk,
     input  wire         rst_n,
 
     input  wire         start,
     input  wire [31:0]  src_addr,
-    input  wire [7:0]   burst_len,    // beats - 1 (0-255)
+    input  wire [7:0]   burst_len,      // total 32-bit AXI beats - 1 (0..255, same as ARLEN)
     output reg          done,
     output reg          busy,
+    output wire [63:0]  rdata,          // 64-bit combined output word
+    output reg          rvalid,         // word valid (consumer should capture on this cycle if rready=1)
+    input  wire         rready,         // consumer ready
     output wire [2:0]   dbg_state,
     output wire [7:0]   dbg_beat_cnt,
-    output wire [1:0]   dbg_buf_idx,
 
-    output wire [7:0]   data_out,
-    output reg          data_valid,
-    input  wire         data_ready,
-
+    // AXI HP read interface
     output reg  [5:0]   m_axi_arid,
     output reg  [31:0]  m_axi_araddr,
     output reg          m_axi_arvalid,
@@ -39,49 +41,51 @@ module axihp_read_master (
     input  wire         m_axi_rlast
 );
 
-    localparam IDLE       = 3'd0;
-    localparam SEND_AR    = 3'd1;
-    localparam WAIT_R     = 3'd2;
-    localparam DRAIN_BYTE = 3'd3;
+    localparam [2:0] IDLE      = 3'd0;
+    localparam [2:0] SEND_AR   = 3'd1;
+    localparam [2:0] READ_BEAT = 3'd2;
+    localparam [2:0] PRESENT   = 3'd3;
 
-    reg [2:0]  state;
-    reg [7:0]  beat_cnt;
-    reg [31:0] rdata_hold;  // captured RDATA[31:0] per beat
-    reg [1:0]  buf_idx;     // 0..3 (4 bytes per beat)
+    reg [2:0] state;
+    reg [7:0] beat_cnt;          // 0..burst_len, counts AXI beats received
+    reg       even_beat;         // 0=accumulating low half, 1=accumulating high half
+    reg [31:0] rdata_lo, rdata_hi;
 
-    assign data_out = rdata_hold[{buf_idx, 3'b0} +: 8];
-    assign dbg_state = state;
+    assign rdata       = {rdata_hi, rdata_lo};
+    assign dbg_state   = state;
     assign dbg_beat_cnt = beat_cnt;
-    assign dbg_buf_idx = buf_idx;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             state          <= IDLE;
             done           <= 0;
             busy           <= 0;
-            data_valid     <= 0;
+            rvalid         <= 0;
             m_axi_arvalid  <= 0;
             m_axi_rready   <= 0;
-            buf_idx        <= 0;
             beat_cnt       <= 0;
+            even_beat      <= 0;
+            rdata_lo       <= 0;
+            rdata_hi       <= 0;
         end else begin
-            data_valid <= 0;
-            done       <= 0;
+            rvalid <= 0;
+            done   <= 0;
 
             case (state)
                 IDLE: begin
-                    if (start) begin
+                    if (start && !busy) begin
                         busy          <= 1;
                         m_axi_arid    <= 6'd0;
                         m_axi_araddr  <= src_addr;
                         m_axi_arlen   <= burst_len;
-                        m_axi_arsize  <= 3'd2;   // 4 bytes per beat
-                        m_axi_arburst <= 2'd1;   // INCR
+                        m_axi_arsize  <= 3'd2;    // 4 bytes per beat
+                        m_axi_arburst <= 2'd1;     // INCR
                         m_axi_arlock  <= 2'd0;
                         m_axi_arcache <= 4'b0011;
                         m_axi_arprot  <= 3'd0;
                         m_axi_arvalid <= 1;
                         beat_cnt      <= 0;
+                        even_beat     <= 0;
                         state         <= SEND_AR;
                     end
                 end
@@ -90,41 +94,65 @@ module axihp_read_master (
                     if (m_axi_arready) begin
                         m_axi_arvalid <= 0;
                         m_axi_rready  <= 1;
-                        state         <= WAIT_R;
+                        state         <= READ_BEAT;
                     end
                 end
 
-                WAIT_R: begin
+                READ_BEAT: begin
                     if (m_axi_rvalid) begin
                         m_axi_rready <= 0;
-                        rdata_hold   <= m_axi_rdata[31:0];
-                        buf_idx      <= 0;
-                        state        <= DRAIN_BYTE;
+                        if (!even_beat) begin
+                            // First beat of pair → lower 32 bits
+                            rdata_lo <= m_axi_rdata[31:0];
+                            if (beat_cnt == burst_len) begin
+                                // Last beat is odd (only 1 beat in this pair)
+                                rdata_hi  <= 32'd0;
+                                even_beat <= 1;
+                                state     <= PRESENT;
+                            end else begin
+                                beat_cnt   <= beat_cnt + 1;
+                                even_beat  <= 1;
+                                m_axi_rready <= 1;  // request next beat immediately
+                            end
+                        end else begin
+                            // Second beat of pair → upper 32 bits
+                            rdata_hi  <= m_axi_rdata[31:0];
+                            even_beat <= 0;
+                            if (beat_cnt == burst_len) begin
+                                state <= PRESENT;   // last pair complete
+                            end else begin
+                                beat_cnt <= beat_cnt + 1;
+                                state     <= PRESENT;
+                            end
+                        end
                     end
                 end
 
-                DRAIN_BYTE: begin
-                    data_valid <= 1;
-                    if (data_ready) begin
-                        if (buf_idx == 3) begin  // 4 bytes per beat
-                            data_valid <= 0;
-                            if (beat_cnt == burst_len) begin
-                                m_axi_rready <= 0;
-                                state <= IDLE;
+                PRESENT: begin
+                    rvalid <= 1;
+                    if (rready) begin
+                        rvalid <= 0;  // clear rvalid on handshake to prevent double-capture
+                        if (beat_cnt >= burst_len && !even_beat) begin
+                            // All AXI beats consumed, all words presented
+                            busy  <= 0;
+                            done  <= 1;
+                            state <= IDLE;
+                        end else begin
+                            // More AXI beats to read for next word
+                            if (!even_beat) begin
+                                m_axi_rready <= 1;
+                                state <= READ_BEAT;
+                            end else begin
+                                // even_beat=1 means solo beat was presented (odd count)
+                                // That was the last beat, so we're done
                                 busy  <= 0;
                                 done  <= 1;
-                            end else begin
-                                beat_cnt <= beat_cnt + 1;
-                                m_axi_rready <= 1;
-                                state <= WAIT_R;
+                                state <= IDLE;
                             end
-                        end else begin
-                            buf_idx <= buf_idx + 1;
                         end
                     end
                 end
             endcase
         end
     end
-
 endmodule

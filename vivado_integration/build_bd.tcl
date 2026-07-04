@@ -161,6 +161,8 @@ set_property top system_wrapper [current_fileset]
 update_compile_order -fileset sources_1
 
 # Synthesis
+set_property STEPS.SYNTH_DESIGN.ARGS.FLATTEN_HIERARCHY full [get_runs synth_1]
+set_property STEPS.SYNTH_DESIGN.ARGS.FSM_EXTRACTION one_hot [get_runs synth_1]
 launch_runs synth_1 -jobs 8
 wait_on_run synth_1
 
