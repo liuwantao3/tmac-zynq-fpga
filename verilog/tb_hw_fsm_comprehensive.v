@@ -41,21 +41,40 @@ module tb_hw_fsm_comprehensive;
             ddr_read32 = ddr_mem[addr[31:3]][31:0];
     endfunction
 
-    // Write state machine
-    localparam WR_IDLE = 0, WR_WAIT_W = 1, WR_WAIT_B = 2;
+    // Write state machine — supports INCR burst (awlen > 0, wlast)
+    localparam WR_IDLE = 0, WR_WRITE = 1, WR_WAIT_B = 2;
     reg [1:0] wr_state;
+    reg [31:0] wr_addr_cur;
+    reg [7:0]  wr_beats_rem;
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             wr_state <= WR_IDLE;
+            wr_addr_cur <= 0;
+            wr_beats_rem <= 0;
         end else begin
             case (wr_state)
-                WR_IDLE: if (m_axi_awvalid) wr_state <= WR_WAIT_W;
-                WR_WAIT_W: if (m_axi_wvalid && m_axi_wready) begin
-                    if (m_axi_wstrb[3:0])
-                        ddr_mem[m_axi_awaddr[31:3]][31:0] <= m_axi_wdata[31:0];
-                    if (m_axi_wstrb[7:4])
-                        ddr_mem[m_axi_awaddr[31:3]][63:32] <= m_axi_wdata[63:32];
-                    wr_state <= WR_WAIT_B;
+                WR_IDLE: if (m_axi_awvalid) begin
+                    wr_addr_cur <= m_axi_awaddr;
+                    wr_beats_rem <= m_axi_awlen;
+                    wr_state <= WR_WRITE;
+                end
+                WR_WRITE: if (m_axi_wvalid && m_axi_wready) begin
+                    if (m_axi_wstrb[3:0]) begin
+                        ddr_mem[wr_addr_cur[31:3]][31:0] <= m_axi_wdata[31:0];
+                        $display("[TB] WR beat addr=0x%08x data[31:0]=0x%08x strb=%b",
+                            wr_addr_cur, m_axi_wdata[31:0], m_axi_wstrb[3:0]);
+                    end
+                    if (m_axi_wstrb[7:4]) begin
+                        ddr_mem[wr_addr_cur[31:3]][63:32] <= m_axi_wdata[63:32];
+                        $display("[TB] WR beat addr=0x%08x data[63:32]=0x%08x strb=%b",
+                            wr_addr_cur, m_axi_wdata[63:32], m_axi_wstrb[7:4]);
+                    end
+                    if (m_axi_wlast) begin
+                        wr_state <= WR_WAIT_B;
+                    end else begin
+                        wr_addr_cur <= wr_addr_cur + 4;
+                        wr_beats_rem <= wr_beats_rem - 1;
+                    end
                 end
                 WR_WAIT_B: if (m_axi_bready) wr_state <= WR_IDLE;
             endcase
@@ -72,7 +91,7 @@ module tb_hw_fsm_comprehensive;
                                      : ddr_mem[rd_idx >> 1][31:0];
 
     assign m_axi_awready = (wr_state == WR_IDLE);
-    assign m_axi_wready  = (wr_state == WR_WAIT_W);
+    assign m_axi_wready  = (wr_state == WR_WRITE);
     assign m_axi_bvalid  = (wr_state == WR_WAIT_B);
     assign m_axi_bresp   = 2'd0; assign m_axi_bid = 6'd0;
 

@@ -82,15 +82,15 @@ module sim_ddr_axi_hp (
         end
     endfunction
 
-    // Read state machine — AXI burst BFM.
+    // Read state machine ? AXI burst BFM.
     //
     // Uses BLOCKING assignments (=) for rdata/rvalid so the read master
     // sees fresh values immediately within the same evaluation cycle.
     //
     // Flow per beat:
-    //   R_IDLE → R_START (present beat N data, rvalid=1)
-    //         → R_HOLD   (wait for rready handshake; on handshake: drop rvalid=0)
-    //         → R_NEXT   (present beat N+1 data, rvalid=1) or R_DONE
+    //   R_IDLE ? R_START (present beat N data, rvalid=1)
+    //         ? R_HOLD   (wait for rready handshake; on handshake: drop rvalid=0)
+    //         ? R_NEXT   (present beat N+1 data, rvalid=1) or R_DONE
     reg [2:0] rstate;
     localparam R_IDLE  = 3'd0;
     localparam R_START = 3'd1;
@@ -201,7 +201,7 @@ module sim_ddr_axi_hp (
         end
     end
 
-    // Write state machine — handles AWSIZE=2 single-beat writes
+    // Write state machine ? handles AWSIZE=2 single-beat writes
     reg [1:0] wstate;
     localparam W_IDLE = 0, W_DATA = 1, W_RESP = 2;
 
@@ -209,6 +209,7 @@ module sim_ddr_axi_hp (
     reg [7:0] w_beat_cnt;
     reg [7:0] w_burst_len;
     reg [2:0] w_stride;
+    wire [31:0] w_beat_addr = w_addr_base + w_beat_cnt * w_stride;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -238,20 +239,20 @@ module sim_ddr_axi_hp (
 
                 W_DATA: begin
                     if (s_axi_wvalid) begin
-                        // For AWSIZE=2 on 64-bit bus, A[2] selects byte lanes:
-                        //   A[2]=0 → WDATA[31:0], WSTRB[3:0] → write at addr+0..3
-                        //   A[2]=1 → WDATA[63:32], WSTRB[7:4] → write at addr+0..3
-                        // Target address is always awaddr (narrow write on 64-bit bus).
-                        if (s_axi_awaddr[2]) begin
-                            if (s_axi_wstrb[4]) mem[w_addr_base + 0] <= s_axi_wdata[39:32];
-                            if (s_axi_wstrb[5]) mem[w_addr_base + 1] <= s_axi_wdata[47:40];
-                            if (s_axi_wstrb[6]) mem[w_addr_base + 2] <= s_axi_wdata[55:48];
-                            if (s_axi_wstrb[7]) mem[w_addr_base + 3] <= s_axi_wdata[63:56];
+                        // For AWSIZE=2 on 64-bit bus, per-beat address A[2] selects byte lanes:
+                        //   A[2]=0 ? WDATA[31:0], WSTRB[3:0] ? write at beat_addr+0..3
+                        //   A[2]=1 ? WDATA[63:32], WSTRB[7:4] ? write at beat_addr+0..3
+                        // beat_addr = w_addr_base + w_beat_cnt * w_stride
+                        if (w_beat_addr[2]) begin
+                            if (s_axi_wstrb[4]) mem[w_beat_addr + 0] <= s_axi_wdata[39:32];
+                            if (s_axi_wstrb[5]) mem[w_beat_addr + 1] <= s_axi_wdata[47:40];
+                            if (s_axi_wstrb[6]) mem[w_beat_addr + 2] <= s_axi_wdata[55:48];
+                            if (s_axi_wstrb[7]) mem[w_beat_addr + 3] <= s_axi_wdata[63:56];
                         end else begin
-                            if (s_axi_wstrb[0]) mem[w_addr_base + 0] <= s_axi_wdata[7:0];
-                            if (s_axi_wstrb[1]) mem[w_addr_base + 1] <= s_axi_wdata[15:8];
-                            if (s_axi_wstrb[2]) mem[w_addr_base + 2] <= s_axi_wdata[23:16];
-                            if (s_axi_wstrb[3]) mem[w_addr_base + 3] <= s_axi_wdata[31:24];
+                            if (s_axi_wstrb[0]) mem[w_beat_addr + 0] <= s_axi_wdata[7:0];
+                            if (s_axi_wstrb[1]) mem[w_beat_addr + 1] <= s_axi_wdata[15:8];
+                            if (s_axi_wstrb[2]) mem[w_beat_addr + 2] <= s_axi_wdata[23:16];
+                            if (s_axi_wstrb[3]) mem[w_beat_addr + 3] <= s_axi_wdata[31:24];
                         end
                         if (s_axi_wlast) begin
                             s_axi_wready <= 0;
@@ -274,7 +275,7 @@ module sim_ddr_axi_hp (
         end
     end
 
-    // Debug readback — triggered only by dbg_addr changes
+    // Debug readback ? triggered only by dbg_addr changes
     always @(dbg_addr) begin
         if (dbg_addr >= BASE_ADDR) begin
             integer off;

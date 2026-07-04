@@ -1,23 +1,21 @@
 `timescale 1ns / 1ps
 
-// AXI HP Write Master — 32-bit mode, split 64-bit words into 2×32-bit AXI3 writes
-// AWSIZE=2 (4 bytes/beat) on a 64-bit HP bus. Each 64-bit word from the
-// top is split into two single-beat AXI3 transactions:
-//   Lower half: A[2]=0, WDATA[31:0], WSTRB[3:0]
-//   Upper half: A[2]=1, WDATA[63:32], WSTRB[7:4]
-// wready asserted once per word (in W_L only, not in upper half).
+// AXI HP Write Master — byte-stream input, INCR burst output, AWSIZE=2
 module axihp_write_master (
     input  wire         clk,
     input  wire         rst_n,
+
     input  wire         start,
     input  wire [31:0]  dst_addr,
-    input  wire [15:0]  word_count,
-    output reg          busy,
+    input  wire [7:0]   burst_len,
     output reg          done,
-    input  wire [63:0]  wdata,
-    input  wire         wvalid,
-    output reg          wready,
+    output reg          busy,
     output wire [2:0]   dbg_state,
+
+    input  wire [7:0]   data_in,
+    input  wire         data_valid,
+    output reg          data_ready,
+
     output reg  [5:0]   m_axi_awid,
     output reg  [31:0]  m_axi_awaddr,
     output reg          m_axi_awvalid,
@@ -40,131 +38,146 @@ module axihp_write_master (
     input  wire  [5:0]  m_axi_bid
 );
 
-    localparam [2:0] IDLE = 0, AW_L = 1, W_L = 2, B_L = 3, AW_U = 4, B_U = 5;
+    localparam [2:0] IDLE   = 0;
+    localparam [2:0] FILL   = 1;
+    localparam [2:0] XFER   = 2;
+    localparam [2:0] B_WAIT = 3;
+    localparam [2:0] FINISH = 4;
+
     reg [2:0] state;
-    reg [15:0] words_rem;
-    reg [31:0] sub_addr;
-    reg [31:0] hold_data_hi;  // captured wdata[63:32] during W_L
+    reg [7:0] bytebuf [0:63];
+    reg [6:0] fill_cnt;
+    reg [7:0] beat_cnt;
+    reg [7:0] total_beats;
+    reg [31:0] base_addr;
+    reg       aw_grant;
+    reg       w_last_done;
 
     assign dbg_state = state;
 
+    wire [6:0] fill_target = {total_beats[5:0], 2'b00} - 7'd1;
+
+    // cur_beat uses registered beat_cnt (no speculative advance from wready)
+    wire [7:0]  cur_beat = beat_cnt;
+    wire [31:0] wdata_beat = {bytebuf[{cur_beat[5:0], 2'b00} + 3],
+                              bytebuf[{cur_beat[5:0], 2'b00} + 2],
+                              bytebuf[{cur_beat[5:0], 2'b00} + 1],
+                              bytebuf[{cur_beat[5:0], 2'b00} + 0]};
+    wire [63:0] wdata_steer = (base_addr[2] ^ cur_beat[0]) ? {wdata_beat, 32'd0} : {32'd0, wdata_beat};
+    wire [7:0]  wstrb_steer = (base_addr[2] ^ cur_beat[0]) ? 8'hF0 : 8'h0F;
+
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            state         <= IDLE;
-            busy          <= 0;
-            done          <= 0;
+            state        <= IDLE;
+            busy         <= 0;
+            done         <= 0;
+            data_ready   <= 0;
             m_axi_awvalid <= 0;
-            m_axi_awid    <= 6'd0;
-            m_axi_awlock  <= 2'd0;
+            m_axi_wvalid <= 0;
+            m_axi_bready <= 0;
+            m_axi_awid   <= 6'd0;
+            m_axi_awlock <= 2'd0;
             m_axi_awcache <= 4'b0011;
-            m_axi_awprot  <= 3'd0;
-            m_axi_wid     <= 6'd0;
-            m_axi_wvalid  <= 0;
-            m_axi_wstrb   <= 8'h00;
-            m_axi_bready  <= 0;
-            wready        <= 0;
-            words_rem     <= 0;
-            hold_data_hi  <= 0;
+            m_axi_awprot <= 3'd0;
+            m_axi_wid    <= 6'd0;
+            m_axi_wlast  <= 0;
+            m_axi_wdata  <= 0;
+            m_axi_wstrb  <= 0;
+            fill_cnt     <= 0;
+            beat_cnt     <= 0;
+            total_beats  <= 0;
+            base_addr    <= 0;
+            aw_grant     <= 0;
+            w_last_done  <= 0;
         end else begin
             done <= 0;
 
             case (state)
                 IDLE: begin
                     if (start && !busy) begin
-                        if (word_count == 0) begin
-                            busy  <= 0;
-                            done  <= 1;
+                        if (burst_len == 0) begin
+                            busy <= 0;
+                            done <= 1;
                         end else begin
-                            busy      <= 1;
-                            words_rem <= word_count;
-                            sub_addr  <= dst_addr;
-                            m_axi_awaddr  <= dst_addr;
-                            m_axi_awlen   <= 8'd0;
-                            m_axi_awsize  <= 3'd2;   // 4 bytes per beat
-                            m_axi_awburst <= 2'd1;
-                            m_axi_awvalid <= 1;
-                            state     <= AW_L;
+                            busy        <= 1;
+                            total_beats <= burst_len + 1;
+                            base_addr   <= dst_addr;
+                            fill_cnt    <= 0;
+                            data_ready  <= 1;
+                            m_axi_awid  <= 6'd0;
+                            m_axi_wid   <= 6'd0;
+                            state       <= FILL;
                         end
                     end
                 end
 
-                // Lower half: send AW with A[2]=0
-                AW_L: begin
-                    if (m_axi_awready) begin
-                        m_axi_awvalid <= 0;
-                        // Send lower half data immediately
-                        m_axi_wdata[31:0] <= wdata[31:0];
-                        m_axi_wdata[63:32] <= 32'd0;
-                        m_axi_wstrb    <= 8'h0F;
-                        m_axi_wlast    <= 1'b1;
-                        m_axi_wvalid   <= 1;
-                        wready         <= 1;
-                        state <= W_L;
+                // Fill byte buffer from data stream
+                FILL: begin
+                    if (data_valid && data_ready) begin
+                        bytebuf[fill_cnt[5:0]] <= data_in;
+                        fill_cnt <= fill_cnt + 1;
                     end
-                end
-
-                // Lower half: complete write, assert wready, capture upper half
-                W_L: begin
-                    if (m_axi_wvalid && m_axi_wready) begin
-                        hold_data_hi <= wdata[63:32];
-                        m_axi_wvalid <= 0;
-                        m_axi_bready <= 1;
-                        wready       <= 0;
-                        state <= B_L;
-                    end
-                end
-
-                // Lower half: wait for write response
-                B_L: begin
-                    if (m_axi_bvalid) begin
-                        m_axi_bready <= 0;
-                        // Upper half: send AW with A[2]=1
-                        m_axi_awaddr  <= sub_addr + 4;
-                        m_axi_awlen   <= 8'd0;
+                    if (fill_cnt == fill_target) begin
+                        data_ready    <= 0;
+                        beat_cnt      <= 0;
+                        aw_grant      <= 0;
+                        w_last_done   <= 0;
+                        m_axi_awaddr  <= base_addr;
+                        m_axi_awlen   <= burst_len;
                         m_axi_awsize  <= 3'd2;
                         m_axi_awburst <= 2'd1;
                         m_axi_awvalid <= 1;
-                        // Upper half data from hold register (no wready)
-                        m_axi_wdata[63:32] <= hold_data_hi;
-                        m_axi_wdata[31:0]  <= 32'd0;
-                        m_axi_wstrb    <= 8'hF0;
-                        m_axi_wlast    <= 1'b1;
-                        m_axi_wvalid   <= 1;
-                        state <= AW_U;
+                        state <= XFER;
                     end
                 end
 
-                // Upper half: combined AW+W (no separate W_U, no wready)
-                AW_U: begin
-                    if (m_axi_awready)
-                        m_axi_awvalid <= 0;
-                    if (m_axi_wready && m_axi_wvalid) begin
-                        m_axi_wvalid <= 0;
-                        m_axi_bready <= 1;
-                        state <= B_U;
-                    end
-                end
-
-                // Upper half: wait for write response, then advance to next word
-                B_U: begin
-                    if (m_axi_bvalid) begin
-                        m_axi_bready <= 0;
-                        words_rem <= words_rem - 1;
-                        sub_addr  <= sub_addr + 8;
-                        if (words_rem > 1) begin
-                            // Next word: lower half
-                            m_axi_awaddr  <= sub_addr + 8;
-                            m_axi_awlen   <= 8'd0;
-                            m_axi_awsize  <= 3'd2;
-                            m_axi_awburst <= 2'd1;
-                            m_axi_awvalid <= 1;
-                            state <= AW_L;
-                        end else begin
-                            busy  <= 0;
-                            done  <= 1;
-                            state <= IDLE;
+                // Issue AW + send W beats (overlapped for efficiency)
+                XFER: begin
+                    // AW channel
+                    if (!aw_grant) begin
+                        if (m_axi_awready) begin
+                            m_axi_awvalid <= 0;
+                            aw_grant <= 1;
                         end
                     end
+
+                    // W channel — data driven from registered beat_cnt
+                    m_axi_wdata <= wdata_steer;
+                    m_axi_wstrb <= wstrb_steer;
+                    m_axi_wlast  <= (beat_cnt == burst_len);
+
+                    if (!w_last_done) begin
+                        m_axi_wvalid <= 1;
+                        if (m_axi_wready) begin
+                            if (beat_cnt == burst_len) begin
+                                w_last_done <= 1;
+                            end else begin
+                                beat_cnt <= beat_cnt + 1;
+                            end
+                        end
+                    end
+
+                    // Both AW and W complete → wait for B
+                    if (aw_grant && w_last_done) begin
+                        m_axi_wvalid <= 0;
+                        m_axi_wlast  <= 0;
+                        m_axi_bready <= 1;
+                        state <= B_WAIT;
+                    end
+                end
+
+                B_WAIT: begin
+                    if (m_axi_bvalid) begin
+                        m_axi_bready <= 0;
+                        state <= FINISH;
+                    end
+                end
+
+                FINISH: begin
+                    busy     <= 0;
+                    done     <= 1;
+                    beat_cnt <= 0;
+                    state    <= IDLE;
                 end
             endcase
         end

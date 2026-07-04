@@ -16,7 +16,10 @@ proc write32 {addr val} {
 }
 
 # GP0 register offsets
+set REG_WR_ADDR     0x04
+set REG_WR_DATA     0x08
 set REG_START     0x00
+set REG_Q8_NUM_GROUPS 0x10
 set REG_STATUS    0x14
 set REG_DESC_BASE 0x18
 set REG_DESC_TAIL 0x1C
@@ -27,7 +30,6 @@ set REG_CLK_SLW   0x30
 set REG_ACT_INFO  0x34
 set REG_DESC_INFO 0x38
 set REG_Q8_DEBUG  0x3C
-set REG_Q8_NUM_GROUPS 0x10
 
 proc gp0_read {reg} {
     global GP0_BASE
@@ -141,7 +143,7 @@ proc verify_checker {addr nbytes test_id} {
 
 # Start chain and wait for HEAD to reach expected_head
 proc run_chain {desc_base expected_head} {
-    global REG_DESC_BASE REG_DESC_TAIL REG_START REG_DESC_HEAD REG_STATUS REG_DEBUG REG_CLK_CNT REG_Q8_DEBUG
+    global REG_DESC_BASE REG_DESC_TAIL REG_START REG_DESC_HEAD REG_STATUS REG_DEBUG REG_CLK_CNT REG_Q8_DEBUG REG_ACT_INFO REG_DESC_INFO REG_WR_ADDR REG_WR_DATA
     gp0_write $REG_DESC_BASE $desc_base
     after 10
     gp0_write $REG_DESC_TAIL 1
@@ -157,6 +159,9 @@ proc run_chain {desc_base expected_head} {
         if {$head >= $expected_head} {
             set elapsed [expr {[clock milliseconds] - $start}]
             puts "  Done at ${elapsed}ms (HEAD=$head)"
+            set wr_addr [gp0_read $REG_WR_ADDR]
+            set wr_data [gp0_read $REG_WR_DATA]
+            puts "  REG_WR_ADDR=[format 0x%08x $wr_addr] REG_WR_DATA=[format 0x%08x $wr_data]"
             set done 1
             break
         }
@@ -169,19 +174,19 @@ proc run_chain {desc_base expected_head} {
         set q8_dbg [gp0_read $REG_Q8_DEBUG]
         set head [gp0_read $REG_DESC_HEAD]
         set clk [gp0_read $REG_CLK_CNT]
-        set col_group [expr ($dbg >> 12) & 0xF]
-        set state [expr ($dbg >> 28) & 0x1F]
-        set state_names {IDLE FETCH_DESC FETCH_DESC_W LOAD_ACT LOAD_ACT_W WRITE_RES WRITE_RES_W DONE LOAD_WEIGHT LOAD_WEIGHT_W LOAD_SCALES LOAD_SCALES_W COPY_ACT_TO_CORE COMPUTE COMPUTE_W READ_RES READ_RES_ACC COPY_ACC_TO_BUF TIMEOUT_ERROR}
-        if {$state < [llength $state_names]} { set sname [lindex $state_names $state] } else { set sname "UNK" }
-        set sc_byte_idx0 [expr ($q8_dbg >> 8) & 1]
+        set state_mask [expr ($dbg >> 27) & 0x1F]
+        set state_names {IDLE FETCH_DESC FETCH_DESC_W LOAD_ACT LOAD_ACT_W WRITE_RES WRITE_RES_W DONE LOAD_WEIGHT LOAD_WEIGHT_W LOAD_SCALES LOAD_SCALES_W COPY_ACT_TO_CORE COMPUTE COMPUTE_W READ_RES READ_RES_ACC COPY_ACC_TO_BUF TIMEOUT_ERROR WRITE_RES_BURST}
+        if {$state_mask < [llength $state_names]} { set sname [lindex $state_names $state_mask] } else { set sname "UNK" }
+        set sc_byte_idx0 [expr ($q8_dbg >> 7) & 1]
         puts "  TIMEOUT: STATUS=[format 0x%08x $status] DEBUG=[format 0x%08x $dbg] Q8_DEBUG=[format 0x%08x $q8_dbg] HEAD=$head CLK_CNT=[format 0x%08x $clk]"
-        puts "  FSM state=$state ($sname), col_group=$col_group, sc_byte_idx[7:0]=[expr $dbg & 0xFF], sc_byte_idx[0]=$sc_byte_idx0"
-        if {$state == 18} {
-            set act_info [gp0_read $REG_ACT_INFO]
-            set to_src [expr $act_info & 0x1F]
-            if {$to_src < [llength $state_names]} { set to_sname [lindex $state_names $to_src] } else { set to_sname "UNK" }
-            puts "  TIMEOUT_ERROR: source_state=$to_src ($to_sname)"
-        }
+        puts "  FSM state=$state_mask ($sname), rd_busy=[expr ($dbg>>24)&1] wr_busy=[expr ($dbg>>23)&1] rd_done=[expr ($dbg>>26)&1] wr_done=[expr ($dbg>>25)&1]"
+        # Read timeout source from REG_ACT_INFO always on timeout
+        set act_info [gp0_read $REG_ACT_INFO]
+        set desc_info [gp0_read $REG_DESC_INFO]
+        set to_src [expr $act_info & 0x1F]
+        if {$to_src < [llength $state_names]} { set to_sname [lindex $state_names $to_src] } else { set to_sname "UNK" }
+        puts "  REG_ACT_INFO=[format 0x%08x $act_info] timeout_src=$to_src ($to_sname)"
+        puts "  REG_DESC_INFO=[format 0x%08x $desc_info] (act_total_bytes=$desc_info)"
         return 0
     }
     return 1

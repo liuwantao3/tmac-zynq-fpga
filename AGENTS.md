@@ -265,6 +265,7 @@ All cores output S24.8 fixed-point (48-bit accumulator, zero-extended to 64-bit 
     - ~~Multi-group column iteration (14 groups × 64 cols = 896 cols)~~ ✅ Done (2026-06-28)
      - ~~**Multi-group bug fixes (q8_wt_din, col_group, act_remaining)**~~ ✅ Done (2026-07-01) — all verified in iVerilog simulation; comprehensive test suite passes
      - ~~**Test 9a: multi-group 64×128 tile (2 groups)**~~ ✅ **PASSED ON HARDWARE (2026-07-02)** — all 64 rows = 128 (64×2), 21ms. All 9 tests PASS.
+    - **Scale format: UQ8.8, NOT fp16 (2026-07-04)** — The Q8 dequant function in `matmul_q8_core.v:278` treats the scale as raw unsigned >> 8 (UQ8.8 format, where 0x0100 = 1.0). Tests 14/17/18 in `run_hp_fsm_extended.tcl` incorrectly used fp16 0x3C00 (= 1.0 as fp16, but raw value 15360 → dequant = 60 per column → row sum = 3840 = 0x0F00). Fixed by changing to 0x0100. The C++ simulation pipeline (`fpga_sim.hpp:1234`) also specifies UQ8.8 for scales ("combined scales UQ8.8"). The real inference pipeline must pack Q8_0 per-block fp16 scales converted to UQ8.8 before writing to DDR.
 13. **Phase 3: matmul_top weight loading integration** — connect HP read master with matmul_top's weight_buf loading, run single-layer compute with all 5 cores.
 
 ## Build & Run Commands

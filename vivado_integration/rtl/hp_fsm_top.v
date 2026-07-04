@@ -124,6 +124,8 @@ module hp_fsm_top (
     reg [31:0] reg_desc_info;      // 0x38: {8'h0, act_total_bytes[23:0]}
     reg [31:0] reg_q8_debug;       // 0x3C: Q8 core debug status
     reg  [3:0] reg_q8_num_groups;  // 0x10[3:0]: number of column groups (0=single)
+    reg [31:0] reg_wr_addr_dbg;    // 0x04: wr_burst_addr captured at WRITE_RES_BURST start
+    reg [31:0] reg_wr_data_dbg;    // 0x08: first 32-bit word of act_buf data at WRITE_RES_BURST start
 
     // ===== HP Read Master =====
     wire       rd_busy, rd_done, rd_valid;
@@ -154,21 +156,21 @@ module hp_fsm_top (
     );
 
     // ===== HP Write Master =====
-    wire       wr_busy, wr_done, wr_wready;
+    wire       wr_busy, wr_done, wr_data_ready;
     wire [2:0] wr_dbg_state;
     reg        wr_start;
-    reg [63:0] wr_wdata;
-    reg        wr_wvalid;
+    wire [7:0] wr_data_in;
+    reg        wr_data_valid;
     reg [31:0] wr_addr;
-    reg [15:0] wr_count;
+    reg [7:0]  wr_burst_len;
 
     axihp_write_master u_wr (
         .clk(clk), .rst_n(rst_n),
         .start(wr_start), .dst_addr(wr_addr),
-        .word_count(wr_count),
+        .burst_len(wr_burst_len),
         .busy(wr_busy), .done(wr_done),
         .dbg_state(wr_dbg_state),
-        .wdata(wr_wdata), .wvalid(wr_wvalid), .wready(wr_wready),
+        .data_in(wr_data_in), .data_valid(wr_data_valid), .data_ready(wr_data_ready),
         .m_axi_awid(m_axi_awid), .m_axi_awaddr(m_axi_awaddr),
         .m_axi_awvalid(m_axi_awvalid), .m_axi_awready(m_axi_awready),
         .m_axi_awlen(m_axi_awlen), .m_axi_awsize(m_axi_awsize),
@@ -233,10 +235,16 @@ module hp_fsm_top (
     reg [7:0]  sc_din_lo;         // captured low byte for scale packing
     reg [5:0]  copy_act_idx;      // activation copy index (0..63)
 
+    // Write-side burst tracking
+    reg [23:0] wr_remaining;      // total bytes left to write across all bursts
+    reg [31:0] wr_burst_addr;     // DDR address for next burst
+    reg [8:0]  wr_burst_bytes;    // bytes in current burst (max 512)
+    reg [8:0]  wr_byte_offset;    // cumulative byte offset into act_buf
+
     // Multi-group accumulator
     reg signed [47:0] acc_buf [0:63];  // running accumulator across column groups
     reg [3:0]  col_group;              // current column group (0..13)
-    reg [5:0]  copy_acc_idx;           // acc_buf → act_buf copy index
+    reg [5:0]  copy_acc_idx;           // acc_buf ? act_buf copy index
     reg [15:0] timeout_cnt;            // shared timeout counter for all wait states
     reg [4:0]  timeout_src;            // state that triggered timeout (latched at timeout)
 
@@ -260,12 +268,13 @@ module hp_fsm_top (
     localparam READ_RES_ACC   = 5'd16;
     localparam COPY_ACC_TO_BUF = 5'd17;
     localparam TIMEOUT_ERROR  = 5'd18;
+    localparam WRITE_RES_BURST  = 5'd19;
 
     // Multi-group flag: non-zero when q8_num_groups > 1 (from descriptor, fallback to GP0 reg)
     wire multi_group = (q8_num_groups > 1);
 
     reg [4:0] state;
-    reg [5:0] byte_idx;
+    reg [8:0] byte_idx;             // write byte index (0..511)
     reg [7:0] desc_byte_idx;
     reg [8:0] act_byte_idx;
 
@@ -278,6 +287,7 @@ module hp_fsm_top (
     end
     assign rd_done_rise = rd_done && !rd_done_d;
     assign wr_done_rise = wr_done && !wr_done_d;
+    assign wr_data_in = act_buf[wr_byte_offset];
     assign q8_done_rise = q8_done && !q8_done_d;
 
     always @(posedge clk or negedge rst_n) begin
@@ -289,8 +299,8 @@ module hp_fsm_top (
             reg_q8_debug <= 0;
             rd_start <= 0; rd_ready <= 0;
             rd_addr <= 0; rd_len <= 0;
-            wr_start <= 0; wr_wvalid <= 0; wr_wdata <= 0;
-            wr_addr <= 0; wr_count <= 0;
+            wr_start <= 0; wr_data_valid <= 0;
+            wr_addr <= 0; wr_burst_len <= 0;
             byte_idx <= 0;
             desc_byte_idx <= 0;
             act_byte_idx <= 0;
@@ -326,13 +336,18 @@ module hp_fsm_top (
             q8_res_addr <= 0;
             col_group <= 0;
             copy_acc_idx <= 0;
+            wr_remaining <= 0;
+            wr_burst_addr <= 0;
+            wr_burst_bytes <= 0;
             timeout_cnt <= 0;
             timeout_src <= 0;
+            reg_wr_addr_dbg <= 0;
+            reg_wr_data_dbg <= 0;
         end else begin
             reg_clk_cnt <= reg_clk_cnt + 1;
             reg_clk_cnt_slow <= reg_clk_cnt_slow + (|reg_clk_cnt[9:0] ? 0 : 1);
             rd_start <= 0; rd_ready <= 0;
-            wr_start <= 0; wr_wvalid <= 0;
+            wr_start <= 0; wr_data_valid <= 0;
             reg_status[15] <= 1'b1;  // default busy
             // Default-off for Q8 core control signals
             q8_start <= 0;
@@ -379,7 +394,7 @@ module hp_fsm_top (
                         q8_num_groups <= (desc_buf[20][3:0] != 0) ? desc_buf[20][3:0] : reg_q8_num_groups;
                         act_byte_idx   <= 0;
                         byte_idx       <= 0;
-                        // Branch: CPU_OP → LOAD_ACT (passthrough), else → LOAD_WEIGHT (compute)
+                        // Branch: CPU_OP ? LOAD_ACT (passthrough), else ? LOAD_WEIGHT (compute)
                         // Use desc_buf directly (tensor_type register lags by 1 cycle)
                         if ({desc_buf[17], desc_buf[16]} == 15) begin
                             state <= LOAD_ACT;
@@ -426,6 +441,7 @@ module hp_fsm_top (
                     rd_ready <= rd_valid;
                     if (rd_valid && rd_ready && act_byte_idx < act_total_bytes) begin
                         act_buf[act_byte_idx] <= rd_data;
+                        $display("[ACT] load idx=%0d data=0x%02x", act_byte_idx, rd_data);
                         act_byte_idx <= act_byte_idx + 1;
                     end
                     if (rd_done_rise) begin
@@ -656,34 +672,37 @@ module hp_fsm_top (
                     end
                 end
 
-                // === Write result to DDR ===
+                // === Write result to DDR (byte-stream, multi-burst) ===
+                // Initiates the first burst; subsequent bursts loop through WRITE_RES_BURST.
                 WRITE_RES: begin
                     reg_status[9] <= 0;
-                    wr_addr  <= result_addr;
-                    if (tensor_type == 15) begin
-                        wr_count <= {8'd0, act_total_bytes[15:3]};
-                    end else begin
-                        wr_count <= 16'd64;
-                    end
-                    wr_wdata <= {act_buf[7], act_buf[6], act_buf[5], act_buf[4],
-                                 act_buf[3], act_buf[2], act_buf[1], act_buf[0]};
-                    wr_wvalid <= 1;
-                    wr_start <= 1;
+                    wr_remaining <= (tensor_type == 15) ? act_total_bytes : 24'd512;
+                    wr_burst_addr <= result_addr;
                     byte_idx <= 0;
-                    state <= WRITE_RES_W;
+                    wr_byte_offset <= 0;
+                    state <= WRITE_RES_BURST;
                 end
 
-                WRITE_RES_W: begin
-                    wr_start   <= 0;
-                    wr_wvalid <= (byte_idx < wr_count);
-                    wr_wdata <= {act_buf[byte_idx*8+7], act_buf[byte_idx*8+6],
-                                 act_buf[byte_idx*8+5], act_buf[byte_idx*8+4],
-                                 act_buf[byte_idx*8+3], act_buf[byte_idx*8+2],
-                                 act_buf[byte_idx*8+1], act_buf[byte_idx*8+0]};
-                    if (wr_wready && wr_wvalid)
-                        byte_idx <= byte_idx + 1;
-                    if (wr_done_rise) begin
-                        timeout_cnt <= 0;
+                // Start next INCR burst
+                WRITE_RES_BURST: begin
+                    byte_idx <= 0;
+                    if (wr_remaining >= 64) begin
+                        reg_wr_addr_dbg <= wr_burst_addr;
+                        reg_wr_data_dbg <= {act_buf[3], act_buf[2], act_buf[1], act_buf[0]};
+                        wr_addr <= wr_burst_addr;
+                        wr_burst_len <= 8'd15;
+                        wr_start <= 1;
+                        wr_burst_bytes <= 9'd64;
+                        state <= WRITE_RES_W;
+                    end else if (wr_remaining >= 4) begin
+                        reg_wr_addr_dbg <= wr_burst_addr;
+                        reg_wr_data_dbg <= {act_buf[3], act_buf[2], act_buf[1], act_buf[0]};
+                        wr_addr <= wr_burst_addr;
+                        wr_burst_len <= (wr_remaining[7:0] >> 2) - 1;
+                        wr_start <= 1;
+                        wr_burst_bytes <= wr_remaining[8:0];
+                        state <= WRITE_RES_W;
+                    end else begin
                         reg_status[9] <= 1;
                         reg_desc_head <= reg_desc_head + 1;
                         if (next_addr != 0) begin
@@ -691,6 +710,34 @@ module hp_fsm_top (
                             state <= FETCH_DESC;
                         end else begin
                             state <= DONE;
+                        end
+                    end
+                end
+
+                // Feed bytes to write master for current burst, then loop
+                WRITE_RES_W: begin
+                    wr_start <= 0;
+                    wr_data_valid <= (byte_idx < wr_burst_bytes);
+                    if (wr_data_ready && wr_data_valid) begin
+                        byte_idx <= byte_idx + 1;
+                        wr_byte_offset <= wr_byte_offset + 1;
+                    end
+                    if (wr_done_rise) begin
+                        timeout_cnt <= 0;
+                        wr_burst_addr <= wr_burst_addr + wr_burst_bytes;
+                        // Check before subtracting so burst-size comparison works
+                        if (wr_remaining > wr_burst_bytes) begin
+                            wr_remaining <= wr_remaining - wr_burst_bytes;
+                            state <= WRITE_RES_BURST;
+                        end else begin
+                            reg_status[9] <= 1;
+                            reg_desc_head <= reg_desc_head + 1;
+                            if (next_addr != 0) begin
+                                desc_addr <= next_addr;
+                                state <= FETCH_DESC;
+                            end else begin
+                                state <= DONE;
+                            end
                         end
                     end else if (&timeout_cnt) begin
                         timeout_cnt <= 0;
@@ -725,29 +772,29 @@ module hp_fsm_top (
             endcase
 
             // DEBUG: expose state and status continuously
-            reg_debug[31:28] <= state;
-            reg_debug[27]    <= rd_done;
-            reg_debug[26]    <= wr_done;
-            reg_debug[25]    <= rd_busy;
-            reg_debug[24]    <= wr_busy;
-            reg_debug[23]    <= q8_busy;
-            reg_debug[22:20] <= wr_dbg_state;
-            reg_debug[19:17] <= rd_dbg_state;
-            reg_debug[16]    <= q8_done;
-            reg_debug[15:12] <= col_group;
-            reg_debug[11:8]  <= timeout_cnt[15:12];
+            reg_debug[31:27] <= state;       // 5-bit state (was 4 bits, lost state[4])
+            reg_debug[26]    <= rd_done;
+            reg_debug[25]    <= wr_done;
+            reg_debug[24]    <= rd_busy;
+            reg_debug[23]    <= wr_busy;
+            reg_debug[22]    <= q8_busy;
+            reg_debug[21:19] <= wr_dbg_state;
+            reg_debug[18:16] <= rd_dbg_state;
+            reg_debug[15]    <= q8_done;
+            reg_debug[14:11] <= col_group;
+            reg_debug[10:8]  <= timeout_cnt[15:13];
             reg_debug[7:0]   <= sc_byte_idx[7:0];
 
-            reg_q8_debug[31:28] <= state;
-            reg_q8_debug[27]    <= q8_busy;
-            reg_q8_debug[26]    <= q8_done;
-            reg_q8_debug[25]    <= q8_start;
-            reg_q8_debug[24]    <= q8_act_we;
-            reg_q8_debug[23:21] <= q8_core_state;     // Q8 core's internal FSM state
-            reg_q8_debug[20:18] <= q8_core_g;         // Q8 core's bank counter
-            reg_q8_debug[17:12] <= q8_core_k;         // Q8 core's column counter
-            reg_q8_debug[11:8]  <= {copy_act_idx[1:0], q8_sc_we, sc_byte_idx[0]};
-            reg_q8_debug[7:0]   <= wt_byte_idx[7:0];
+            reg_q8_debug[31:27] <= state;       // 5-bit state
+            reg_q8_debug[26]    <= q8_busy;
+            reg_q8_debug[25]    <= q8_done;
+            reg_q8_debug[24]    <= q8_start;
+            reg_q8_debug[23]    <= q8_act_we;
+            reg_q8_debug[22:20] <= q8_core_state;     // Q8 core's internal FSM state
+            reg_q8_debug[19:17] <= q8_core_g;         // Q8 core's bank counter
+            reg_q8_debug[16:11] <= q8_core_k;         // Q8 core's column counter
+            reg_q8_debug[10:7]  <= {copy_act_idx[1:0], q8_sc_we, sc_byte_idx[0]};
+            reg_q8_debug[6:0]   <= wt_byte_idx[6:0];
         end
     end
 
@@ -814,6 +861,8 @@ module hp_fsm_top (
                         rstate <= R_DATA;
                      case (s_axil_araddr)
                          0:       s_axil_rdata <= {28'h0, reg_start};
+                         16'h4:   s_axil_rdata <= reg_wr_addr_dbg;
+                         16'h8:   s_axil_rdata <= reg_wr_data_dbg;
                          16'h10:  s_axil_rdata <= {28'h0, reg_q8_num_groups};
                          16'h14:  s_axil_rdata <= reg_status;
                          16'h18:  s_axil_rdata <= reg_desc_base;
