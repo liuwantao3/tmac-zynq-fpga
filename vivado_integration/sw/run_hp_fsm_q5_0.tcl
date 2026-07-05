@@ -283,13 +283,123 @@ if {[run_chain $Q5_DESC_ADDR 1]} {
             set ok 0
         }
     }
-    if {$ok} {
+	if {$ok} {
         puts "  Q5_0 Test: PASS (all 8 rows = $expected)"
     } else {
         puts "  Q5_0 Test: FAIL"
     }
 } else {
     puts "  Q5_0 Test: TIMEOUT"
+}
+
+# ===================================================================
+# Test 2: Chain of 2 Q5_0 descriptors
+#   Desc 0: all-1s -> expect 896 per row
+#   Desc 1: all-0s -> expect 0 per row
+# ===================================================================
+puts "\n--- Test 2: Chain of 2 Q5_0 (all-1s -> all-0s) ---"
+
+# Helper to fill all 224 blocks with a constant q5_val
+proc fill_q5_weight {base q5_nibble} {
+    for {set blk 0} {$blk < 224} {incr blk} {
+        set bo [expr $blk * 22]
+        set qs_byte [expr ($q5_nibble << 4) | $q5_nibble]
+        # f16(1.0) = 0x3C00
+        mwr -force -size 1 [expr $base + $bo + 0] 0x00
+        mwr -force -size 1 [expr $base + $bo + 1] 0x3C
+        # qh = 0xFFFFFFFF
+        mwr -force -size 1 [expr $base + $bo + 2] 0xFF
+        mwr -force -size 1 [expr $base + $bo + 3] 0xFF
+        mwr -force -size 1 [expr $base + $bo + 4] 0xFF
+        mwr -force -size 1 [expr $base + $bo + 5] 0xFF
+        # qs: 16 bytes
+        for {set k 0} {$k < 16} {incr k} {
+            mwr -force -size 1 [expr $base + $bo + 6 + $k] $qs_byte
+        }
+    }
+}
+
+# Helper to fill scales at weight_base + 4928
+proc fill_q5_scales {weight_base} {
+    set sc_word [expr {0x0001 | (0x0001 << 16)}]
+    for {set j 0} {$j < 4} {incr j} {
+        write32 [expr $weight_base + 4928 + $j * 4] $sc_word
+    }
+}
+
+# Helper to fill activations
+proc fill_q5_acts {base val} {
+    set act_word [expr {($val & 0xFFFF) | (($val & 0xFFFF) << 16)}]
+    for {set j 0} {$j < [expr 1792 / 4]} {incr j} {
+        write32 [expr $base + $j * 4] $act_word
+    }
+}
+
+# Helper to verify 8 rows at result_addr
+proc verify_q5_result {res_addr expected test_id} {
+    set ok 1
+    for {set j 0} {$j < 8} {incr j} {
+        set addr [expr $res_addr + $j * 8]
+        set lo [read32 $addr]
+        set hi [read32 [expr $addr + 4]]
+        set got_signed [expr {($hi << 32) | $lo}]
+        if {$got_signed >= [expr {1 << 47}]} {
+            set got_signed [expr {$got_signed - (1 << 48)}]
+        }
+        if {$got_signed == $expected} {
+            puts "  Row $j: PASS (got $got_signed)"
+        } else {
+            puts "  FAIL[${test_id}]: row $j lo=[format 0x%08x $lo] hi=[format 0x%08x $hi] got=$got_signed expected=$expected"
+            set ok 0
+        }
+    }
+    return $ok
+}
+
+# Zero 64 bytes
+proc zero_res {addr} {
+    for {set j 0} {$j < 16} {incr j} {
+        write32 [expr $addr + $j * 4] 0
+    }
+}
+
+set Q5_DESC0_ADDR 0x001002C0
+set Q5_DESC1_ADDR 0x00100300
+set Q5_W1_ADDR    0x00108000
+set Q5_A1_ADDR    0x00109000
+set Q5_R0_ADDR    0x0010A000
+set Q5_R1_ADDR    0x0010A040
+
+# Write weight/act for desc 0 (all-1s -> 896)
+puts "  Writing desc 0 weight/act (all-1s)..."
+fill_q5_weight $Q5_WEIGHT_ADDR 1
+fill_q5_scales  $Q5_WEIGHT_ADDR
+fill_q5_acts    $Q5_ACT_ADDR 1
+zero_res $Q5_RES_ADDR
+
+# Write weight/act for desc 1 (all-0s -> 0)
+puts "  Writing desc 1 weight/act (all-0s)..."
+fill_q5_weight $Q5_W1_ADDR 0
+fill_q5_scales  $Q5_W1_ADDR
+fill_q5_acts    $Q5_A1_ADDR 1
+zero_res $Q5_R1_ADDR
+
+# Chain: desc0 -> desc1 -> 0
+write_desc $Q5_DESC0_ADDR $Q5_DESC1_ADDR $Q5_WEIGHT_ADDR $Q5_ACT_ADDR $Q5_R0_ADDR 1792 1
+write_desc $Q5_DESC1_ADDR 0 $Q5_W1_ADDR $Q5_A1_ADDR $Q5_R1_ADDR 1792 1
+
+if {[run_chain $Q5_DESC0_ADDR 2]} {
+    set head [gp0_read $REG_DESC_HEAD]
+    puts "  HEAD=$head (expect 2)"
+    set s0 [verify_q5_result $Q5_R0_ADDR 896 2]
+    set s1 [verify_q5_result $Q5_R1_ADDR 0 2]
+    if {$s0 && $s1} {
+        puts "  Test 2: PASS"
+    } else {
+        puts "  Test 2: FAIL"
+    }
+} else {
+    puts "  Test 2: TIMEOUT"
 }
 
 # ===================================================================

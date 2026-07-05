@@ -149,6 +149,7 @@ module tb_hp_fsm_q5_0;
         axil_araddr = 0; axil_arvalid = 0; axil_rready = 0;
     endtask
 
+    // --- Q5_0 descriptor setup ---
     task setup_q5_desc(input [31:0] desc_addr, input [31:0] next_addr,
                        input [31:0] weight_addr, input [31:0] act_addr,
                        input [31:0] res_addr, input [23:0] act_bytes);
@@ -157,6 +158,20 @@ module tb_hp_fsm_q5_0;
         ddr_write32(desc_addr + 8,  act_addr);
         ddr_write32(desc_addr + 12, res_addr);
         ddr_write32(desc_addr + 16, 32'h00000001);  // tensor_type=1 (Q5_0)
+        ddr_write32(desc_addr + 20, 32'h00000000);
+        ddr_write32(desc_addr + 24, {8'h00, act_bytes});
+        ddr_write32(desc_addr + 28, 32'h00000000);
+    endtask
+
+    // --- CPU_OP descriptor setup ---
+    task setup_cpu_desc(input [31:0] desc_addr, input [31:0] next_addr,
+                        input [31:0] act_addr, input [31:0] res_addr,
+                        input [23:0] act_bytes);
+        ddr_write32(desc_addr + 0,  next_addr);
+        ddr_write32(desc_addr + 4,  0);              // weight_addr = 0 (unused)
+        ddr_write32(desc_addr + 8,  act_addr);
+        ddr_write32(desc_addr + 12, res_addr);
+        ddr_write32(desc_addr + 16, 32'h0000000F);  // tensor_type=15 (CPU_OP)
         ddr_write32(desc_addr + 20, 32'h00000000);
         ddr_write32(desc_addr + 24, {8'h00, act_bytes});
         ddr_write32(desc_addr + 28, 32'h00000000);
@@ -182,7 +197,7 @@ module tb_hp_fsm_q5_0;
         if (!completed) $display("  WARN: wait_done timeout");
     endtask
 
-    // Write one Q5_0 block (22 bytes) at DDR byte offset
+    // Write one Q5_0 block (22 bytes) at DDR byte offset with given q5_val
     task gen_q5_block_at(input [31:0] base, input [15:0] byte_off,
                          input [3:0] q5_val);
         reg [15:0] f16;
@@ -191,14 +206,72 @@ module tb_hp_fsm_q5_0;
             f16 = 16'h3C00;  // f16(1.0) = 0x3C00
             ddr_write8(base + byte_off + 0, f16[7:0]);
             ddr_write8(base + byte_off + 1, f16[15:8]);
-            // qh = 0xFFFFFFFF
-            ddr_write8(base + byte_off + 2, 8'hFF);
+            ddr_write8(base + byte_off + 2, 8'hFF);  // qh = 0xFFFFFFFF
             ddr_write8(base + byte_off + 3, 8'hFF);
             ddr_write8(base + byte_off + 4, 8'hFF);
             ddr_write8(base + byte_off + 5, 8'hFF);
-            // qs: 16 bytes, each byte = q5_val in both nibbles
             for (k = 0; k < 16; k = k + 1)
                 ddr_write8(base + byte_off + 6 + k, {q5_val, q5_val});
+        end
+    endtask
+
+    // Fill all 224 blocks with a given q5_val
+    task fill_q5_weight(input [31:0] base, input [3:0] q5_val);
+        integer b;
+        begin
+            for (b = 0; b < 224; b = b + 1)
+                gen_q5_block_at(base, b * 22, q5_val);
+        end
+    endtask
+
+    // Fill 8 row scales (UQ8.8 = 0x0001 for scale=1/256)
+    task fill_q5_scales(input [31:0] weight_base);
+        integer s;
+        begin
+            for (s = 0; s < 8; s = s + 1) begin
+                ddr_write8(weight_base + 4928 + s*2, 8'd1);
+                ddr_write8(weight_base + 4928 + s*2 + 1, 8'd0);
+            end
+        end
+    endtask
+
+    // Fill 896 x int16 activations
+    task fill_q5_acts(input [31:0] base, input [15:0] val);
+        integer a;
+        begin
+            for (a = 0; a < 896; a = a + 1) begin
+                ddr_write8(base + a*2, val[7:0]);
+                ddr_write8(base + a*2 + 1, val[15:8]);
+            end
+        end
+    endtask
+
+    // Verify 8 rows of Q5_0 result at res_addr
+    task verify_q5_result(input [31:0] res_addr, input [47:0] expected, input integer tn);
+        integer r;
+        reg [31:0] lo, hi;
+        reg signed [47:0] got;
+        begin
+            for (r = 0; r < 8; r = r + 1) begin
+                lo = ddr_read32(res_addr + r*8);
+                hi = ddr_read32(res_addr + r*8 + 4);
+                got = {hi[15:0], lo};
+                if (got == expected) begin
+                    $display("  Row %0d: PASS (got %0d)", r, got);
+                end else begin
+                    $display("  FAIL[%0d]: row %0d got %0d expected %0d", tn, r, got, expected);
+                    fail_count = fail_count + 1;
+                end
+            end
+        end
+    endtask
+
+    // Zero 64 bytes
+    task zero_res(input [31:0] addr);
+        integer z;
+        begin
+            for (z = 0; z < 16; z = z + 1)
+                ddr_write32(addr + z*4, 32'h00000000);
         end
     endtask
 
@@ -206,80 +279,163 @@ module tb_hp_fsm_q5_0;
         $dumpfile("tb_hp_fsm_q5_0.vcd");
         $dumpvars(0, tb_hp_fsm_q5_0);
         $display("==============================================");
-        $display("  HP FSM Q5_0 Dispatch Path Test");
+        $display("  HP FSM Q5_0 Multi-Descriptor Tests");
         $display("==============================================");
         #12 rst_n = 1; #20;
         fail_count = 0; test_num = 0;
 
-        // DDR layout:
-        //   Desc    @ 0x00300000
-        //   Weight  @ 0x00310000 (4928 bytes)
-        //   Act     @ 0x00320000 (1792 bytes)
-        //   Res     @ 0x00330000 (64 bytes)
-
+        // =================================================================
+        // Test 1: Single Q5_0 descriptor, all-1s -> expect 896 per row
+        // =================================================================
         test_num = test_num + 1;
-        $display("\n--- Test %0d: Q5_0 all-1s (expect each row=896) ---", test_num);
-
+        $display("\n--- Test %0d: Single Q5_0 all-1s (expect each row=896) ---", test_num);
         setup_q5_desc(32'h00300000, 32'h00000000,
                       32'h00310000, 32'h00320000, 32'h00330000, 1792);
-
-        // Weight data: 224 blocks x 22 bytes = 4928 bytes
-        $display("  Writing weight data...");
-        for (i = 0; i < 224; i = i + 1)
-            gen_q5_block_at(32'h00310000, i * 22, 4'd1);
-
-        // Row scales: 8 x 16-bit at weight_addr + 4928
-        $display("  Writing scales...");
-        for (i = 0; i < 8; i = i + 1) begin
-            reg [15:0] sc;
-            sc = 16'h0001;
-            ddr_write8(32'h00310000 + 4928 + i*2, sc[7:0]);
-            ddr_write8(32'h00310000 + 4928 + i*2 + 1, sc[15:8]);
-        end
-
-        // Activations: 896 x 16-bit
-        $display("  Writing activations...");
-        for (i = 0; i < 896; i = i + 1) begin
-            ddr_write8(32'h00320000 + i*2, 8'd1);
-            ddr_write8(32'h00320000 + i*2 + 1, 8'd0);
-        end
-
-        // Zero result area
-        for (i = 0; i < 8; i = i + 1)
-            ddr_write32(32'h00330000 + i*4, 32'h00000000);
-
+        fill_q5_weight(32'h00310000, 4'd1);
+        fill_q5_scales(32'h00310000);
+        fill_q5_acts(32'h00320000, 16'd1);
+        zero_res(32'h00330000);
         start_chain(32'h00300000);
         wait_done(1);
         axil_read(16'h14, rd_val); $display("  STATUS=0x%08x", rd_val);
         axil_read(16'h28, rd_val); $display("  DEBUG=0x%08x", rd_val);
         axil_read(16'h20, rd_val); $display("  HEAD=%d", rd_val);
+        verify_q5_result(32'h00330000, 896, test_num);
 
-        // Verify: each row should be 896
-        for (i = 0; i < 8; i = i + 1) begin
-            reg [31:0] lo, hi;
-            reg signed [47:0] got;
-            lo = ddr_read32(32'h00330000 + i*8);
-            hi = ddr_read32(32'h00330000 + i*8 + 4);
-            got = {hi[15:0], lo};
-            if (got == 896) begin
-                $display("  Row %0d: PASS (got %0d)", i, got);
-            end else begin
-                $display("  Row %0d: FAIL (got %0d, expected 896)", i, got);
+        // =================================================================
+        // Test 2: Chain of 2 Q5_0 descriptors
+        //   Desc 0: all-1s -> expect 896 per row
+        //   Desc 1: all-0s -> expect 0 per row
+        // =================================================================
+        test_num = test_num + 1;
+        $display("\n--- Test %0d: Chain of 2 Q5_0 (all-1s, then all-0s) ---", test_num);
+        setup_q5_desc(32'h00300020, 32'h00300040,   // desc 0 -> desc 1
+                      32'h00310000, 32'h00320000, 32'h00330040, 1792);
+        setup_q5_desc(32'h00300040, 32'h00000000,   // desc 1 -> end
+                      32'h00313000, 32'h00322000, 32'h00330080, 1792);
+        fill_q5_weight(32'h00310000, 4'd1);   // Desc 0: weights=1 -> expect 896
+        fill_q5_scales(32'h00310000);
+        fill_q5_weight(32'h00313000, 4'd0);   // Desc 1: weights=0 -> expect 0
+        fill_q5_scales(32'h00313000);
+        fill_q5_acts(32'h00320000, 16'd1);    // Desc 0 acts = 1
+        fill_q5_acts(32'h00322000, 16'd1);    // Desc 1 acts = 1
+        zero_res(32'h00330040);
+        zero_res(32'h00330080);
+        start_chain(32'h00300020);
+        wait_done(2);
+        axil_read(16'h14, rd_val); $display("  STATUS=0x%08x", rd_val);
+        axil_read(16'h20, rd_val); $display("  HEAD=%d (expect 2)", rd_val);
+        $display("  Verifying Desc 0 (weights=1, expect 896):");
+        verify_q5_result(32'h00330040, 896, test_num);
+        $display("  Verifying Desc 1 (weights=0, expect 0):");
+        verify_q5_result(32'h00330080, 0, test_num);
+
+        // =================================================================
+        // Test 3: Mixed chain CPU_OP -> Q5_0
+        //   Desc 0: CPU_OP passthrough 64 bytes
+        //   Desc 1: Q5_0 all-1s -> expect 896
+        // =================================================================
+        test_num = test_num + 1;
+        $display("\n--- Test %0d: Mixed CPU_OP -> Q5_0 ---", test_num);
+        // CPU_OP: act=pattern, res=0x00340000 (passthrough)
+        setup_cpu_desc(32'h00300060, 32'h00300080,
+                       32'h00340000, 32'h00340040, 64);
+        // Q5_0: weights=1, acts=1 -> 896
+        setup_q5_desc(32'h00300080, 32'h00000000,
+                      32'h00314000, 32'h00323000, 32'h003300C0, 1792);
+        // CPU_OP pattern: incrementing 64 bytes (0x00..0x3F)
+        for (j = 0; j < 16; j = j + 1)
+            ddr_write32(32'h00340000 + j*4,
+                (4*j+0) + ((4*j+1) << 8) + ((4*j+2) << 16) + ((4*j+3) << 24));
+        zero_res(32'h00340040);
+        $display("  Writing weight/act for Q5_0 desc 1...");
+        fill_q5_weight(32'h00314000, 4'd1);
+        fill_q5_scales(32'h00314000);
+        fill_q5_acts(32'h00323000, 16'd1);
+        zero_res(32'h003300C0);
+
+        start_chain(32'h00300060);
+        wait_done(2);
+        axil_read(16'h14, rd_val); $display("  STATUS=0x%08x", rd_val);
+        axil_read(16'h20, rd_val); $display("  HEAD=%d (expect 2)", rd_val);
+        // Verify CPU_OP passthrough
+        $display("  Verifying CPU_OP passthrough (64 bytes):");
+        for (j = 0; j < 16; j = j + 1) begin
+            reg [31:0] expected;
+            expected = (4*j+0) + ((4*j+1) << 8) + ((4*j+2) << 16) + ((4*j+3) << 24);
+            rd_val = ddr_read32(32'h00340040 + j*4);
+            if (rd_val == expected)
+                $display("    Word %0d: PASS (0x%08x)", j, rd_val);
+            else begin
+                $display("    FAIL[%0d]: word %0d got 0x%08x expected 0x%08x", test_num, j, rd_val, expected);
                 fail_count = fail_count + 1;
             end
         end
+        // Verify Q5_0 result
+        $display("  Verifying Q5_0 desc 1 (expect 896 per row):");
+        verify_q5_result(32'h003300C0, 896, test_num);
+
+        // =================================================================
+        // Test 4: Chain of 3: Q5_0 -> CPU_OP -> Q5_0
+        //   Desc 0: Q5_0 all-1s -> 896
+        //   Desc 1: CPU_OP passthrough 64 bytes
+        //   Desc 2: Q5_0 all-2s -> 3584
+        // =================================================================
+        test_num = test_num + 1;
+        $display("\n--- Test %0d: Chain of 3 (Q5_0 -> CPU_OP -> Q5_0) ---", test_num);
+        setup_q5_desc(32'h003000A0, 32'h003000C0,   // desc 0 -> desc 1
+                      32'h00315000, 32'h00324000, 32'h00330100, 1792);
+        setup_cpu_desc(32'h003000C0, 32'h003000E0,   // desc 1 -> desc 2
+                       32'h00340100, 32'h00340140, 64);
+        setup_q5_desc(32'h003000E0, 32'h00000000,   // desc 2 -> end
+                      32'h00317000, 32'h00325000, 32'h00330180, 1792);
+        // Desc 0: Q5_0 weights=1, acts=1 -> 896
+        fill_q5_weight(32'h00315000, 4'd1);
+        fill_q5_scales(32'h00315000);
+        fill_q5_acts(32'h00324000, 16'd1);
+        zero_res(32'h00330100);
+        // Desc 1: CPU_OP incrementing pattern
+        for (j = 0; j < 16; j = j + 1)
+            ddr_write32(32'h00340100 + j*4, (4*j+0) + ((4*j+1) << 8) + ((4*j+2) << 16) + ((4*j+3) << 24));
+        zero_res(32'h00340140);
+        // Desc 2: Q5_0 weights=2, acts=2 -> 3584
+        fill_q5_weight(32'h00317000, 4'd2);
+        fill_q5_scales(32'h00317000);
+        fill_q5_acts(32'h00325000, 16'd2);
+        zero_res(32'h00330180);
+
+        start_chain(32'h003000A0);
+        wait_done(3);
+        axil_read(16'h14, rd_val); $display("  STATUS=0x%08x", rd_val);
+        axil_read(16'h20, rd_val); $display("  HEAD=%d (expect 3)", rd_val);
+        $display("  Verifying Q5_0 desc 0 (weights=1, expect 896):");
+        verify_q5_result(32'h00330100, 896, test_num);
+        $display("  Verifying CPU_OP desc 1 passthrough (64 bytes):");
+        for (j = 0; j < 16; j = j + 1) begin
+            reg [31:0] expected;
+            expected = (4*j+0) + ((4*j+1) << 8) + ((4*j+2) << 16) + ((4*j+3) << 24);
+            rd_val = ddr_read32(32'h00340140 + j*4);
+            if (rd_val == expected)
+                $display("    Word %0d: PASS (0x%08x)", j, rd_val);
+            else begin
+                $display("    FAIL[%0d]: word %0d got 0x%08x expected 0x%08x", test_num, j, rd_val, expected);
+                fail_count = fail_count + 1;
+            end
+        end
+        $display("  Verifying Q5_0 desc 2 (weights=2, acts=2, expect 3584):");
+        verify_q5_result(32'h00330180, 3584, test_num);
 
         // Summary
         $display("\n==============================================");
         if (fail_count == 0)
-            $display("  ALL TESTS PASSED");
+            $display("  ALL %0d TESTS PASSED", test_num);
         else
-            $display("  %0d TESTS FAILED", fail_count);
+            $display("  %0d TESTS FAILED (of %0d)", fail_count, test_num);
         $display("==============================================");
         #100 $finish;
     end
 
-    initial #1000000 begin
+    initial #5000000 begin
         $display("TIMEOUT");
         $finish;
     end
