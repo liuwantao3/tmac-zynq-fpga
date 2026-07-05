@@ -211,9 +211,10 @@ All cores output S24.8 fixed-point (48-bit accumulator, zero-extended to 64-bit 
 |------|------|-----------|--------|
 | `matmul_q8_core.v` | 64×896 | ~515 | ✅ Working |
 | `matmul_q4k_core.v` | 56×256 | ~? | ✅ Working |
+| `matmul_q5_0_core.v` | 4×896 | ~7170 | ✅ Working (2 cores, 4 rows/tile) |
 | `matmul_int16_core.v` | 64×64 | 515 | ✅ Working |
 | `matmul_top.v` | — | — | ✅ 5 cores instantiated (Q8, Q4K, Q5_0, Q6_K, INT16) |
-| `hp_fsm_top.v` | HP FSM + Q8 | N/A | ✅ Descriptor-chain DMA, Q8 compute 64×896 (14-group) |
+| `hp_fsm_top.v` | HP FSM + Q8 + Q5_0 | N/A | ✅ Descriptor-chain DMA, Q8 compute 64×896 (14-group), Q5_0 4×896 (2-core) |
 
 ### Missing Verilog Cores:
 
@@ -221,22 +222,56 @@ All cores output S24.8 fixed-point (48-bit accumulator, zero-extended to 64-bit 
 |------|------|--------|
 | None | — | All cores implemented ✅ |
 
-## Current Status (2026-07-05) — After Q5_0 Pipeline Fix + HW Integration
+## Current Status (2026-07-05) — 2-Core Q5_0, HW Verified
 
 | Resource | Used | Available | % | Notes |
 |----------|------|-----------|---|-------|
-| Slice LUTs | **10,959** | 17,600 | **62.3** | +3,190 from Q5_0 cores |
-| LUT as Logic | **10,852** | 17,600 | **61.7** | |
-| LUT as Memory | **107** | 6,000 | **1.78** | |
-| Slice Regs | 13,131 | 35,200 | 37.3 | |
-| BRAM18 | **49** | 120 | **40.8** | +32 (4× Q5_0 cores × 8 BRAM each) |
-| DSP48E1 | **28** | 80 | **35.0** | +12 (4× Q5_0 cores × 2 DSP each + Q8) |
-| Slice | 4,393 | 4,400 | **99.84** | Tight — routing congestion |
-| **WNS** | **-7.779 ns** | 10 ns | Violated | Works at typical conditions (HW verified) |
+| Slice LUTs | **9,898** | 17,600 | **56.2** | +2,129 from Q5_0 (was 7,769 baseline) |
+| LUT as Logic | **9,801** | 17,600 | **55.7** | |
+| LUT as Memory | **97** | 6,000 | **1.62** | |
+| Slice Regs | 12,781 | 35,200 | 36.3 | |
+| BRAM18 | **33** | 120 | **27.5** | Q8(17) + 2×Q5_0(8+8) = 33 |
+| DSP48E1 | **22** | 80 | **27.5** | Q8(16) + 2×Q5_0(3+3) = 22 |
+| Slice | 4,387 | 4,400 | **99.7** | Tight — routing congestion |
+| **WNS** | **-9.74 ns** | 10 ns | Violated | Works on HW despite violation |
 
 **Bitstream sources:** `axihp_read_master.v` + `axihp_write_master.v` + `matmul_q8_core.v` + `matmul_q5_0_core.v` + `hp_fsm_top.v`
 
-**Hardware tests:** All 11 tests PASS (9 baseline + 2 Q5_0). Q5_0 all-1s (8 rows × 896) PASS in 21ms. Q8 all-1s (64 rows × 64) PASS. Q8 multi-group (64 rows × 128) PASS.
+**Hardware tests:** All 13 tests PASS (9 baseline + 4 Q5_0). Q5_0 single desc (4 rows × 896) PASS. Q5_0 chain-of-2 (all-1s→all-0s) PASS. Mixed CPU_OP→Q5_0 chains PASS. Q8 tests unchanged.
+
+### Hierarchical Resource Breakdown (Vivado routed)
+
+```
+Instance          Tot LUTs   %Total   FFs    BRAM18  DSP   Role
+─────────────────────────────────────────────────────────────────────────
+inst (FSM top)      4,464    47.0%   8,531     0       2   hp_fsm_top control logic
+u_q8                2,148    22.6%   3,187    17      16   Q8 compute core
+u_wr (write mstr)   1,141    12.0%    131      0       0   AXI HP write master
+u_q5_core0            830     8.4%    167      8       2   Q5_0 core (rows 0-1)
+u_q5_core1            766     7.7%    167      8       2   Q5_0 core (rows 2-3)
+axi_lite (auto_pc)    392     4.1%    482      0       0   AXI protocol converter
+u_rd (read mstr)      173     1.8%    116      0       0   AXI HP read master
+─────────────────────────────────────────────────────────────────────────
+Total               9,914   100%   12,781    33      22
+```
+
+**`inst (FSM top)` — 4,464 LUTs (47%)** is the binding constraint. Contains:
+- Q8 weight/scale/act loading FSM with byte-unpack shift registers (~1,200 LUTs)
+- Q5_0 weight loading (4,928-byte iteration, per-cycle bank/addr/we routing) (~800 LUTs)
+- Q5_0 scale/act copy/unpack FSM (~300 LUTs)
+- Buffer arrays: desc_buf(32B), act_buf(64×64b), acc_buf(64×48b) in FFs (~600 LUTs)
+- AXI4-Lite slave + register file (~200 LUTs)
+- Main FSM state decode + counters (~500 LUTs)
+- Q8/Q5_0 dispatch branching (~400 LUTs)
+- Q8 control signals (wmem/smem/acc BRAM steering) (~400 LUTs)
+
+**Note on LUTRAM→BRAM conversion potential:** The 3 FF-based buffers (act_buf 4,096 b, acc_buf 3,072 b, desc_buf 256 b) total 7,680 bits — fitting in 1 RAMB18. Converting them would save ~7,400 FFs but **zero LUTs** (all 4,464 FSM LUTs are logic, not LUTRAM). Slice savings: ~50-70 slices (1-1.5%). Not the bottleneck.
+
+**Why slices are full (99.7%) despite 56.2% LUT usage:**
+- 473 CARRY4 chains lock LUT pairs into fixed slice positions
+- 2,383 MUXF7 + 1,152 MUXF8 use dedicated mux per slice
+- 307 unique control sets force slice-level partitioning
+- LUTRAM in desc_buf/act_buf occupies SLICEM slices exclusively
 
 ### Q5_0 Pipeline Bugs Found and Fixed
 
@@ -247,6 +282,19 @@ All cores output S24.8 fixed-point (48-bit accumulator, zero-extended to 64-bit 
    - D1: `d_fp_w * q5_w` → `pipe_dq` (1 DSP)
    - D2: `pipe_dq * scale >> 8` + clamp → `pipe_dec` (1 DSP)
    - A: `acc[row] += pipe_dec * act_r` + ei++ (1 DSP + add)
+
+### 2-Core Design (2026-07-05)
+
+Reduced from 4 to 2 Q5_0 cores due to 99.84% slice utilization causing timing glitches on core 3. Each Q5_0 tile processes 4 rows (2 cores × 2 rows) instead of 8 rows. attn_q (896×896) requires 224 descriptors per layer instead of 112. All HW tests pass with no glitches.
+
+| Metric | 4-Core (before) | 2-Core (after) | Delta |
+|--------|----------------|---------------|-------|
+| LUTs | 10,959 | 9,898 | -1,061 |
+| BRAM18 | 49 | 33 | -16 |
+| DSP | 28 | 22 | -6 |
+| Slice | 4,393 | 4,387 | -6 |
+| WNS | -7.78 ns | -9.74 ns | worse (routing var) |
+| HW glitches | Row 7 = -232 | None | fixed |
 
 ## Two-Track Plan
 
@@ -349,7 +397,7 @@ python3 scripts/extract_tmac.py models/qwen2-0_5b-instruct-q4_k_m.gguf /tmp/mode
 - `verilog/tb_cosim_q5_0.v` — Q5_0 co-simulation (waits for tile dump)
 - `verilog/tb_cosim_q6_k.v` — Q6_K co-simulation (waits for tile dump)
 - `verilog/tb_hw_fsm_comprehensive.v` — HP FSM all 7 tests (HEAD-based wait_done)
-- `verilog/tb_hp_fsm_q5_0.v` — HP FSM Q5_0 dispatch test (all-1s pattern)
+- `verilog/tb_hp_fsm_q5_0.v` — HP FSM Q5_0 dispatch test (all-1s pattern, chain of 2, mixed CPU_OP+Q5_0, chain of 3)
 - `verilog/tb_q5_off_by_one.v` — Q5_0 off-by-one BRAM bug verification (non-uniform patterns)
 - `verilog/test_hp_loopback.v` — 32-bit HP loopback testbench (ARSIZE=2 proven)
 - `verilog/sim_ddr_axi_hp.v` — AXI HP DDR model for simulation
