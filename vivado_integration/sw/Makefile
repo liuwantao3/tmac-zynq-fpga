@@ -5,31 +5,46 @@ OBJDUMP = $(LLVM_DIR)/llvm-objdump.exe
 OBJCOPY = $(LLVM_DIR)/llvm-objcopy.exe
 SIZE = $(LLVM_DIR)/llvm-size.exe
 
-CFLAGS  = --target=armv7a-none-eabi -mcpu=cortex-a9 -O2 -g -nostdlib -ffreestanding
-LDFLAGS = -T link.ld -Map=hp_baremetal.map
+CFLAGS  = --target=armv7a-none-eabi -mcpu=cortex-a9 -O2 -g -nostdlib -ffreestanding -ffast-math
+CXXFLAGS = --target=armv7a-none-eabi -mcpu=cortex-a9 -O1 -g -nostdlib -ffreestanding -ffast-math -fno-exceptions -fno-rtti
+LDFLAGS = -T link.ld -Map=tmac.map
 
 OBJS_COMMON = startup.o
 
-all: hp_baremetal.elf hp_baremetal.bin test_int16.elf test_int16.bin
+all: tmac_baremetal.elf tmac_baremetal.bin test_fpga_cores.elf test_fpga_cores.bin hp_baremetal.elf test_int16.elf
 
-# Baremetal HP test (no BSP, MMU off before main)
+# ===== T-MAC Bare-Metal Inference Engine =====
+tmac_baremetal.elf: $(OBJS_COMMON) tmac_baremetal.o link.ld tmac_baremetal.h
+	$(LD) $(LDFLAGS) $(OBJS_COMMON) tmac_baremetal.o -o $@
+	$(SIZE) $@
+
+tmac_baremetal.bin: tmac_baremetal.elf
+	$(OBJCOPY) -O binary $< $@
+
+# ===== Standalone FPGA Core Test Wrapper =====
+test_fpga_cores.elf: $(OBJS_COMMON) test_fpga_cores.o link.ld tmac_baremetal.h
+	$(LD) $(LDFLAGS) $(OBJS_COMMON) test_fpga_cores.o -o $@
+	$(SIZE) $@
+
+test_fpga_cores.bin: test_fpga_cores.elf
+	$(OBJCOPY) -O binary $< $@
+
+# ===== Existing HP FSM test =====
 hp_baremetal.elf: $(OBJS_COMMON) hp_baremetal.o link.ld
 	$(LD) $(LDFLAGS) $(OBJS_COMMON) hp_baremetal.o -o $@
 	$(SIZE) $@
 
-hp_baremetal.bin: hp_baremetal.elf
-	$(OBJCOPY) -O binary $< $@
-
-# Legacy int16 test
+# ===== Legacy INT16 test =====
 test_int16.elf: $(OBJS_COMMON) main.o link.ld
 	$(LD) $(LDFLAGS) $(OBJS_COMMON) main.o -o $@
 	$(SIZE) $@
 
-test_int16.bin: test_int16.elf
-	$(OBJCOPY) -O binary $< $@
-
+# Compilation rules
 %.o: %.c regs.h
 	$(CC) $(CFLAGS) -c -o $@ $<
+
+%.o: %.cpp regs.h tmac_baremetal.h
+	$(CC) $(CXXFLAGS) -c -o $@ $<
 
 %.o: %.s
 	$(CC) $(CFLAGS) -c -o $@ $<

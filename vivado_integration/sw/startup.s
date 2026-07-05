@@ -24,6 +24,15 @@ _start:
     dsb
     isb
 
+    // Enable FPU (VFPv3-D16 on Cortex-A9)
+    mrc p15, 0, r0, c1, c0, 2  // Read CPACR
+    orr r0, r0, #(0xF << 20)   // Enable CP10 and CP11 (FPU access)
+    mcr p15, 0, r0, c1, c0, 2  // Write CPACR
+    dsb
+    isb
+    mov r3, #0x40000000
+    vmsr fpexc, r3              // FPEXC.EN = 1 (enable FPU)
+
     // Set stack pointer
     ldr sp, =__stack_top
 

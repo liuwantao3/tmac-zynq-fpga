@@ -409,6 +409,75 @@ Total: 56 × 48 = 2688 bytes block data + 8 bytes norm (4 × UQ8.8) = 2696 bytes
 | 8 | Negative activations | 1 | -1 | -229376 | signed accum |
 | 9 | 5-desc mixed chain | 1, 0, 1 | 1, 1, 1 | 229376, 0, 229376 | deep mixed chain |
 
+## Bare-Metal ARM Port (2026-07-05) — FPGA Cores Tested on Hardware
+
+| Component | File | Status |
+|-----------|------|--------|
+| Boot code (startup.s) | `vivado_integration/sw/startup.s` | ✅ FPU enable added (CPACR+FPEXC), MMU/caches off |
+| Register map + types | `vivado_integration/sw/tmac_baremetal.h` | ✅ AXI-Lite access, math builtins, FP16→FP32 |
+| Inference engine | `vivado_integration/sw/tmac_baremetal.cpp` | Q8/Q5 FPGA paths, CPU fallback for other types |
+| Core test wrapper | `vivado_integration/sw/test_fpga_cores.cpp` | ✅ Runs on HW, 5 tests |
+| Linker script | `vivado_integration/sw/link.ld` | ✅ DDR at 0x00100000, 64KB stack |
+| Makefile | `vivado_integration/sw/Makefile` | ✅ LLVM/clang cross-compile |
+| XSDB test script | `vivado_integration/sw/run_test_fpga_cores.tcl` | ✅ bitstream+ps7_init+AFI+dow+run |
+| XSDB addr map test | `vivado_integration/sw/test_addr_map2.tcl` | ✅ Proved PS=PL address mapping |
+
+### Key Fixes Found During Bare-Metal Port
+
+1. **FPU not enabled** — Cortex-A9 VFP is disabled after reset (FPEXC.EN=0). Any floating-point instruction (float literals, casts, math) causes an undefined instruction exception. `startup.s` now enables CP10/CP11 in CPACR and sets FPEXC.EN=1. Without this, `test_fpga_cores` crashed immediately in the initialization loop (`act_all1[i] = 1.0f`).
+
+2. **48-bit result sign extension** — The Q8/Q5 cores output 48-bit signed accumulators, zero-extended to 64-bit words in DDR. For negative results, the ARM code must manually sign-extend from bit 47:
+   ```c
+   uint64_t raw = (uint64_t)lo | ((uint64_t)hi << 32);
+   if (raw & ((uint64_t)1 << 47)) raw |= 0xFFFF000000000000ULL;
+   int32_t acc = (int32_t)(int64_t)raw;
+   ```
+
+3. **AFI0 registers at 0xF800_8000** — The AFI control registers are at 0xF800_8000 (not 0xF800_9000 as documented in earlier AGENTS.md). Correct config sequence:
+   ```
+   mwr 0xF8000008 0x0000DF0D    # unlock SLCR
+   mwr 0xF8000910 0x0000000F    # LVL_SHFTR_EN
+   mwr 0xF8008000 0x00000005    # AFI0_CTRL (enable + slverr)
+   mwr 0xF8008004 0x00000044    # AFI0_PART (R:4, W:4 entries)
+   mwr 0xF8008008 0x00000001    # AFI0_WRCHAN
+   mwr 0xF8000004 0x0000767B    # lock SLCR
+   ```
+
+4. **PS=PL address mapping confirmed** — Writes via ARM core at PS address X are visible to the HP FSM at the same numeric address X. Both PS and PL share the same DDR address space (no 0x00100000 offset). Verified by `test_addr_map2.tcl` with CPU_OP descriptor passthrough test.
+
+5. **Q8 weight format: single group, per-group scales** — The HP FSM loads ONE group's weights (4096 bytes = 64×64 INT8 column-major) and reuses them across all column groups via multi-group iteration. Scales are loaded per-group from `weight_addr + 4096 + g*256`. Activation data is loaded per-group from `act_addr + g*128`.
+
+6. **Q5_0 scale location** — Row_inv UQ16.8 values follow the 4928 bytes of block data: 4 × uint16_t at `weight_addr + 4928`.
+
+7. **CPU_OP descriptor** — Tensor type 15: loads `act_total_bytes` from `act_addr` into act_buf, writes directly to `result_addr` (passthrough). Used for CPU-only ops between FPGA matmuls.
+
+8. **`-O1` required** — `-O2` build has a BSS layout issue on LLVM 7.0.1. Use `-O1` for bare-metal compilation.
+
+9. **Scratch buffer addresses** — Must use addresses within the first ~500 MB of DDR. The range `0x1F000000-0x1F004000` (just below the last 1MB) is verified working. Higher addresses in the `0x17E00000` range may have DDR access issues.
+
+10. **UART not initialized by ps7_init** — PS7 UART at 0xE0000000 is not fully initialized after ps7_post_config. `uart_init()` must program baud rate and enable TX. Until fixed, avoid UART output in test programs — use DDR buffer writes for result reporting.
+
+### Test Results (HW, 2026-07-05)
+
+```
+test_tiny.elf: ALL PASS — DDR write, FPGA reg access, CPU_OP descriptor passthrough
+test_fpga_cores.elf:
+  Q8 all-1s:    PASS  (weights=1, acts=1 → 896 per row)
+  Q8 all(-1)s:  FAIL  (weights=-1, acts=1 — sign issue)
+  Q5 val=1:     FAIL
+  Q5 val=0:     PASS
+  Q5 val=-1:    FAIL
+```
+
+Known issue: negative value tests fail — likely the 48-bit sign extension fix needs verification. The `read48()` helper function was added to `test_fpga_cores.cpp` but the test output offsets in the XSDB script were reading wrong words (fixed in `run_test_fpga_cores.tcl` to read words [9],[10],[11]).
+
+### Next Steps
+
+1. Run `test_fpga_cores.elf` with corrected output offsets to confirm sign extension fix
+2. Build and run `tmac_baremetal.elf` with a loaded model for full inference
+3. Switch to `-O2` once BSS layout issue is understood
+4. Initialize UART properly for debug output
+
 ### 2-Core Design (2026-07-05)
 
 Reduced from 4 to 2 Q5_0 cores due to 99.84% slice utilization causing timing glitches on core 3. Each Q5_0 tile processes 4 rows (2 cores × 2 rows) instead of 8 rows. attn_q (896×896) requires 224 descriptors per layer instead of 112. All HW tests pass with no glitches.
