@@ -217,6 +217,80 @@ module hp_fsm_top (
         .dbg_state(q8_core_state), .dbg_k(q8_core_k), .dbg_g(q8_core_g)
     );
 
+    // ===== Q5_0 Compute Cores (4 parallel, each handles 2 of 8 rows) =====
+    wire       q5_done0, q5_done1, q5_done2, q5_done3;
+    wire       q5_busy0, q5_busy1, q5_busy2, q5_busy3;
+    reg        q5_start;
+    reg        q5_wt_we0, q5_wt_we1, q5_wt_we2, q5_wt_we3;
+    reg [2:0]  q5_wt_bank;
+    reg [9:0]  q5_wt_addr;
+    reg [7:0]  q5_wt_din;
+    reg        q5_sc_we;
+    reg [2:0]  q5_sc_addr;
+    reg [15:0] q5_sc_din;
+    reg        q5_act_we;
+    reg [9:0]  q5_act_addr;
+    reg [15:0] q5_act_din;
+    reg [0:0]  q5_res_addr;
+    wire [47:0] q5_res0, q5_res1, q5_res2, q5_res3;
+
+    matmul_q5_0_core u_q5_core0 (
+        .clk(clk), .rst_n(rst_n), .start(q5_start),
+        .done(q5_done0), .busy(q5_busy0),
+        .wt_we(q5_wt_we0), .wt_bank(q5_wt_bank), .wt_addr(q5_wt_addr), .wt_din(q5_wt_din),
+        .sc_we(q5_sc_we), .sc_addr(q5_sc_addr), .sc_din(q5_sc_din),
+        .act_we(q5_act_we), .act_addr(q5_act_addr), .act_din(q5_act_din),
+        .res_addr(q5_res_addr), .res_dout(q5_res0), .core_id(2'd0),
+        .dbg_tile_start(1'b0), .dbg_tile_cycles(), .dbg_tile_id(), .dbg_verbose(1'b0)
+    );
+    matmul_q5_0_core u_q5_core1 (
+        .clk(clk), .rst_n(rst_n), .start(q5_start),
+        .done(q5_done1), .busy(q5_busy1),
+        .wt_we(q5_wt_we1), .wt_bank(q5_wt_bank), .wt_addr(q5_wt_addr), .wt_din(q5_wt_din),
+        .sc_we(q5_sc_we), .sc_addr(q5_sc_addr), .sc_din(q5_sc_din),
+        .act_we(q5_act_we), .act_addr(q5_act_addr), .act_din(q5_act_din),
+        .res_addr(q5_res_addr), .res_dout(q5_res1), .core_id(2'd1),
+        .dbg_tile_start(1'b0), .dbg_tile_cycles(), .dbg_tile_id(), .dbg_verbose(1'b0)
+    );
+    matmul_q5_0_core u_q5_core2 (
+        .clk(clk), .rst_n(rst_n), .start(q5_start),
+        .done(q5_done2), .busy(q5_busy2),
+        .wt_we(q5_wt_we2), .wt_bank(q5_wt_bank), .wt_addr(q5_wt_addr), .wt_din(q5_wt_din),
+        .sc_we(q5_sc_we), .sc_addr(q5_sc_addr), .sc_din(q5_sc_din),
+        .act_we(q5_act_we), .act_addr(q5_act_addr), .act_din(q5_act_din),
+        .res_addr(q5_res_addr), .res_dout(q5_res2), .core_id(2'd2),
+        .dbg_tile_start(1'b0), .dbg_tile_cycles(), .dbg_tile_id(), .dbg_verbose(1'b0)
+    );
+    matmul_q5_0_core u_q5_core3 (
+        .clk(clk), .rst_n(rst_n), .start(q5_start),
+        .done(q5_done3), .busy(q5_busy3),
+        .wt_we(q5_wt_we3), .wt_bank(q5_wt_bank), .wt_addr(q5_wt_addr), .wt_din(q5_wt_din),
+        .sc_we(q5_sc_we), .sc_addr(q5_sc_addr), .sc_din(q5_sc_din),
+        .act_we(q5_act_we), .act_addr(q5_act_addr), .act_din(q5_act_din),
+        .res_addr(q5_res_addr), .res_dout(q5_res3), .core_id(2'd3),
+        .dbg_tile_start(1'b0), .dbg_tile_cycles(), .dbg_tile_id(), .dbg_verbose(1'b0)
+    );
+
+    wire q5_all_done = q5_done0 & q5_done1 & q5_done2 & q5_done3;
+    wire q5_any_busy = q5_busy0 | q5_busy1 | q5_busy2 | q5_busy3;
+    reg q5_done_d;
+    wire q5_done_rise;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) q5_done_d <= 0;
+        else q5_done_d <= q5_all_done;
+    end
+    assign q5_done_rise = q5_all_done && !q5_done_d;
+
+    // ===== Compute type: 0=Q8, 1=Q5_0 =====
+    reg [1:0] compute_type;
+
+    // ===== Q5_0 helper regs =====
+    reg [15:0] q5_wt_byte_idx;      // overall byte position in Q5_0 weight (0..4927)
+    reg [7:0]  q5_unpack_cnt;       // counter for unpacking DDR words (0..7)
+    reg [9:0]  q5_copy_act_idx;     // activation copy index (0..895)
+    reg [1:0]  q5_res_core;         // result readback core index (0..3)
+    reg [0:0]  q5_res_row;          // result readback local row (0..1)
+
     // ===== Buffer =====
     reg [7:0] desc_buf [0:31];    // 32-byte descriptor
     reg [63:0] act_buf [0:63];    // 64 x 64-bit = 512 bytes result buffer (Q8: 64 rows x 8 bytes)
@@ -273,6 +347,16 @@ module hp_fsm_top (
     localparam COPY_ACC_TO_BUF = 5'd17;
     localparam TIMEOUT_ERROR  = 5'd18;
     localparam WRITE_RES_BURST  = 5'd19;
+    // Q5_0 compute path states
+    localparam Q5_LOAD_WEIGHT   = 5'd20;
+    localparam Q5_LOAD_WEIGHT_W = 5'd21;
+    localparam Q5_LOAD_SCALES   = 5'd22;
+    localparam Q5_LOAD_SCALES_W = 5'd23;
+    localparam Q5_COPY_ACT      = 5'd24;
+    localparam Q5_COPY_ACT_W    = 5'd25;
+    localparam Q5_COMPUTE       = 5'd26;
+    localparam Q5_COMPUTE_W     = 5'd27;
+    localparam Q5_READ_RES      = 5'd28;
 
     // Multi-group flag: non-zero when q8_num_groups > 1 (from descriptor, fallback to GP0 reg)
     wire multi_group = (q8_num_groups > 1);
@@ -350,6 +434,18 @@ module hp_fsm_top (
             rd_unpack_active <= 0;
             wt_burst_done   <= 0;
             sc_burst_done   <= 0;
+            q5_start        <= 0;
+            q5_wt_we0       <= 0; q5_wt_we1 <= 0; q5_wt_we2 <= 0; q5_wt_we3 <= 0;
+            q5_wt_bank      <= 0; q5_wt_addr <= 0; q5_wt_din <= 0;
+            q5_sc_we        <= 0; q5_sc_addr <= 0; q5_sc_din <= 0;
+            q5_act_we       <= 0; q5_act_addr <= 0; q5_act_din <= 0;
+            q5_res_addr     <= 0;
+            q5_wt_byte_idx  <= 0;
+            q5_unpack_cnt   <= 0;
+            q5_copy_act_idx <= 0;
+            q5_res_core     <= 0;
+            q5_res_row      <= 0;
+            compute_type    <= 0;
         end else begin
             reg_clk_cnt <= reg_clk_cnt + 1;
             reg_clk_cnt_slow <= reg_clk_cnt_slow + (|reg_clk_cnt[9:0] ? 0 : 1);
@@ -361,6 +457,11 @@ module hp_fsm_top (
             q8_wt_we <= 0;
             q8_sc_we <= 0;
             q8_act_we <= 0;
+            // Default-off for Q5_0 core control signals
+            q5_start <= 0;
+            q5_wt_we0 <= 0; q5_wt_we1 <= 0; q5_wt_we2 <= 0; q5_wt_we3 <= 0;
+            q5_sc_we <= 0;
+            q5_act_we <= 0;
 
             case (state)
                 IDLE: begin
@@ -408,11 +509,19 @@ module hp_fsm_top (
                         q8_num_groups <= (desc_buf[20][3:0] != 0) ? desc_buf[20][3:0] : reg_q8_num_groups;
                         act_byte_idx   <= 0;
                         byte_idx       <= 0;
-                        // Branch: CPU_OP ? LOAD_ACT (passthrough), else ? LOAD_WEIGHT (compute)
+                        // Branch by descriptor type
                         // Use desc_buf directly (tensor_type register lags by 1 cycle)
                         if ({desc_buf[17], desc_buf[16]} == 15) begin
+                            // CPU_OP: passthrough activation to DDR
                             state <= LOAD_ACT;
+                        end else if ({desc_buf[17], desc_buf[16]} == 1) begin
+                            // Q5_0 compute path
+                            compute_type <= 1;
+                            q5_wt_byte_idx <= 0;
+                            state <= Q5_LOAD_WEIGHT;
                         end else begin
+                            // Q8 compute path (default)
+                            compute_type <= 0;
                             wt_byte_idx   <= 0;
                             wt_remaining  <= 4096;
                             state <= LOAD_WEIGHT;
@@ -603,6 +712,228 @@ module hp_fsm_top (
                     end
                 end
 
+                // =====================================================================
+                // Q5_0 Compute Path
+                // =====================================================================
+
+                Q5_LOAD_WEIGHT: begin
+                    // Start burst read: 64 bytes from DDR
+                    rd_addr <= weight_addr + q5_wt_byte_idx;
+                    rd_len <= 8'd15;    // 16 AXI beats = 64 bytes
+                    rd_start <= 1;
+                    q5_unpack_cnt <= 0;
+                    wt_burst_done <= 0;
+                    state <= Q5_LOAD_WEIGHT_W;
+                end
+
+                Q5_LOAD_WEIGHT_W: begin
+                    if (!rd_unpack_active) begin
+                        // Capture next 64-bit word from DDR
+                        rd_ready <= rd_valid;
+                        if (rd_valid && rd_ready) begin
+                            rd_unpack_buf <= rd_data;
+                            rd_unpack_active <= 1;
+                            q5_unpack_cnt <= 0;
+                        end
+                    end else begin
+                        rd_ready <= 0;
+                        // Extract one byte from rd_unpack_buf
+                        case (q5_unpack_cnt)
+                            0: q5_wt_din <= rd_unpack_buf[7:0];
+                            1: q5_wt_din <= rd_unpack_buf[15:8];
+                            2: q5_wt_din <= rd_unpack_buf[23:16];
+                            3: q5_wt_din <= rd_unpack_buf[31:24];
+                            4: q5_wt_din <= rd_unpack_buf[39:32];
+                            5: q5_wt_din <= rd_unpack_buf[47:40];
+                            6: q5_wt_din <= rd_unpack_buf[55:48];
+                            7: q5_wt_din <= rd_unpack_buf[63:56];
+                        endcase
+                        // Compute routing: bank, addr based on byte position
+                        q5_wt_bank <= (q5_wt_byte_idx % 22 < 6) ?
+                            (q5_wt_byte_idx % 22) : 3'd6;
+                        q5_wt_addr <= (q5_wt_byte_idx % 22 < 6) ?
+                            ((q5_wt_byte_idx / 22) % 56) :
+                            (((q5_wt_byte_idx / 22) % 56) * 16 + (q5_wt_byte_idx % 22) - 6);
+                        // Per-core write enable by row
+                        case ((q5_wt_byte_idx / 22) / 28)
+                            3'd0: begin q5_wt_we0 <= 1; q5_wt_we1 <= 0; q5_wt_we2 <= 0; q5_wt_we3 <= 0; end
+                            3'd1: begin q5_wt_we0 <= 1; q5_wt_we1 <= 0; q5_wt_we2 <= 0; q5_wt_we3 <= 0; end
+                            3'd2: begin q5_wt_we0 <= 0; q5_wt_we1 <= 1; q5_wt_we2 <= 0; q5_wt_we3 <= 0; end
+                            3'd3: begin q5_wt_we0 <= 0; q5_wt_we1 <= 1; q5_wt_we2 <= 0; q5_wt_we3 <= 0; end
+                            3'd4: begin q5_wt_we0 <= 0; q5_wt_we1 <= 0; q5_wt_we2 <= 1; q5_wt_we3 <= 0; end
+                            3'd5: begin q5_wt_we0 <= 0; q5_wt_we1 <= 0; q5_wt_we2 <= 1; q5_wt_we3 <= 0; end
+                            3'd6: begin q5_wt_we0 <= 0; q5_wt_we1 <= 0; q5_wt_we2 <= 0; q5_wt_we3 <= 1; end
+                            3'd7: begin q5_wt_we0 <= 0; q5_wt_we1 <= 0; q5_wt_we2 <= 0; q5_wt_we3 <= 1; end
+                        endcase
+                        q5_wt_byte_idx <= q5_wt_byte_idx + 1;
+                        if (q5_unpack_cnt == 7) begin
+                            rd_unpack_active <= 0;
+                        end
+                        q5_unpack_cnt <= q5_unpack_cnt + 1;
+                    end
+                    // Burst done: start next burst if more data needed
+                    if (rd_done_rise) wt_burst_done <= 1;
+                    if (wt_burst_done && !rd_unpack_active) begin
+                        wt_burst_done <= 0;
+                        if (q5_wt_byte_idx < 4928) begin
+                            rd_addr <= weight_addr + q5_wt_byte_idx;
+                            rd_len <= 8'd15;
+                            rd_start <= 1;
+                        end
+                    end
+                    // All 4928 bytes loaded: transition to scale load
+                    if (q5_wt_byte_idx >= 4928 && !rd_unpack_active && !wt_burst_done) begin
+                        timeout_cnt <= 0;
+                        state <= Q5_LOAD_SCALES;
+                    end else if (&timeout_cnt && !rd_unpack_active) begin
+                        timeout_cnt <= 0;
+                        timeout_src <= state;
+                        state <= TIMEOUT_ERROR;
+                    end else if (!rd_unpack_active && !(rd_valid && rd_ready)) begin
+                        timeout_cnt <= timeout_cnt + 1;
+                    end
+                end
+
+                Q5_LOAD_SCALES: begin
+                    rd_addr <= weight_addr + 4928;  // scales follow weight data
+                    rd_len <= 8'd3;     // 4 AXI beats = 16 bytes = 8 × 16-bit scales
+                    rd_start <= 1;
+                    q5_unpack_cnt <= 0;
+                    sc_burst_done <= 0;
+                    state <= Q5_LOAD_SCALES_W;
+                end
+
+                Q5_LOAD_SCALES_W: begin
+                    if (!rd_unpack_active) begin
+                        rd_ready <= rd_valid;
+                        if (rd_valid && rd_ready) begin
+                            rd_unpack_buf <= rd_data;
+                            rd_unpack_active <= 1;
+                        end
+                    end else begin
+                        rd_ready <= 0;
+                        q5_sc_we <= 1;
+                        q5_sc_addr <= q5_unpack_cnt[2:0];
+                        case (q5_unpack_cnt[1:0])
+                            0: q5_sc_din <= {rd_unpack_buf[15:8], rd_unpack_buf[7:0]};
+                            1: q5_sc_din <= {rd_unpack_buf[31:24], rd_unpack_buf[23:16]};
+                            2: q5_sc_din <= {rd_unpack_buf[47:40], rd_unpack_buf[39:32]};
+                            3: q5_sc_din <= {rd_unpack_buf[63:56], rd_unpack_buf[55:48]};
+                        endcase
+                        if (q5_unpack_cnt == 7) begin
+                            rd_unpack_active <= 0;
+                        end else if (&q5_unpack_cnt[1:0]) begin
+                            rd_unpack_active <= 0;
+                        end
+                        q5_unpack_cnt <= q5_unpack_cnt + 1;
+                    end
+                    if (rd_done_rise) sc_burst_done <= 1;
+                    if (sc_burst_done && !rd_unpack_active) begin
+                        sc_burst_done <= 0;
+                        timeout_cnt <= 0;
+                        q5_copy_act_idx <= 0;
+                        state <= Q5_COPY_ACT;
+                    end else if (&timeout_cnt && !rd_unpack_active) begin
+                        timeout_cnt <= 0;
+                        timeout_src <= state;
+                        state <= TIMEOUT_ERROR;
+                    end else if (!rd_unpack_active) begin
+                        timeout_cnt <= timeout_cnt + 1;
+                    end
+                end
+
+                Q5_COPY_ACT: begin
+                    // Read 64 bytes from DDR = 8 × 64-bit words = 32 activation values
+                    rd_addr <= act_addr + q5_copy_act_idx * 2;
+                    rd_len <= 8'd15;    // 16 AXI beats = 64 bytes
+                    rd_start <= 1;
+                    sc_burst_done <= 0;
+                    state <= Q5_COPY_ACT_W;
+                end
+
+                Q5_COPY_ACT_W: begin
+                    if (!rd_unpack_active) begin
+                        rd_ready <= rd_valid;
+                        if (rd_valid && rd_ready) begin
+                            rd_unpack_buf <= rd_data;
+                            rd_unpack_active <= 1;
+                            q5_unpack_cnt <= 0;
+                        end
+                    end else begin
+                        rd_ready <= 0;
+                        q5_act_we <= 1;
+                        case (q5_unpack_cnt)
+                            0: begin q5_act_din <= rd_unpack_buf[15:0];  q5_act_addr <= q5_copy_act_idx + 0; end
+                            1: begin q5_act_din <= rd_unpack_buf[31:16]; q5_act_addr <= q5_copy_act_idx + 1; end
+                            2: begin q5_act_din <= rd_unpack_buf[47:32]; q5_act_addr <= q5_copy_act_idx + 2; end
+                            3: begin q5_act_din <= rd_unpack_buf[63:48]; q5_act_addr <= q5_copy_act_idx + 3; end
+                        endcase
+                        if (q5_unpack_cnt == 3) begin
+                            rd_unpack_active <= 0;
+                            q5_copy_act_idx <= q5_copy_act_idx + 4;
+                        end
+                        q5_unpack_cnt <= q5_unpack_cnt + 1;
+                    end
+                    if (rd_done_rise) sc_burst_done <= 1;
+                    if (sc_burst_done && !rd_unpack_active) begin
+                        sc_burst_done <= 0;
+                        timeout_cnt <= 0;
+                        if (q5_copy_act_idx < 896) begin
+                            state <= Q5_COPY_ACT;
+                        end else begin
+                            q5_copy_act_idx <= 0;
+                            state <= Q5_COMPUTE;
+                        end
+                    end else if (&timeout_cnt && !rd_unpack_active) begin
+                        timeout_cnt <= 0;
+                        timeout_src <= state;
+                        state <= TIMEOUT_ERROR;
+                    end else if (!rd_unpack_active) begin
+                        timeout_cnt <= timeout_cnt + 1;
+                    end
+                end
+
+                Q5_COMPUTE: begin
+                    q5_start <= 1;
+                    state <= Q5_COMPUTE_W;
+                end
+
+                Q5_COMPUTE_W: begin
+                    q5_start <= 0;
+                    if (q5_done_rise) begin
+                        timeout_cnt <= 0;
+                        q5_res_core <= 0;
+                        q5_res_row <= 0;
+                        state <= Q5_READ_RES;
+                    end else if (&timeout_cnt) begin
+                        timeout_cnt <= 0;
+                        timeout_src <= state;
+                        state <= TIMEOUT_ERROR;
+                    end else begin
+                        timeout_cnt <= timeout_cnt + 1;
+                    end
+                end
+
+                Q5_READ_RES: begin
+                    // Select which core/row to read
+                    q5_res_addr <= q5_res_row;
+                    act_buf[{q5_res_core, q5_res_row}] <= {16'd0,
+                        (q5_res_core == 0) ? q5_res0 :
+                        (q5_res_core == 1) ? q5_res1 :
+                        (q5_res_core == 2) ? q5_res2 : q5_res3};
+                    if (q5_res_row == 1) begin
+                        q5_res_row <= 0;
+                        if (q5_res_core == 3) begin
+                            byte_idx <= 0;
+                            state <= WRITE_RES;
+                        end else begin
+                            q5_res_core <= q5_res_core + 1;
+                        end
+                    end else begin
+                        q5_res_row <= 1;
+                    end
+                end
+
                 // === Copy activation bytes from act_buf to core act_reg (64 x 16-bit) ===
                 COPY_ACT_TO_CORE: begin
                     q8_act_we <= 1;
@@ -698,7 +1029,9 @@ module hp_fsm_top (
                 // Initiates the first burst; subsequent bursts loop through WRITE_RES_BURST.
                 WRITE_RES: begin
                     reg_status[9] <= 0;
-                    wr_remaining <= (tensor_type == 15) ? act_total_bytes : 24'd512;
+                    if (tensor_type == 15) wr_remaining <= act_total_bytes;
+                    else if (tensor_type == 1) wr_remaining <= 24'd64;  // Q5_0: 8 rows x 8 bytes
+                    else wr_remaining <= 24'd512;  // Q8: 64 rows x 8 bytes
                     wr_burst_addr <= result_addr;
                     byte_idx <= 0;
                     wr_byte_offset <= 0;

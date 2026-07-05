@@ -14,6 +14,7 @@ add_files -fileset sources_1 [list \
     [file normalize "$ver_dir/axihp_read_master.v"] \
     [file normalize "$ver_dir/axihp_write_master.v"] \
     [file normalize "$ver_dir/matmul_q8_core.v"] \
+    [file normalize "$ver_dir/matmul_q5_0_core.v"] \
     [file normalize "$rtl_dir/hp_fsm_top.v"] \
 ]
 update_compile_order -fileset sources_1
@@ -163,6 +164,7 @@ update_compile_order -fileset sources_1
 # Synthesis
 set_property STEPS.SYNTH_DESIGN.ARGS.FLATTEN_HIERARCHY full [get_runs synth_1]
 set_property STEPS.SYNTH_DESIGN.ARGS.FSM_EXTRACTION one_hot [get_runs synth_1]
+set_property STEPS.SYNTH_DESIGN.ARGS.RETIMING true [get_runs synth_1]
 launch_runs synth_1 -jobs 8
 wait_on_run synth_1
 

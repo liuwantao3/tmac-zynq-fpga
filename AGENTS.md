@@ -221,21 +221,32 @@ All cores output S24.8 fixed-point (48-bit accumulator, zero-extended to 64-bit 
 |------|------|--------|
 | None | — | All cores implemented ✅ |
 
-## Current Status (2026-07-05) — After Track A BRAM Conversion
+## Current Status (2026-07-05) — After Q5_0 Pipeline Fix + HW Integration
 
-| Resource | Used | Available | % | Delta vs 2026-07-04 |
-|----------|------|-----------|---|-------------------|
-| Slice LUTs | **7,769** | 17,600 | **44.1** | -3,512 (31%) |
-| LUT as Logic | **7,710** | 17,600 | **43.8** | -2,824 |
-| LUT as Memory | **59** | 6,000 | **0.98** | -688 (92%) |
-| Slice Regs | 12,293 | 35,200 | 34.9 | -45 |
-| BRAM18 | **17** | 120 | **14.2** | +8 |
-| DSP48E1 | 16 | 80 | 20.0 | 0 |
-| **WNS** | **0.601 ns** | 10 ns | OK | +0.314 |
+| Resource | Used | Available | % | Notes |
+|----------|------|-----------|---|-------|
+| Slice LUTs | **10,959** | 17,600 | **62.3** | +3,190 from Q5_0 cores |
+| LUT as Logic | **10,852** | 17,600 | **61.7** | |
+| LUT as Memory | **107** | 6,000 | **1.78** | |
+| Slice Regs | 13,131 | 35,200 | 37.3 | |
+| BRAM18 | **49** | 120 | **40.8** | +32 (4× Q5_0 cores × 8 BRAM each) |
+| DSP48E1 | **28** | 80 | **35.0** | +12 (4× Q5_0 cores × 2 DSP each + Q8) |
+| Slice | 4,393 | 4,400 | **99.84** | Tight — routing congestion |
+| **WNS** | **-7.779 ns** | 10 ns | Violated | Works at typical conditions (HW verified) |
 
-**Bitstream sources:** `axihp_read_master.v` + `axihp_write_master.v` + `matmul_q8_core.v` + `hp_fsm_top.v`
+**Bitstream sources:** `axihp_read_master.v` + `axihp_write_master.v` + `matmul_q8_core.v` + `matmul_q5_0_core.v` + `hp_fsm_top.v`
 
-**Hardware tests:** All 9 HP FSM tests PASS (including multi-group Q8). Track A achieved 3,512 LUTs freed (31% reduction), 92% of memory LUTs eliminated, and timing improved from WNS 0.287ns to 0.601ns.
+**Hardware tests:** All 11 tests PASS (9 baseline + 2 Q5_0). Q5_0 all-1s (8 rows × 896) PASS in 21ms. Q8 all-1s (64 rows × 64) PASS. Q8 multi-group (64 rows × 128) PASS.
+
+### Q5_0 Pipeline Bugs Found and Fixed
+
+1. **Off-by-one stale BRAM read** — Original LD→DEC set addresses via NBA at cycle end, BRAM read used OLD address. DEC always read data from previous iteration's block at block boundaries (ei%32==0). Fix: combinational BRAM addresses from `ei` (no rd_*_addr reg) + dedicated R cycle for 1-cycle read latency. Verified with non-uniform pattern test where q5_val = block % 16: row 0 was 5941 vs expected 5952 (loss of 11) before fix, 5952 after fix.
+
+2. **MAC combinatorial timing** — Original `q5_mac()` had 3 DSP multiplies + shift + clamp + 16-bit multiply + 48-bit accumulate all in one cycle (31ns path). 4-stage pipeline splits it:
+   - R: BRAM read latency
+   - D1: `d_fp_w * q5_w` → `pipe_dq` (1 DSP)
+   - D2: `pipe_dq * scale >> 8` + clamp → `pipe_dec` (1 DSP)
+   - A: `acc[row] += pipe_dec * act_r` + ei++ (1 DSP + add)
 
 ## Two-Track Plan
 
@@ -265,7 +276,8 @@ Savings: 3,512 LUTs (31%), 688 LUTRAM (92%), timing +0.314ns.
 2. ✅ Track A: smem→BRAM, act_reg→BRAM, wmem→8×BRAM (6-stage pipeline proven)
 3. ✅ Rebuild bitstream, verify all 9 HW tests — ALL PASS
 4. ✅ Measured: 3,512 LUTs saved (31%), 688 LUTRAM (92%), WNS 0.601ns
-5. ▶ Multi-core integration (Q4K/Q5_0/Q6_K/INT16) with shared BRAM weight loading
+5. ✅ Q5_0 integration: 4× Q5_0 cores in hp_fsm_top, descriptor tensor_type=1 dispatch, 4-stage pipeline, HW test PASS (2026-07-05)
+6. ▶ Multi-core integration (Q4K/Q6_K/INT16) with shared BRAM weight loading
 
 ## Build & Run Commands
 
@@ -319,7 +331,7 @@ python3 scripts/extract_tmac.py models/qwen2-0_5b-instruct-q4_k_m.gguf /tmp/mode
 - `verilog/matmul_top.v` — Quad-core top: AXI4-Lite slave (inline, replaces orphan axilite_slave.v), 8192-byte weight_buf, loading FSM, mode mux (Q8/Q4K/Q5_0/Q6_K/INT16)
 - `verilog/matmul_q8_core.v` — Q8_0 compute core: 8×512×8 wmem (BRAM banks), dequant LUT, 6-stage pipeline
 - `verilog/matmul_q4k_core.v` — Q4_K block decode: 2304-byte block buffer, S24.8 fixed-point, 56×256 tile
-- `verilog/matmul_q5_0_core.v` — Q5_0 block decode: 8×896 tile, 224 blocks/tile, row_scale normalization
+- `verilog/matmul_q5_0_core.v` — Q5_0 block decode: 8×896 tile, 4× parallel cores, 4-stage pipeline (R→D1→D2→A), 1 DSP multiply/stage, combinational BRAM addresses (off-by-one fix)
 - `verilog/matmul_q6_k_core.v` — Q6_K block decode: 32×256 tile, 32 blocks/tile, super_scale + per-sub-block scales
 - `verilog/matmul_int16_core.v` — General INT16×INT16 core: 512×128-bit wmem, 3-stage FSM
 - `verilog/dequant_lut.v` — Q8_0 dequant ROM (standalone, not instantiated)
@@ -337,6 +349,8 @@ python3 scripts/extract_tmac.py models/qwen2-0_5b-instruct-q4_k_m.gguf /tmp/mode
 - `verilog/tb_cosim_q5_0.v` — Q5_0 co-simulation (waits for tile dump)
 - `verilog/tb_cosim_q6_k.v` — Q6_K co-simulation (waits for tile dump)
 - `verilog/tb_hw_fsm_comprehensive.v` — HP FSM all 7 tests (HEAD-based wait_done)
+- `verilog/tb_hp_fsm_q5_0.v` — HP FSM Q5_0 dispatch test (all-1s pattern)
+- `verilog/tb_q5_off_by_one.v` — Q5_0 off-by-one BRAM bug verification (non-uniform patterns)
 - `verilog/test_hp_loopback.v` — 32-bit HP loopback testbench (ARSIZE=2 proven)
 - `verilog/sim_ddr_axi_hp.v` — AXI HP DDR model for simulation
 
@@ -399,7 +413,8 @@ python3 scripts/extract_tmac.py models/qwen2-0_5b-instruct-q4_k_m.gguf /tmp/mode
 |--------|---------|---------|
 | `vivado_integration/build_bd.tcl` | Vivado batch build | `C:\Xilinx\Vivado\2023.1\bin\vivado.bat -mode batch -source vivado_integration/build_bd.tcl` |
 | `vivado_integration/sw/rebuild.tcl` | XSCT: rebuild Vitis app | `C:\Xilinx\Vitis\2023.1\bin\xsct.bat vivado_integration/sw/rebuild.tcl` |
-| `vivado_integration/sw/run_hp_fsm_comprehensive.tcl` | XSDB: all 7 HP FSM tests (basic, min, 2-burst, 4-burst, chain 2, chain 3, restart) + Test 8 (Q8 all-1s) | `C:\Xilinx\Vivado\2023.1\bin\xsdb.bat vivado_integration/sw/run_hp_fsm_comprehensive.tcl` |
+| `vivado_integration/sw/run_hp_fsm_comprehensive.tcl` | XSDB: all 7 HP FSM tests (basic, min, 2-burst, 4-burst, chain 2, chain 3, restart) + Test 8-9 (Q8 all-1s, Q8 multi-group) | `C:\Xilinx\Vivado\2023.1\bin\xsdb.bat vivado_integration/sw/run_hp_fsm_comprehensive.tcl` |
+| `vivado_integration/sw/run_hp_fsm_q5_0.tcl` | XSDB: Q5_0 compute test (all-1s, 8 rows, 896 each) | `C:\Xilinx\Vivado\2023.1\bin\xsdb.bat vivado_integration/sw/run_hp_fsm_q5_0.tcl` |
 
 ### Debug Workflow
 
@@ -572,6 +587,7 @@ Three bugs in the multi-group Q8 iteration were found and fixed during iVerilog 
 - `vivado_integration/build_bd.tcl`: Vivado batch build — HP0 config (`PCW_S_AXI_HP0_DATA_WIDTH=64`) set before `apply_bd_automation`. Sources `hp_fsm_top.v` + `axihp_read_master.v` + `axihp_write_master.v`.
 - `vivado_integration/rtl/hp_fsm_top.v`: HP descriptor-chain FSM — AXI4-Lite slave, desc_buf (32B), act_buf (512B), Q8 matmul core + 64×896 tile (14 groups), multi-group accumulator (64×48-bit acc_buf), 32-bit HP read/write masters. 18-state FSM: IDLE→FETCH_DESC→LOAD_WEIGHT→LOAD_SCALES→LOAD_ACT→COPY_ACT_TO_CORE→COMPUTE→READ_RES_ACC (×groups)→COPY_ACC_TO_BUF→WRITE_RES→DONE.
 - `vivado_integration/sw/run_hp_fsm_comprehensive.tcl`: XSDB flow — all 7 HP FSM tests (basic, min 8B, 128B 2-burst, 256B 4-burst, chain of 2, chain of 3, re-start). Polls HEAD register for completion.
+- `vivado_integration/sw/run_hp_fsm_q5_0.tcl`: XSDB flow — Q5_0 all-1s test. Loads weight/scales/acts, sets tensor_type=1 descriptor, verifies 8 rows = 896.
 - `vivado_integration/sw/regs.h`: Register map
 - `vivado_integration/ps7_init.tcl`: Modified — AFI1 + LVL_SHFTR_EN config in ps7_post_config
 - `verilog/axihp_read_master.v`: HP read master — ARSIZE=2 (4 bytes/beat), always captures RDATA[31:0], byte-stream output. DRAIN state per-beat. 32-bit mode.

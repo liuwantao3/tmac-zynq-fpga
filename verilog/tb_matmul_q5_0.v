@@ -9,7 +9,8 @@ module tb_matmul_q5_0;
     wire        busy;
 
     reg         wt_we;
-    reg [12:0]  wt_addr;
+    reg [2:0]   wt_bank;
+    reg [9:0]   wt_addr;
     reg [7:0]   wt_din;
     reg         sc_we;
     reg [2:0]   sc_addr;
@@ -17,8 +18,9 @@ module tb_matmul_q5_0;
     reg         act_we;
     reg [9:0]   act_addr;
     reg [15:0]  act_din;
-    reg [2:0]   res_addr;
+    reg [0:0]   res_addr;
     wire [47:0] res_dout;
+    reg [1:0]   core_id;
 
     matmul_q5_0_core u_core (
         .clk      (clk),
@@ -27,6 +29,7 @@ module tb_matmul_q5_0;
         .done     (done),
         .busy     (busy),
         .wt_we    (wt_we),
+        .wt_bank  (wt_bank),
         .wt_addr  (wt_addr),
         .wt_din   (wt_din),
         .sc_we    (sc_we),
@@ -36,45 +39,32 @@ module tb_matmul_q5_0;
         .act_addr (act_addr),
         .act_din  (act_din),
         .res_addr (res_addr),
-        .res_dout (res_dout)
+        .res_dout (res_dout),
+        .core_id  (core_id),
+        .dbg_verbose(1'b1)
     );
 
     always #5 clk = ~clk;
 
     integer i, errors, total;
 
-    task write_byte;
-        input [12:0] addr;
+    // Write 1 byte to a specific bank+addr
+    task write_bank;
+        input [2:0] bank;
+        input [9:0] addr;
         input [7:0] data;
         begin
             @(negedge clk);
-            wt_we <= 1; wt_addr <= addr; wt_din <= data;
+            wt_we <= 1; wt_bank <= bank; wt_addr <= addr; wt_din <= data;
             @(posedge clk);
             wt_we <= 0;
         end
     endtask
 
-    task gen_block;
-        input [7:0] bi;
-        input [3:0] q5_val;
-        integer base;
-        integer k;
-        begin
-            base = bi * 22;
-            f16_encode(1.0, base+0, base+1);
-            write_byte(base+2, 8'hFF);
-            write_byte(base+3, 8'hFF);
-            write_byte(base+4, 8'hFF);
-            write_byte(base+5, 8'hFF);
-            for (k = 0; k < 16; k = k + 1)
-                write_byte(base+6+k, {q5_val, q5_val});
-        end
-    endtask
-
-    task f16_encode;
-        input real val;
-        input [12:0] addr_lo;
-        input [12:0] addr_hi;
+    // Encode f16 as 2 bytes (bank 0=lo, bank 1=hi) at given block_local
+    task f16_encode_banked;
+        input real    val;
+        input [5:0]   block_local;  // 0..55
         reg signed [15:0] bits;
         reg sign;
         reg [4:0] exp;
@@ -87,7 +77,6 @@ module tb_matmul_q5_0;
             abs_val = (val < 0) ? -val : val;
             if (abs_val == 0.0) begin exp = 0; mant = 0; end
             else begin
-                frac = $realtobits(abs_val);
                 e = 0;
                 while (abs_val >= 2.0) begin abs_val = abs_val / 2.0; e = e + 1; end
                 while (abs_val < 1.0 && e > -14) begin abs_val = abs_val * 2.0; e = e - 1; end
@@ -96,16 +85,36 @@ module tb_matmul_q5_0;
                 if (exp >= 31) begin exp = 31; mant = 0; end
             end
             bits = {sign, exp, mant};
-            write_byte(addr_lo, bits[7:0]);
-            write_byte(addr_hi, bits[15:8]);
+            write_bank(0, block_local, bits[7:0]);
+            write_bank(1, block_local, bits[15:8]);
         end
     endtask
 
-    task load_all;
+    // Generate one Q5_0 block (22 bytes) in banked format for given block_local
+    task gen_block_banked;
+        input [5:0]  block_local;  // 0..55
+        input [3:0]  q5_val;       // 4-bit ql value for all 32 elements
+        integer k;
+        begin
+            // Bytes 0-1: f16 scale = 1.0
+            f16_encode_banked(1.0, block_local);
+            // Bytes 2-5: qh = 0xFFFFFFFF (all high bits)
+            write_bank(2, block_local, 8'hFF);
+            write_bank(3, block_local, 8'hFF);
+            write_bank(4, block_local, 8'hFF);
+            write_bank(5, block_local, 8'hFF);
+            // Bytes 6-21: qs array (16 bytes, each containing two q5_val nibbles)
+            for (k = 0; k < 16; k = k + 1)
+                write_bank(6, block_local * 16 + k, {q5_val, q5_val});
+        end
+    endtask
+
+    // Load 56 blocks (2 rows) for core_id=0
+    task load_all_banked;
         input [3:0] q5_val;
         integer b;
         begin
-            for (b = 0; b < 224; b = b + 1) gen_block(b, q5_val);
+            for (b = 0; b < 56; b = b + 1) gen_block_banked(b, q5_val);
         end
     endtask
 
@@ -146,26 +155,18 @@ module tb_matmul_q5_0;
     endtask
 
     task check_result;
-        input [2:0] row;
+        input [0:0] row;
         input [47:0] expected;
         reg [47:0] got;
         begin
             res_addr <= row; @(posedge clk); #1; got = res_dout;
             if (got !== expected) begin
-                $display("  FAIL row %d: got %d expected %d", row, got, expected);
+                $display("  FAIL row %0d: got %0d expected %0d", row, got, expected);
                 errors = errors + 1;
             end else begin
-                $display("  PASS row %d: %d", row, got);
+                $display("  PASS row %0d: %0d", row, got);
             end
             total = total + 1;
-        end
-    endtask
-
-    task check_all_rows;
-        input [47:0] expected;
-        integer r;
-        begin
-            for (r = 0; r < 8; r = r + 1) check_result(r, expected);
         end
     endtask
 
@@ -175,53 +176,61 @@ module tb_matmul_q5_0;
 
         clk = 0; rst_n = 0; start = 0;
         wt_we = 0; act_we = 0; sc_we = 0;
+        core_id = 0;
         errors = 0; total = 0;
 
         repeat (4) @(posedge clk);
         rst_n <= 1;
         repeat (2) @(posedge clk);
 
+        $display("=== Q5_0 BRAM Core Unit Tests (core_id=0, rows 0-1) ===");
+
+        $display("");
         $display("Test 1: all weights=1, all acts=1, scales=1");
         $display("  qh=0xFFFFFFFF, qs_nibble=1 -> q5 = ((1<<4)|1)-16 = 1");
         $display("  d=1.0 -> d_fp=256, val_norm = 256*1*1>>8 = 1");
         $display("  Expected per row = 896 * 1 * 1 = 896");
-        load_all(4'd1);
+        load_all_banked(4'd1);
         load_scales;
         load_acts(1);
         start_and_wait;
-        check_all_rows(896);
+        check_result(0, 896);
+        check_result(1, 896);
 
         $display("");
         $display("Test 2: all weights=0 -> expect 0");
         rst_n = 0; @(posedge clk); rst_n = 1; @(posedge clk);
-        gen_block(0, 4'd0);
-        load_all(4'd0);
+        gen_block_banked(0, 4'd0);
+        load_all_banked(4'd0);
         load_scales;
         load_acts(1);
         start_and_wait;
-        check_all_rows(0);
+        check_result(0, 0);
+        check_result(1, 0);
 
         $display("");
         $display("Test 3: acts=0 -> expect 0");
-        load_all(4'd1);
+        load_all_banked(4'd1);
         load_scales;
         load_acts(0);
         start_and_wait;
-        check_all_rows(0);
+        check_result(0, 0);
+        check_result(1, 0);
 
         $display("");
         $display("Test 4: weights=2, acts=2, scales=1");
         $display("  q5=2, val_norm=256*2*1>>8=2, prod=2*2=4");
         $display("  Expected per row = 896 * 4 = 3584");
         rst_n = 0; @(posedge clk); rst_n = 1; @(posedge clk);
-        load_all(4'd2);
+        load_all_banked(4'd2);
         load_scales;
         load_acts(2);
         start_and_wait;
-        check_all_rows(3584);
+        check_result(0, 3584);
+        check_result(1, 3584);
 
         $display("");
-        $display("=== Total: %d/%d correct ===", total-errors, total);
+        $display("=== Total: %0d/%0d correct ===", total-errors, total);
         $finish;
     end
 

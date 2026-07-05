@@ -93,11 +93,20 @@ sim_cosim_q5_0: $(COSIM_Q5_0_SRC)
 # ---- HP FSM comprehensive test (7 test cases) ----
 HPFSM_TOP = tb_hw_fsm_comprehensive
 HPFSM_SRC = tb_hw_fsm_comprehensive.v ../vivado_integration/rtl/hp_fsm_top.v \
-             axihp_read_master.v axihp_write_master.v matmul_q8_core.v
+             axihp_read_master.v axihp_write_master.v matmul_q8_core.v matmul_q5_0_core.v
 
 sim_hpfsm: $(HPFSM_SRC)
 	$(IVERILOG) $(FLAGS) -o $(HPFSM_TOP).vvp $(HPFSM_SRC)
 	$(VVP) $(HPFSM_TOP).vvp
+
+# ---- HP FSM Q5_0 dispatch path test ----
+HPFSM_Q5_0_TOP = tb_hp_fsm_q5_0
+HPFSM_Q5_0_SRC = tb_hp_fsm_q5_0.v ../vivado_integration/rtl/hp_fsm_top.v \
+                 axihp_read_master.v axihp_write_master.v matmul_q8_core.v matmul_q5_0_core.v
+
+sim_hpfsm_q5_0: $(HPFSM_Q5_0_SRC)
+	$(IVERILOG) $(FLAGS) -o $(HPFSM_Q5_0_TOP).vvp $(HPFSM_Q5_0_SRC)
+	$(VVP) $(HPFSM_Q5_0_TOP).vvp
 
 # ---- Phase B descriptor chain test ----
 PHASEB_TOP = tb_phaseb
@@ -111,7 +120,7 @@ sim_phaseb: $(PHASEB_SRC)
 	$(VVP) $(PHASEB_TOP).vvp
 
 # ---- Run all tests (core unit tests only — phaseb requires C++ dump) ----
-all: sim_q8 sim_q4k sim_int16 sim_q5_0 sim_q6_k sim_hpfsm
+all: sim_q8 sim_q4k sim_int16 sim_q5_0 sim_q6_k sim_hpfsm sim_hpfsm_q5_0
 
 # ---- Waveform viewing ----
 waves-q8:
