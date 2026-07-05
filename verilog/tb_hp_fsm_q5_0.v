@@ -246,13 +246,13 @@ module tb_hp_fsm_q5_0;
         end
     endtask
 
-    // Verify 8 rows of Q5_0 result at res_addr
+    // Verify 4 rows of Q5_0 result at res_addr
     task verify_q5_result(input [31:0] res_addr, input [47:0] expected, input integer tn);
         integer r;
         reg [31:0] lo, hi;
         reg signed [47:0] got;
         begin
-            for (r = 0; r < 8; r = r + 1) begin
+            for (r = 0; r < 4; r = r + 1) begin
                 lo = ddr_read32(res_addr + r*8);
                 hi = ddr_read32(res_addr + r*8 + 4);
                 got = {hi[15:0], lo};
@@ -266,11 +266,11 @@ module tb_hp_fsm_q5_0;
         end
     endtask
 
-    // Zero 64 bytes
+    // Zero 32 bytes (4 rows x 8 bytes)
     task zero_res(input [31:0] addr);
         integer z;
         begin
-            for (z = 0; z < 16; z = z + 1)
+            for (z = 0; z < 8; z = z + 1)
                 ddr_write32(addr + z*4, 32'h00000000);
         end
     endtask

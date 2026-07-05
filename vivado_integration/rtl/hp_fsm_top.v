@@ -217,11 +217,11 @@ module hp_fsm_top (
         .dbg_state(q8_core_state), .dbg_k(q8_core_k), .dbg_g(q8_core_g)
     );
 
-    // ===== Q5_0 Compute Cores (4 parallel, each handles 2 of 8 rows) =====
-    wire       q5_done0, q5_done1, q5_done2, q5_done3;
-    wire       q5_busy0, q5_busy1, q5_busy2, q5_busy3;
+    // ===== Q5_0 Compute Cores (2 parallel, each handles 2 of 4 rows) =====
+    wire       q5_done0, q5_done1;
+    wire       q5_busy0, q5_busy1;
     reg        q5_start;
-    reg        q5_wt_we0, q5_wt_we1, q5_wt_we2, q5_wt_we3;
+    reg        q5_wt_we0, q5_wt_we1;
     reg [2:0]  q5_wt_bank;
     reg [9:0]  q5_wt_addr;
     reg [7:0]  q5_wt_din;
@@ -232,7 +232,7 @@ module hp_fsm_top (
     reg [9:0]  q5_act_addr;
     reg [15:0] q5_act_din;
     reg [0:0]  q5_res_addr;
-    wire [47:0] q5_res0, q5_res1, q5_res2, q5_res3;
+    wire [47:0] q5_res0, q5_res1;
 
     matmul_q5_0_core u_q5_core0 (
         .clk(clk), .rst_n(rst_n), .start(q5_start),
@@ -252,27 +252,9 @@ module hp_fsm_top (
         .res_addr(q5_res_addr), .res_dout(q5_res1), .core_id(2'd1),
         .dbg_tile_start(1'b0), .dbg_tile_cycles(), .dbg_tile_id(), .dbg_verbose(1'b0)
     );
-    matmul_q5_0_core u_q5_core2 (
-        .clk(clk), .rst_n(rst_n), .start(q5_start),
-        .done(q5_done2), .busy(q5_busy2),
-        .wt_we(q5_wt_we2), .wt_bank(q5_wt_bank), .wt_addr(q5_wt_addr), .wt_din(q5_wt_din),
-        .sc_we(q5_sc_we), .sc_addr(q5_sc_addr), .sc_din(q5_sc_din),
-        .act_we(q5_act_we), .act_addr(q5_act_addr), .act_din(q5_act_din),
-        .res_addr(q5_res_addr), .res_dout(q5_res2), .core_id(2'd2),
-        .dbg_tile_start(1'b0), .dbg_tile_cycles(), .dbg_tile_id(), .dbg_verbose(1'b0)
-    );
-    matmul_q5_0_core u_q5_core3 (
-        .clk(clk), .rst_n(rst_n), .start(q5_start),
-        .done(q5_done3), .busy(q5_busy3),
-        .wt_we(q5_wt_we3), .wt_bank(q5_wt_bank), .wt_addr(q5_wt_addr), .wt_din(q5_wt_din),
-        .sc_we(q5_sc_we), .sc_addr(q5_sc_addr), .sc_din(q5_sc_din),
-        .act_we(q5_act_we), .act_addr(q5_act_addr), .act_din(q5_act_din),
-        .res_addr(q5_res_addr), .res_dout(q5_res3), .core_id(2'd3),
-        .dbg_tile_start(1'b0), .dbg_tile_cycles(), .dbg_tile_id(), .dbg_verbose(1'b0)
-    );
 
-    wire q5_all_done = q5_done0 & q5_done1 & q5_done2 & q5_done3;
-    wire q5_any_busy = q5_busy0 | q5_busy1 | q5_busy2 | q5_busy3;
+    wire q5_all_done = q5_done0 & q5_done1;
+    wire q5_any_busy = q5_busy0 | q5_busy1;
     reg q5_done_d;
     wire q5_done_rise;
     always @(posedge clk or negedge rst_n) begin
@@ -435,7 +417,7 @@ module hp_fsm_top (
             wt_burst_done   <= 0;
             sc_burst_done   <= 0;
             q5_start        <= 0;
-            q5_wt_we0       <= 0; q5_wt_we1 <= 0; q5_wt_we2 <= 0; q5_wt_we3 <= 0;
+            q5_wt_we0       <= 0; q5_wt_we1 <= 0;
             q5_wt_bank      <= 0; q5_wt_addr <= 0; q5_wt_din <= 0;
             q5_sc_we        <= 0; q5_sc_addr <= 0; q5_sc_din <= 0;
             q5_act_we       <= 0; q5_act_addr <= 0; q5_act_din <= 0;
@@ -459,7 +441,7 @@ module hp_fsm_top (
             q8_act_we <= 0;
             // Default-off for Q5_0 core control signals
             q5_start <= 0;
-            q5_wt_we0 <= 0; q5_wt_we1 <= 0; q5_wt_we2 <= 0; q5_wt_we3 <= 0;
+            q5_wt_we0 <= 0; q5_wt_we1 <= 0;
             q5_sc_we <= 0;
             q5_act_we <= 0;
 
@@ -754,16 +736,13 @@ module hp_fsm_top (
                         q5_wt_addr <= (q5_wt_byte_idx % 22 < 6) ?
                             ((q5_wt_byte_idx / 22) % 56) :
                             (((q5_wt_byte_idx / 22) % 56) * 16 + (q5_wt_byte_idx % 22) - 6);
-                        // Per-core write enable by row
+                        // Per-core write enable by row (2 cores, 4 rows)
                         case ((q5_wt_byte_idx / 22) / 28)
-                            3'd0: begin q5_wt_we0 <= 1; q5_wt_we1 <= 0; q5_wt_we2 <= 0; q5_wt_we3 <= 0; end
-                            3'd1: begin q5_wt_we0 <= 1; q5_wt_we1 <= 0; q5_wt_we2 <= 0; q5_wt_we3 <= 0; end
-                            3'd2: begin q5_wt_we0 <= 0; q5_wt_we1 <= 1; q5_wt_we2 <= 0; q5_wt_we3 <= 0; end
-                            3'd3: begin q5_wt_we0 <= 0; q5_wt_we1 <= 1; q5_wt_we2 <= 0; q5_wt_we3 <= 0; end
-                            3'd4: begin q5_wt_we0 <= 0; q5_wt_we1 <= 0; q5_wt_we2 <= 1; q5_wt_we3 <= 0; end
-                            3'd5: begin q5_wt_we0 <= 0; q5_wt_we1 <= 0; q5_wt_we2 <= 1; q5_wt_we3 <= 0; end
-                            3'd6: begin q5_wt_we0 <= 0; q5_wt_we1 <= 0; q5_wt_we2 <= 0; q5_wt_we3 <= 1; end
-                            3'd7: begin q5_wt_we0 <= 0; q5_wt_we1 <= 0; q5_wt_we2 <= 0; q5_wt_we3 <= 1; end
+                            3'd0: begin q5_wt_we0 <= 1; q5_wt_we1 <= 0; end
+                            3'd1: begin q5_wt_we0 <= 1; q5_wt_we1 <= 0; end
+                            3'd2: begin q5_wt_we0 <= 0; q5_wt_we1 <= 1; end
+                            3'd3: begin q5_wt_we0 <= 0; q5_wt_we1 <= 1; end
+                            default: begin q5_wt_we0 <= 0; q5_wt_we1 <= 0; end
                         endcase
                         q5_wt_byte_idx <= q5_wt_byte_idx + 1;
                         if (q5_unpack_cnt == 7) begin
@@ -915,15 +894,13 @@ module hp_fsm_top (
                 end
 
                 Q5_READ_RES: begin
-                    // Select which core/row to read
+                    // Read 4 results (2 cores x 2 rows = 4 rows)
                     q5_res_addr <= q5_res_row;
                     act_buf[{q5_res_core, q5_res_row}] <= {16'd0,
-                        (q5_res_core == 0) ? q5_res0 :
-                        (q5_res_core == 1) ? q5_res1 :
-                        (q5_res_core == 2) ? q5_res2 : q5_res3};
+                        (q5_res_core == 0) ? q5_res0 : q5_res1};
                     if (q5_res_row == 1) begin
                         q5_res_row <= 0;
-                        if (q5_res_core == 3) begin
+                        if (q5_res_core == 1) begin  // last core
                             byte_idx <= 0;
                             state <= WRITE_RES;
                         end else begin
@@ -1030,7 +1007,7 @@ module hp_fsm_top (
                 WRITE_RES: begin
                     reg_status[9] <= 0;
                     if (tensor_type == 15) wr_remaining <= act_total_bytes;
-                    else if (tensor_type == 1) wr_remaining <= 24'd64;  // Q5_0: 8 rows x 8 bytes
+                    else if (tensor_type == 1) wr_remaining <= 24'd32;  // Q5_0: 4 rows x 8 bytes
                     else wr_remaining <= 24'd512;  // Q8: 64 rows x 8 bytes
                     wr_burst_addr <= result_addr;
                     byte_idx <= 0;

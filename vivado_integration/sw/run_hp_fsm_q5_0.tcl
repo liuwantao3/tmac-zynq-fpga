@@ -259,12 +259,11 @@ if {[run_chain $Q5_DESC_ADDR 1]} {
     puts "  REG_DEBUG=[format 0x%08x $dbg]"
     puts "  REG_Q8_DEBUG=[format 0x%08x $q8_dbg]"
 
-    # --- Verify results: 8 rows, each 8 bytes (48-bit signed fixed-point) ---
+    # --- Verify results: 4 rows, each 8 bytes (48-bit signed fixed-point) ---
     # Expected: 896 (each row = 896 columns x q5=1 x act=1)
-    # 48-bit value stored in 64-bit word: lo 32 bits + hi 16 bits (upper 16 of 64 unused)
     set ok 1
     set expected 896
-    for {set j 0} {$j < 8} {incr j} {
+    for {set j 0} {$j < 4} {incr j} {
         set addr [expr $Q5_RES_ADDR + $j * 8]
         set lo [read32 $addr]
         set hi [read32 [expr $addr + 4]]
@@ -283,8 +282,8 @@ if {[run_chain $Q5_DESC_ADDR 1]} {
             set ok 0
         }
     }
-	if {$ok} {
-        puts "  Q5_0 Test: PASS (all 8 rows = $expected)"
+    if {$ok} {
+        puts "  Q5_0 Test: PASS (all 4 rows = $expected)"
     } else {
         puts "  Q5_0 Test: FAIL"
     }
@@ -297,7 +296,7 @@ if {[run_chain $Q5_DESC_ADDR 1]} {
 #   Desc 0: all-1s -> expect 896 per row
 #   Desc 1: all-0s -> expect 0 per row
 # ===================================================================
-puts "\n--- Test 2: Chain of 2 Q5_0 (all-1s -> all-0s) ---"
+puts "\n--- Test 2: Chain of 2 Q5_0 (all-1s -> all-0s) (4 rows each) ---"
 
 # Helper to fill all 224 blocks of Q5_0 weight at given base addr
 # Uses efficient 32-bit writes. Each block: d=1.0, qh=0xFFFFFFFF,
@@ -340,7 +339,7 @@ proc fill_q5_acts {base val} {
 # Helper to verify 8 rows at result_addr
 proc verify_q5_result {res_addr expected test_id} {
     set ok 1
-    for {set j 0} {$j < 8} {incr j} {
+    for {set j 0} {$j < 4} {incr j} {
         set addr [expr $res_addr + $j * 8]
         set lo [read32 $addr]
         set hi [read32 [expr $addr + 4]]
