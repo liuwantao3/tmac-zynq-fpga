@@ -299,23 +299,25 @@ if {[run_chain $Q5_DESC_ADDR 1]} {
 # ===================================================================
 puts "\n--- Test 2: Chain of 2 Q5_0 (all-1s -> all-0s) ---"
 
-# Helper to fill all 224 blocks with a constant q5_val
+# Helper to fill all 224 blocks of Q5_0 weight at given base addr
+# Uses efficient 32-bit writes. Each block: d=1.0, qh=0xFFFFFFFF,
+# qs nibble = q5_nibble for all 32 weights.
 proc fill_q5_weight {base q5_nibble} {
+    set qs_byte [expr ($q5_nibble << 4) | $q5_nibble]
+    # Build 4928-byte list
+    set bytes {}
     for {set blk 0} {$blk < 224} {incr blk} {
-        set bo [expr $blk * 22]
-        set qs_byte [expr ($q5_nibble << 4) | $q5_nibble]
-        # f16(1.0) = 0x3C00
-        mwr -force -size 1 [expr $base + $bo + 0] 0x00
-        mwr -force -size 1 [expr $base + $bo + 1] 0x3C
-        # qh = 0xFFFFFFFF
-        mwr -force -size 1 [expr $base + $bo + 2] 0xFF
-        mwr -force -size 1 [expr $base + $bo + 3] 0xFF
-        mwr -force -size 1 [expr $base + $bo + 4] 0xFF
-        mwr -force -size 1 [expr $base + $bo + 5] 0xFF
-        # qs: 16 bytes
-        for {set k 0} {$k < 16} {incr k} {
-            mwr -force -size 1 [expr $base + $bo + 6 + $k] $qs_byte
-        }
+        lappend bytes 0x00 0x3C 0xFF 0xFF 0xFF 0xFF
+        for {set k 0} {$k < 16} {incr k} { lappend bytes $qs_byte }
+    }
+    # Write as 32-bit words (1232 writes)
+    for {set i 0} {$i < 1232} {incr i} {
+        set b0 [lindex $bytes [expr $i*4]]
+        set b1 [lindex $bytes [expr $i*4+1]]
+        set b2 [lindex $bytes [expr $i*4+2]]
+        set b3 [lindex $bytes [expr $i*4+3]]
+        set word [expr {($b3 << 24) | ($b2 << 16) | ($b1 << 8) | $b0}]
+        write32 [expr $base + $i*4] $word
     }
 }
 
