@@ -1,7 +1,7 @@
 # HP FSM Q5_0 Compute Hardware Test
 # All-1s pattern: d=1.0 (fp16 0x3C00), qh=0xFFFFFFFF, qs=0x11 (q5=1),
-#   row_scale=0x0001 (UQ8.8 1/256), act=1 (int16)
-# Expected result: each row = 896 (896 columns x q5=1 x act=1 with dequant scale 1/256)
+#   row_scale=0x0100 (UQ8.8 1.0), act=1 (int16)
+# Expected result: each row = 229376 (896 columns x q5=1 x act=1, S24.8 fixed-point)
 #
 # Power-cycle the board before running!
 # C:\Xilinx\Vivado\2023.1\bin\xsdb.bat vivado_integration/sw/run_hp_fsm_q5_0.tcl
@@ -55,32 +55,40 @@ proc write_desc {addr next_addr weight_addr act_addr res_addr bytes {tensor_type
     write32 [expr $addr + 28]      0
 }
 
-# Build the Q5_0 weight byte array (224 blocks x 22 bytes = 4926 bytes)
-# Per block:
-#   bytes 0-1:  d = fp16(1.0) = 0x00 0x3C (little-endian)
-#   bytes 2-5:  qh = 0xFFFFFFFF (all hyper-bits set, so q5 = ql+16 instead of ql-16)
-#   bytes 6-21: qs = 16 bytes of 0x11 (ql_nibble=1 for both even/odd wi)
-# Decoded q5 = (qh_bit<<4 | ql_nibble) - 16 = (1<<4 | 1) - 16 = 17 - 16 = 1
-proc build_q5_weight_bytes {} {
+# Build Q5_0 weight data in separated format (2464 bytes total):
+#   Core0 headers: 56×6B = 336B at base+0
+#   Core1 headers: 56×6B = 336B at base+336
+#   Core0 qs: 56×16B = 896B at base+672
+#   Core1 qs: 56×16B = 896B at base+1568
+#   Scales: 8B at base+2464 (handled separately)
+proc fill_q5_weight {base q5_nibble} {
+    set qs_byte [expr ($q5_nibble << 4) | $q5_nibble]
     set bytes {}
-    for {set blk 0} {$blk < 224} {incr blk} {
+    # Core0 headers: 56 blocks × 6 bytes
+    for {set blk 0} {$blk < 56} {incr blk} {
         lappend bytes 0x00 0x3C 0xFF 0xFF 0xFF 0xFF
-        for {set k 0} {$k < 16} {incr k} { lappend bytes 0x11 }
     }
-    return $bytes
-}
-
-# Write a byte array to DDR as 32-bit words (array length must be multiple of 4)
-proc write_bytes_word_aligned {addr byte_list} {
-    set n [llength $byte_list]
-    if {$n % 4 != 0} { puts "ERROR: byte list length $n not multiple of 4"; return }
-    for {set i 0} {$i < [expr $n / 4]} {incr i} {
-        set b0 [lindex $byte_list [expr $i*4]]
-        set b1 [lindex $byte_list [expr $i*4+1]]
-        set b2 [lindex $byte_list [expr $i*4+2]]
-        set b3 [lindex $byte_list [expr $i*4+3]]
-        set word [expr {[expr $b3 << 24] | [expr $b2 << 16] | [expr $b1 << 8] | $b0}]
-        write32 [expr $addr + $i*4] $word
+    # Core1 headers: 56 blocks × 6 bytes
+    for {set blk 0} {$blk < 56} {incr blk} {
+        lappend bytes 0x00 0x3C 0xFF 0xFF 0xFF 0xFF
+    }
+    # Core0 qs: 56 blocks × 16 bytes
+    for {set blk 0} {$blk < 56} {incr blk} {
+        for {set k 0} {$k < 16} {incr k} { lappend bytes $qs_byte }
+    }
+    # Core1 qs: 56 blocks × 16 bytes
+    for {set blk 0} {$blk < 56} {incr blk} {
+        for {set k 0} {$k < 16} {incr k} { lappend bytes $qs_byte }
+    }
+    # Now total should be 336 + 336 + 896 + 896 = 2464 bytes = 616 × 32-bit words
+    if {[llength $bytes] != 2464} { puts "ERROR: byte list length [llength $bytes] != 2464"; return }
+    for {set i 0} {$i < 616} {incr i} {
+        set b0 [lindex $bytes [expr $i*4]]
+        set b1 [lindex $bytes [expr $i*4+1]]
+        set b2 [lindex $bytes [expr $i*4+2]]
+        set b3 [lindex $bytes [expr $i*4+3]]
+        set word [expr {($b3 << 24) | ($b2 << 16) | ($b1 << 8) | $b0}]
+        write32 [expr $base + $i*4] $word
     }
 }
 
@@ -197,36 +205,25 @@ puts "  GP0 access OK"
 #   qh = 0xFFFFFFFF (all hyper-bits set)
 #   qs = 0x11 (ql_nibble=1)
 #   Decoded: q5 = (1<<4 | 1) - 16 = 1
-#   row_scale = UQ8.8 1/256 = 0x0001
+#   row_scale = UQ8.8 1.0 = 0x0100
 #   act = int16 1
 #   Each MAC = d_fp * q5 * scale >> 8 * act
-#            = 256 * 1 * 1 >> 8 * 1 = 1
-#   Each row = 896 columns * 1 = 896
+#            = 256 * 1 * 256 >> 8 * 1 = 256
+#   Each row = 896 * 256 = 229376 (S24.8 fixed-point)
 # ===================================================================
-puts "\n--- Test Q5_0: all-1s pattern (expect each row = 896) ---"
+puts "\n--- Test Q5_0: all-1s pattern (expect each row = 229376) ---"
 
 set Q5_WEIGHT_ADDR  0x00103000
 set Q5_ACT_ADDR     0x00106000
 set Q5_RES_ADDR     0x00107000
 set Q5_DESC_ADDR    0x00100280
 
-# --- Write Q5_0 weight data: 224 blocks x 22 bytes = 4928 bytes ---
-# Scales follow at weight_addr + 4928
-puts "  Writing Q5_0 weight data (4928 bytes, 224 blocks)..."
-set weight_bytes [build_q5_weight_bytes]
-# Pad to 4928 bytes (1232 words) if needed — 224*22 = 4928, already aligned
-write_bytes_word_aligned $Q5_WEIGHT_ADDR $weight_bytes
-puts "  [expr [llength $weight_bytes]] bytes written"
+# --- Write Q5_0 weight data: separated headers+qs, 2464 bytes ---
+puts "  Writing Q5_0 weight data (2464 bytes)..."
+fill_q5_weight $Q5_WEIGHT_ADDR 1
 
-# --- Write row scales: 8 x UQ8.8 = 16 bytes at weight_addr + 4928 ---
-# scale = 0x0001 (UQ8.8 1/256)
-# As 32-bit words (2 scales per word): {0x0001, 0x0001} = 0x00010001
-puts "  Writing row scales (16 bytes)..."
-set SCALE_ADDR [expr $Q5_WEIGHT_ADDR + 4928]
-set sc_word [expr {0x0001 | (0x0001 << 16)}]
-for {set j 0} {$j < 4} {incr j} {
-    write32 [expr $SCALE_ADDR + $j * 4] $sc_word
-}
+puts "  Writing row scales (8 bytes, UQ8.8=1.0)..."
+fill_q5_scales $Q5_WEIGHT_ADDR
 
 # --- Write activations: 896 x int16 = 1792 bytes at ACT_ADDR ---
 # All values = 1 (int16). As 32-bit words (2 per word): 0x00010001
@@ -259,10 +256,10 @@ if {[run_chain $Q5_DESC_ADDR 1]} {
     puts "  REG_DEBUG=[format 0x%08x $dbg]"
     puts "  REG_Q8_DEBUG=[format 0x%08x $q8_dbg]"
 
-    # --- Verify results: 4 rows, each 8 bytes (48-bit signed fixed-point) ---
-    # Expected: 896 (each row = 896 columns x q5=1 x act=1)
+    # --- Verify results: 4 rows, each 8 bytes (48-bit S24.8 fixed-point) ---
+    # Expected: 229376 (896 columns x q5=1 x act=1, S24.8 = 896 << 8)
     set ok 1
-    set expected 896
+    set expected 229376
     for {set j 0} {$j < 4} {incr j} {
         set addr [expr $Q5_RES_ADDR + $j * 8]
         set lo [read32 $addr]
@@ -293,24 +290,24 @@ if {[run_chain $Q5_DESC_ADDR 1]} {
 
 # ===================================================================
 # Test 2: Chain of 2 Q5_0 descriptors
-#   Desc 0: all-1s -> expect 896 per row
+#   Desc 0: all-1s -> expect 229376 per row
 #   Desc 1: all-0s -> expect 0 per row
 # ===================================================================
 puts "\n--- Test 2: Chain of 2 Q5_0 (all-1s -> all-0s) (4 rows each) ---"
 
-# Helper to fill all 224 blocks of Q5_0 weight at given base addr
+# Helper to fill Q5_0 weight (112 blocks = 2464 bytes) at given base addr
 # Uses efficient 32-bit writes. Each block: d=1.0, qh=0xFFFFFFFF,
 # qs nibble = q5_nibble for all 32 weights.
 proc fill_q5_weight {base q5_nibble} {
     set qs_byte [expr ($q5_nibble << 4) | $q5_nibble]
-    # Build 4928-byte list
+    # Build 2464-byte list
     set bytes {}
-    for {set blk 0} {$blk < 224} {incr blk} {
+    for {set blk 0} {$blk < 112} {incr blk} {
         lappend bytes 0x00 0x3C 0xFF 0xFF 0xFF 0xFF
         for {set k 0} {$k < 16} {incr k} { lappend bytes $qs_byte }
     }
-    # Write as 32-bit words (1232 writes)
-    for {set i 0} {$i < 1232} {incr i} {
+    # Write as 32-bit words (616 writes)
+    for {set i 0} {$i < 616} {incr i} {
         set b0 [lindex $bytes [expr $i*4]]
         set b1 [lindex $bytes [expr $i*4+1]]
         set b2 [lindex $bytes [expr $i*4+2]]
@@ -320,11 +317,16 @@ proc fill_q5_weight {base q5_nibble} {
     }
 }
 
-# Helper to fill scales at weight_base + 4928
+# Helper to fill scales at weight_base + 2464
+# Scale = 0x0100 (UQ8.8 = 1.0). Little-endian: byte0=0x00, byte1=0x01.
+# After FSM byte swap: q5_sc_din = {0x01, 0x00} = 0x0100.
 proc fill_q5_scales {weight_base} {
-    set sc_word [expr {0x0001 | (0x0001 << 16)}]
-    for {set j 0} {$j < 4} {incr j} {
-        write32 [expr $weight_base + 4928 + $j * 4] $sc_word
+    # Two scales per 32-bit word: scale[0]=0x0100, scale[1]=0x0100
+    # In little-endian: addr+0=0x00, addr+1=0x01, addr+2=0x00, addr+3=0x01
+    # So the 32-bit value is 0x00 + (0x01<<8) + (0x00<<16) + (0x01<<24) = 0x01000100
+    set sc_word 0x01000100
+    for {set j 0} {$j < 2} {incr j} {
+        write32 [expr $weight_base + 2464 + $j * 4] $sc_word
     }
 }
 
@@ -392,7 +394,7 @@ write_desc $Q5_DESC1_ADDR 0 $Q5_W1_ADDR $Q5_A1_ADDR $Q5_R1_ADDR 1792 1
 if {[run_chain $Q5_DESC0_ADDR 2]} {
     set head [gp0_read $REG_DESC_HEAD]
     puts "  HEAD=$head (expect 2)"
-    set s0 [verify_q5_result $Q5_R0_ADDR 896 2]
+    set s0 [verify_q5_result $Q5_R0_ADDR 229376 2]
     set s1 [verify_q5_result $Q5_R1_ADDR 0 2]
     if {$s0 && $s1} {
         puts "  Test 2: PASS"

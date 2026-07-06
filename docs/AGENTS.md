@@ -2,21 +2,32 @@
 
 ## Qwen2-0.5B FPGA Accelerator — Zynq 7010
 
-Quad-core Verilog RTL: INT16×INT16 (general), Q8_0 dequant (logits), Q5_0 block decode (attn_q/k/o, ffn_gate/up), Q6_K block decode (ffn_down even), Q4_K block decode (ffn_down odd), with AXI4-Lite memory-mapped I/O.
+Multi-core Verilog RTL: INT16×INT16 (general), Q8_0 dequant (logits), Q5_0 block decode (attn_q/k/o, ffn_gate/up), Q6_K block decode (ffn_down even), Q4_K block decode (ffn_down odd), with AXI4-Lite memory-mapped I/O.
 
 **Model**: Q4_K_M (mixed quantization). See top-level AGENTS.md for tensor types table.
 
 ## Architecture
 
-### FSM flow (hp_fsm_top.v, 20 states):
+### FSM flow (hp_fsm_top.v, 29 states):
+
+**Q8 compute path** (tensor_type=0):
 ```
-IDLE → FETCH_DESC → [tensor_type=15 ? LOAD_ACT : LOAD_WEIGHT] →
-  LOAD_WEIGHT_W → LOAD_SCALES → LOAD_SCALES_W → LOAD_ACT → LOAD_ACT_W →
+IDLE → FETCH_DESC → FETCH_DESC_W → LOAD_WEIGHT → LOAD_WEIGHT_W →
+  LOAD_SCALES → LOAD_SCALES_W → LOAD_ACT → LOAD_ACT_W →
   COPY_ACT_TO_CORE → COMPUTE → COMPUTE_W →
   [multi_group ? READ_RES_ACC(×groups) → COPY_ACC_TO_BUF : READ_RES] →
-  [act_remaining>0 ? WRITE_RES_BURST : WRITE_RES] → WRITE_RES_W → DONE
+  WRITE_RES → WRITE_RES_BURST → WRITE_RES_W → DONE
 ```
-For CPU_OP (tensor_type=15): Loads activation data directly, skips weight/scales/compute.
+
+**Q5_0 compute path** (tensor_type=1):
+```
+IDLE → FETCH_DESC → FETCH_DESC_W → Q5_PRELOAD_HDR → Q5_PRELOAD_HDR_W →
+  Q5_LOAD_SCALES → Q5_LOAD_SCALES_W → Q5_COPY_ACT → Q5_COPY_ACT_W →
+  loop(Q5_BLOCK_COMPUTE → Q5_BLOCK_COMPUTE_W ×56 blocks) → Q5_READ_RES →
+  WRITE_RES → WRITE_RES_BURST → WRITE_RES_W → DONE
+```
+
+**CPU_OP path** (tensor_type=15): FETCH_DESC → LOAD_ACT → LOAD_ACT_W → WRITE_RES → DONE
 
 ### CPU-OP Descriptor Protocol
 Descriptor type 15 (tensor_type=15) triggers CPU interrupt. FSM pauses until CPU completes RMSNorm/RoPE/SoftMax/SwiGLU and resumes via CHAIN_CTRL.
@@ -53,7 +64,7 @@ Descriptor type 15 (tensor_type=15) triggers CPU interrupt. FSM pauses until CPU
 | 0x38 | reg_desc_info | R | {8'h0, act_total_bytes[23:0]} |
 | 0x3C | reg_q8_debug | R | Q8 core debug word |
 
-### REG_DEBUG (0x28) bitfields (RTL lines 793-804):
+### REG_DEBUG (0x28) bitfields (RTL lines 1255-1266):
 
 | Bits | Field | Description |
 |------|-------|-------------|
@@ -70,7 +81,7 @@ Descriptor type 15 (tensor_type=15) triggers CPU interrupt. FSM pauses until CPU
 | [10:8] | timeout_cnt[15:13] | Timeout counter upper bits |
 | [7:0] | sc_byte_idx | Scale byte index |
 
-### REG_Q8_DEBUG (0x3C) bitfields (RTL lines 806-815):
+### REG_Q8_DEBUG (0x3C) bitfields (RTL lines 1268-1277):
 
 | Bits | Field | Description |
 |------|-------|-------------|
@@ -109,6 +120,15 @@ Descriptor type 15 (tensor_type=15) triggers CPU interrupt. FSM pauses until CPU
 | 17 | COPY_ACC_TO_BUF | Copying acc_buf to act_buf |
 | 18 | TIMEOUT_ERROR | Timeout waiting for rd/wr/q8 done |
 | 19 | WRITE_RES_BURST | Multi-burst result write |
+| 20 | Q5_PRELOAD_HDR | Reading Q5_0 header data from DDR (672 bytes) |
+| 21 | Q5_PRELOAD_HDR_W | Draining + unpacking headers to hdr_packed |
+| 22 | Q5_LOAD_SCALES | Reading Q5_0 scale data from DDR |
+| 23 | Q5_LOAD_SCALES_W | Draining + unpacking scales to row_scale |
+| 24 | Q5_COPY_ACT | Reading Q5_0 activation data from DDR |
+| 25 | Q5_COPY_ACT_W | Draining + unpacking acts to act_mem |
+| 26 | Q5_BLOCK_COMPUTE | Per-block qs DDR read + clr_acc on blk=0 |
+| 27 | Q5_BLOCK_COMPUTE_W | Assembling qs_word, pulsing start, waiting for done |
+| 28 | Q5_READ_RES | Reading 4× rows from Q5_0 cores |
 
 ## Key Hardware Findings
 
@@ -139,7 +159,7 @@ C:\Xilinx\Vivado\2023.1\bin\xsim.bat tb_hw_fsm --runall
 ### Verilog RTL
 - `verilog/matmul_q8_core.v` — Q8_0 compute: 8×BRAM18 wmem+banks, 6-stage pipeline, 524 cycles/tile
 - `verilog/matmul_q4k_core.v` — Q4_K: 2304-byte block buffer, S24.8, 56×256 tile
-- `verilog/matmul_q5_0_core.v` — Q5_0: 4×896 tile, 112 blocks, row_scale normalization
+- `verilog/matmul_q5_0_core.v` — Q5_0: 4×896 tile, 1 DSP MAC/cycle, block-streaming (SETUP_D→COMPUTE×32→DRAIN), 1849 cycles/tile
 - `verilog/matmul_q6_k_core.v` — Q6_K: 32×256 tile, super_scale + sub-block scales
 - `verilog/matmul_int16_core.v` — INT16×INT16: 512×128 wmem, 3-stage FSM
 - `vivado_integration/rtl/hp_fsm_top.v` — Top FSM: AXI4-Lite, HP read/write masters, descriptor chain, Q8 compute integration
@@ -149,8 +169,9 @@ C:\Xilinx\Vivado\2023.1\bin\xsim.bat tb_hw_fsm --runall
 - `sim/fpga_sim.hpp` — MatmulAccel, decode logic
 - `sim/test_integration.cpp` — Integration tests
 
-## Test Status (2026-07-05)
+## Test Status (2026-07-06)
 
-All 9 HP FSM HW tests PASS (7 baseline DMA + 1 Q8 single-group + 1 Q8 multi-group).
-Track A BRAM conversion: 7,769 LUTs (44.1%), 17 BRAM18 (14.2%), 16 DSP (20%).
-WNS = 0.601 ns at 100 MHz.
+All HP FSM HW tests PASS: 7 baseline DMA + 2 Q8 (single/multi-group) + 9 Q5_0 dispatch.
+Q8 core 6/6, Q4K 4/4, Q6_K 97/97. INT16 pre-existing failure.
+Resource: 9,898 LUTs (56.2%), 33 BRAM18 (27.5%), 22 DSP (27.5%).
+WNS = -9.74 ns at 100 MHz (works on HW despite violation).

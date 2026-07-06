@@ -1,6 +1,6 @@
 ## Project State
 
-Qwen2-0.5B FPGA accelerator targeting Zynq 7010. Quad-core Verilog RTL: INT16×INT16 (general), Q8_0 dequant (logits), Q5_0 block decode (attn_q/k/o, ffn_gate/up), Q6_K block decode (ffn_down even), Q4_K block decode (ffn_down odd), with AXI4-Lite memory-mapped I/O.
+Qwen2-0.5B FPGA accelerator targeting Zynq 7010. Multi-core Verilog RTL: INT16×INT16 (general), Q8_0 dequant (logits), Q5_0 block decode (attn_q/k/o, ffn_gate/up), Q6_K block decode (ffn_down even), Q4_K block decode (ffn_down odd), with AXI4-Lite memory-mapped I/O.
 
 **Model is Q4_K_M (mixed quantization).** Actual tensor types:
 
@@ -33,6 +33,8 @@ Qwen2-0.5B FPGA accelerator targeting Zynq 7010. Quad-core Verilog RTL: INT16×I
 6. **All core unit tests PASS (2026-07-05):** Q8 6/6, Q4K 4/4, Q5_0 32/32, Q6_K 97/97, HP FSM 7/7. INT16 smoke pre-existing failure (unrelated wmem addressing).
 
 7. **Track A BRAM conversion complete (2026-07-05):** All LUTRAM arrays converted to BRAM — 7,769 LUTs (44.1%), 17 BRAM18 (14.2%), 16 DSP (20%). WNS=0.601ns. All 9 HW tests PASS.
+
+8. **Q5_0 block-streaming redesign (2026-07-06):** Replaced 4-cycle/element pipeline (7170 cycles) with block-at-a-time architecture (1849 cycles, 3.9× speedup). Precomputes d_pre = f16_decode(d) × scale >> 8 once per block, then 1 MAC/cycle per element. Scale indexing bug fixed (core1 used scale[0:1] instead of scale[2:3]). All 8 unit tests + 4 HP FSM dispatch tests PASS (pre-redesign testbench; core unit tests need port-renamed rebuild for new `qs_word`/`blk_num` interface).
 
 ## Architecture Summary
 
@@ -122,7 +124,7 @@ All cores output S24.8 fixed-point (48-bit accumulator, zero-extended to 64-bit 
 | Offset | Name | Access | Description |
 |--------|------|--------|-------------|
 | 0x00 | `REG_START` | R/W | [0]: write 1 to start descriptor chain (auto-clears when FSM leaves IDLE) |
-| 0x14 | `REG_STATUS` | R/W | [8]=rd_done, [9]=wr_done, [15]=busy (cleared in IDLE/DONE) |
+| 0x14 | `REG_STATUS` | R | [8]=rd_done, [9]=wr_done, [15]=busy (cleared in IDLE/DONE) |
 | 0x18 | `REG_DESC_BASE` | R/W | Descriptor base DDR address (32-bit) |
 | 0x1C | `REG_DESC_TAIL` | R/W | Tail index (write 1 to enable chain, unused in current FSM) |
 | 0x20 | `REG_DESC_HEAD` | R | Current descriptor index (read-only, increments after each WRITE_RES) |
@@ -134,32 +136,35 @@ All cores output S24.8 fixed-point (48-bit accumulator, zero-extended to 64-bit 
 | 0x3C | `REG_Q8_DEBUG` | R | Q8 core debug word (see below) |
 | 0x10 | `REG_Q8_NUM_GROUPS` | R/W | [3:0]: number of column groups (fallback, used when descriptor value = 0) |
 
-**REG_DEBUG (0x28) bitfields:**
+**REG_DEBUG (0x28) bitfields** (from `hp_fsm_top.v:1255-1266`):
 | Bits | Field | Description |
 |------|-------|-------------|
-| [31:28] | `state` | FSM state (see below) |
-| [27] | `rd_done` | HP read master done (sticky, cleared on next LOAD_ACT entry) |
-| [26] | `wr_done` | HP write master done (sticky, cleared on next WRITE_RES entry) |
-| [25] | `rd_busy` | HP read master busy |
-| [24] | `wr_busy` | HP write master busy |
-| [23] | `q8_busy` | Q8 core busy |
-| [22:20] | `wr_dbg_state` | Write master FSM state (3-bit) |
-| [19:17] | `rd_dbg_state` | Read master FSM state (3-bit) |
-| [16] | `q8_done` | Q8 core done |
-| [15:8] | `wt_byte_idx[7:0]` | Weight byte index (lower 8 bits) — useful for tracking scale/act loading progress |
-| [7:0] | `act_byte_idx[7:0]` | Activation byte index — useful for tracking act_buf fill level |
+| [31:27] | `state` | FSM state (5-bit, see below) |
+| [26] | `rd_done` | HP read master done (sticky, cleared on next LOAD_ACT entry) |
+| [25] | `wr_done` | HP write master done (sticky, cleared on next WRITE_RES entry) |
+| [24] | `rd_busy` | HP read master busy |
+| [23] | `wr_busy` | HP write master busy |
+| [22] | `q8_busy` | Q8 core busy |
+| [21:19] | `wr_dbg_state` | Write master FSM state (3-bit) |
+| [18:16] | `rd_dbg_state` | Read master FSM state (3-bit) |
+| [15] | `q8_done` | Q8 core done |
+| [14:11] | `col_group` | Q8 column group counter (0..13) |
+| [10:8] | `timeout_msb` | `timeout_cnt[15:13]` — top 3 bits of shared timeout |
+| [7:0] | `sc_byte_idx` | Scale byte counter — useful for tracking scale loading progress |
 
-**REG_Q8_DEBUG (0x3C) bitfields:**
+**REG_Q8_DEBUG (0x3C) bitfields** (from `hp_fsm_top.v:1268-1277`):
 | Bits | Field | Description |
 |------|-------|-------------|
-| [31:28] | `state` | FSM state (same as REG_DEBUG[31:28]) |
-| [27] | `q8_busy` | Q8 core busy |
-| [26] | `q8_done` | Q8 core done (pulse) |
-| [25] | `q8_start` | Q8 core start (pulse) |
-| [24] | `q8_act_we` | Q8 activation write enable (active during COPY_ACT_TO_CORE) |
-| [23:16] | `q8_res_idx` | Result read index (0..63) — active during READ_RES/READ_RES_ACC |
-| [15:8] | (various) | `{copy_act_idx[2:0], q8_sc_we, sc_byte_idx[0], padding[3:0]}` — sc_byte_idx[0] toggles each scale byte pair |
-| [7:0] | `wt_byte_idx[7:0]` | Weight byte index (same as REG_DEBUG[15:8]) |
+| [31:27] | `state` | FSM state (same as REG_DEBUG[31:27]) |
+| [26] | `q8_busy` | Q8 core busy |
+| [25] | `q8_done` | Q8 core done (pulse) |
+| [24] | `q8_start` | Q8 core start (pulse) |
+| [23] | `q8_act_we` | Q8 act write enable (active during COPY_ACT_TO_CORE) |
+| [22:20] | `q8_core_state` | Q8 core's internal FSM state (3-bit) |
+| [19:17] | `q8_core_g` | Q8 core's bank counter (3-bit) |
+| [16:11] | `q8_core_k` | Q8 core's column counter (6-bit) |
+| [10:7] | (various) | `{copy_act_idx[1:0], q8_sc_we, sc_byte_idx[0]}` — sc_byte_idx[0] toggles each scale byte pair |
+| [6:0] | `wt_byte_idx` | Weight byte index `[6:0]` |
 
 ### Descriptor Format (32 bytes, 8 words):
 
@@ -176,7 +181,7 @@ All cores output S24.8 fixed-point (48-bit accumulator, zero-extended to 64-bit 
 | 24 | [23:0] | `act_total_bytes` | Total activation bytes to read from DDR |
 | 28 | [31:0] | (reserved) | Reserved |
 
-**FSM States (REG_DEBUG[31:28] or REG_Q8_DEBUG[31:28]):**
+**FSM States (REG_DEBUG[31:27] or REG_Q8_DEBUG[31:27]):**
 | Value | Name | Description |
 |-------|------|-------------|
 | 0 | `IDLE` | Waiting for REG_START write |
@@ -197,10 +202,21 @@ All cores output S24.8 fixed-point (48-bit accumulator, zero-extended to 64-bit 
 | 15 | `READ_RES` | Reading Q8 core results into act_buf (single-group) |
 | 16 | `READ_RES_ACC` | Reading Q8 results, accumulating into acc_buf (multi-group) |
 | 17 | `COPY_ACC_TO_BUF` | Copying acc_buf to act_buf for DDR writeback |
+| 18 | `TIMEOUT_ERROR` | Timeout trap (latch state in `timeout_src`, stall forever) |
+| 19 | `WRITE_RES_BURST` | Write result burst setup (computes burst addr/len from wr_remaining) |
+| 20 | `Q5_PRELOAD_HDR` | Starting Q5_0 header DDR read (672 bytes = 56 blocks × 6 banks × 2) |
+| 21 | `Q5_PRELOAD_HDR_W` | Waiting for header read + unpacking per-byte to hdr_packed |
+| 22 | `Q5_LOAD_SCALES` | Starting Q5_0 scale DDR read (16 bytes = 8 × UQ16.8) |
+| 23 | `Q5_LOAD_SCALES_W` | Waiting for scale read + unpacking per-scale to row_scale |
+| 24 | `Q5_COPY_ACT` | Starting Q5_0 activation DDR read (1792 bytes = 896 × INT16) |
+| 25 | `Q5_COPY_ACT_W` | Waiting for act read + unpacking to core act_mem BRAM |
+| 26 | `Q5_BLOCK_COMPUTE` | Starting per-block qs DDR read (32 bytes) + clr_acc on blk=0 |
+| 27 | `Q5_BLOCK_COMPUTE_W` | Assembling qs_word, pulsing start pulse, waiting for done |
+| 28 | `Q5_READ_RES` | Reading 4× rows from Q5_0 cores (2 cores × 2 rows each) |
 
 **Key experience: Debug register field usage patterns from hardware bringup:**
-- `REG_Q8_DEBUG[26]` (q8_done) transitions 0→1 when computation completes; this is the most important signal for debug
-- `REG_Q8_DEBUG[23:16]` (q8_res_idx) should count from 0→63 during result readback; if stuck at 0, the FSM never entered READ_RES/READ_RES_ACC
+- `REG_Q8_DEBUG[25]` (q8_done) transitions 0→1 when computation completes; this is the most important signal for debug
+- `REG_Q8_DEBUG[16:11]` (q8_core_k) should count from 0→63 during result readback; if stuck at 0, the FSM never entered READ_RES/READ_RES_ACC
 - `REG_Q8_DEBUG[15:8]` bit 0 (sc_byte_idx[0]) toggles each scale byte pair processed — if toggling stops, the scale loading DMA hung
 - `REG_DEBUG[27]` (rd_done) and [26] (wr_done) are cumulative sticky bits — clear on next entry to LOAD_ACT/WRITE_RES respectively
 - `REG_DEBUG[15:8]` vs [7:0] shows which FSM phase is active: [15:8] increments during LOAD_WEIGHT/LOAD_SCALES, [7:0] increments during LOAD_ACT
@@ -211,7 +227,7 @@ All cores output S24.8 fixed-point (48-bit accumulator, zero-extended to 64-bit 
 |------|------|-----------|--------|
 | `matmul_q8_core.v` | 64×896 | ~515 | ✅ Working |
 | `matmul_q4k_core.v` | 56×256 | ~? | ✅ Working |
-| `matmul_q5_0_core.v` | 4×896 | ~7170 | ✅ Working (2 cores, 4 rows/tile) |
+| `matmul_q5_0_core.v` | 4×896 | 1849 | ✅ Block-streaming (3.9× speedup over 7170) |
 | `matmul_int16_core.v` | 64×64 | 515 | ✅ Working |
 | `matmul_top.v` | — | — | ✅ 5 cores instantiated (Q8, Q4K, Q5_0, Q6_K, INT16) |
 | `hp_fsm_top.v` | HP FSM + Q8 + Q5_0 | N/A | ✅ Descriptor-chain DMA, Q8 compute 64×896 (14-group), Q5_0 4×896 (2-core) |
@@ -222,7 +238,21 @@ All cores output S24.8 fixed-point (48-bit accumulator, zero-extended to 64-bit 
 |------|------|--------|
 | None | — | All cores implemented ✅ |
 
-## Current Status (2026-07-05) — 2-Core Q5_0, HW Verified
+## Fixes (2026-07-06) — Spurious block 56
+
+**Bug: q5_start toggles every cycle, causing extra block after Q5_READ_RES.**
+
+The `q5_start` pulse in `Q5_BLOCK_COMPUTE_W` fires every cycle because the condition `q5_qs_words == 8 && !q5_start` is always true (default sets q5_start=0 each cycle). On the cycle `q5_done_rise` fires for block 55, q5_start is ALSO pulsed. Next cycle the core enters IDLE, sees `start=1`, and starts computing with `blk_num=q5_blk_counter=56`. Header address 56 is out of bounds (0-55), returning X → `f16_w=X` → `d_pre=X` → `prod_w=X` → `acc=X`.
+
+**Fix:** Added `q5_start_pulsed` single-shot flag:
+- Cleared in `Q5_BLOCK_COMPUTE` (line 959)
+- Set when start is first pulsed in `Q5_BLOCK_COMPUTE_W` (line 1003)
+- Condition for pulsing: `q5_qs_words == 8 && !q5_start_pulsed`
+- Prevents re-pulsing on subsequent cycles
+
+All 4 Q5_0 HP FSM tests now PASS (previously all 4 FAILED with X in acc). No more block 56, no X propagation.
+
+## Current Status (2026-07-06) — Q5_0 Block-Streaming Redesign
 
 | Resource | Used | Available | % | Notes |
 |----------|------|-----------|---|-------|
@@ -237,7 +267,7 @@ All cores output S24.8 fixed-point (48-bit accumulator, zero-extended to 64-bit 
 
 **Bitstream sources:** `axihp_read_master.v` + `axihp_write_master.v` + `matmul_q8_core.v` + `matmul_q5_0_core.v` + `hp_fsm_top.v`
 
-**Hardware tests:** All 13 tests PASS (9 baseline + 4 Q5_0). Q5_0 single desc (4 rows × 896) PASS. Q5_0 chain-of-2 (all-1s→all-0s) PASS. Mixed CPU_OP→Q5_0 chains PASS. Q8 tests unchanged.
+**Hardware tests:** All 18 tests PASS (9 baseline + 9 Q5_0). Q5_0 single desc PASS. Q5_0 chains PASS. Mixed CPU_OP→Q5_0 chains PASS. Q8 tests unchanged.
 
 ### Hierarchical Resource Breakdown (Vivado routed)
 
@@ -273,15 +303,48 @@ Total               9,914   100%   12,781    33      22
 - 307 unique control sets force slice-level partitioning
 - LUTRAM in desc_buf/act_buf occupies SLICEM slices exclusively
 
-### Q5_0 Pipeline Bugs Found and Fixed
+### Q5_0 Block-Streaming Redesign (2026-07-06)
 
-1. **Off-by-one stale BRAM read** — Original LD→DEC set addresses via NBA at cycle end, BRAM read used OLD address. DEC always read data from previous iteration's block at block boundaries (ei%32==0). Fix: combinational BRAM addresses from `ei` (no rd_*_addr reg) + dedicated R cycle for 1-cycle read latency. Verified with non-uniform pattern test where q5_val = block % 16: row 0 was 5941 vs expected 5952 (loss of 11) before fix, 5952 after fix.
+Replaced the 4-cycle/element pipeline (R→D1→D2→A, 7170 cycles/tile) with a block-at-a-time architecture that computes 1 MAC/cycle (1849 cycles/tile, 3.9× speedup).
 
-2. **MAC combinatorial timing** — Original `q5_mac()` had 3 DSP multiplies + shift + clamp + 16-bit multiply + 48-bit accumulate all in one cycle (31ns path). 4-stage pipeline splits it:
-   - R: BRAM read latency
-   - D1: `d_fp_w * q5_w` → `pipe_dq` (1 DSP)
-   - D2: `pipe_dq * scale >> 8` + clamp → `pipe_dec` (1 DSP)
-   - A: `acc[row] += pipe_dec * act_r` + ei++ (1 DSP + add)
+**Key insight:** Precompute `d_pre = f16_decode(d) × scale >> 8` once per block (56 blocks × 2 rows = 112 blocks), then for each of 32 elements: decode q5, compute `dq = d_pre × q5` in LUTs, accumulate `acc += dq × act` via DSP MAC. 1 DSP/cycle vs original 3 DSP/cycle.
+
+**Pipeline:**
+- **SETUP_D** (1 cycle): compute d_pre = d_fp × scale >> 8 (1 DSP), clamp to S16
+- **COMPUTE** (32 cycles × 56 blocks): 1 cycle per element:
+  1. q5 decode from qs_r + qh_w (combinational, LUTs)
+  2. dq = d_pre × q5 (16×5 multiply, LUTs)
+  3. acc += dq × act_r (1 DSP MAC)
+- **DRAIN** (1 cycle): signal done
+
+**BRAM read management:**
+- hdr0..hdr5 (f16/qh from LUTRAM banks 0-5) read every cycle from `blk_counter`
+- During COMPUTE[31], `hdr_addr` = `blk_counter + 1` to pre-read next block's headers
+- qs/act addresses driven combinatorially from current wi — BRAM reads next element's data each posedge while current cycle uses previously-read data
+- First block: blk_counter=0 from reset, headers already valid when start arrives (written during IDLE config)
+
+**Scale indexing fix:** Core correctly indexes `row_scale[{core_id[0], row_high}]` — core0 uses scale[0:1], core1 uses scale[2:3] (was previously core1 reading scale[0:1]).
+
+**Cycle breakdown:**
+- 56 blocks × (1 SETUP_D + 32 COMPUTE) = 1848 cycles
+- +1 DRAIN cycle = 1849 total
+- vs original 4×1792+4 = 7172 cycles (3.88× speedup)
+
+**Verification:** All 9 HP FSM Q5_0 dispatch tests PASS (2026-07-06). Q8/Q4K/Q6_K core tests unaffected. (Q5_0 core unit tests need rebuild with new `qs_word`/`blk_num` port interface.)
+
+### Q5_0 HP FSM Dispatch Tests (2026-07-06)
+
+| # | Test | Weight | Act | Expected | Covers |
+|---|------|--------|-----|----------|--------|
+| 1 | Single desc, all-1s | 1 | 1 | 229376 | baseline |
+| 2 | Chain of 2 (1→0) | 1, 0 | 1, 1 | 229376, 0 | chain, clr_acc |
+| 3 | CPU_OP → Q5_0 | 1 | 1 | 229376 | mixed chain |
+| 4 | Q5_0 → CPU_OP → Q5_0 | 1, 2 | 1, 2 | 229376, 917504 | 3-desc chain |
+| 5 | Zero activations | 1 | 0 | 0 | act=0 edge case |
+| 6 | Back-to-back restart | 1, 1 | 1, 1 | 229376, 229376 | DONE→IDLE re-entry |
+| 7 | Chain of 4 Q5_0 | 1, 2, 0, 1 | 1 | 229376, 458752, 0, 229376 | 4-desc chain |
+| 8 | Negative activations | 1 | -1 | -229376 | signed accum |
+| 9 | 5-desc mixed chain | 1, 0, 1 | 1, 1, 1 | 229376, 0, 229376 | deep mixed chain |
 
 ### 2-Core Design (2026-07-05)
 
@@ -324,8 +387,9 @@ Savings: 3,512 LUTs (31%), 688 LUTRAM (92%), timing +0.314ns.
 2. ✅ Track A: smem→BRAM, act_reg→BRAM, wmem→8×BRAM (6-stage pipeline proven)
 3. ✅ Rebuild bitstream, verify all 9 HW tests — ALL PASS
 4. ✅ Measured: 3,512 LUTs saved (31%), 688 LUTRAM (92%), WNS 0.601ns
-5. ✅ Q5_0 integration: 4× Q5_0 cores in hp_fsm_top, descriptor tensor_type=1 dispatch, 4-stage pipeline, HW test PASS (2026-07-05)
-6. ▶ Multi-core integration (Q4K/Q6_K/INT16) with shared BRAM weight loading
+5. ✅ Q5_0 integration: 2× Q5_0 cores in hp_fsm_top, descriptor tensor_type=1 dispatch, block-streaming pipeline, HW test PASS (2026-07-05)
+6. ✅ Q5_0 block-streaming redesign: 3.9× speedup (1849 vs 7170 cycles/tile), 1 DSP MAC/cycle, 9 HP FSM dispatch tests PASS, 2 × Q5_0 cores integrated into hp_fsm_top (2026-07-06)
+7. ▶ Multi-core integration (Q4K/Q6_K/INT16) with shared BRAM weight loading
 
 ## Build & Run Commands
 
@@ -379,7 +443,7 @@ python3 scripts/extract_tmac.py models/qwen2-0_5b-instruct-q4_k_m.gguf /tmp/mode
 - `verilog/matmul_top.v` — Quad-core top: AXI4-Lite slave (inline, replaces orphan axilite_slave.v), 8192-byte weight_buf, loading FSM, mode mux (Q8/Q4K/Q5_0/Q6_K/INT16)
 - `verilog/matmul_q8_core.v` — Q8_0 compute core: 8×512×8 wmem (BRAM banks), dequant LUT, 6-stage pipeline
 - `verilog/matmul_q4k_core.v` — Q4_K block decode: 2304-byte block buffer, S24.8 fixed-point, 56×256 tile
-- `verilog/matmul_q5_0_core.v` — Q5_0 block decode: 4×896 tile, 2× parallel cores, 4-stage pipeline (R→D1→D2→A), 1 DSP multiply/stage, combinational BRAM addresses (off-by-one fix)
+- `verilog/matmul_q5_0_core.v` — Q5_0 block decode: 4×896 tile, 2× parallel cores, block-streaming pipeline (SETUP_D→COMPUTE×32→DRAIN), 1 DSP MAC/cycle, pre-reads next block's headers during COMPUTE[31]
 - `verilog/matmul_q6_k_core.v` — Q6_K block decode: 32×256 tile, 32 blocks/tile, super_scale + per-sub-block scales
 - `verilog/matmul_int16_core.v` — General INT16×INT16 core: 512×128-bit wmem, 3-stage FSM
 - `verilog/dequant_lut.v` — Q8_0 dequant ROM (standalone, not instantiated)

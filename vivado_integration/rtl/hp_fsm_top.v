@@ -221,10 +221,15 @@ module hp_fsm_top (
     wire       q5_done0, q5_done1;
     wire       q5_busy0, q5_busy1;
     reg        q5_start;
-    reg        q5_wt_we0, q5_wt_we1;
-    reg [2:0]  q5_wt_bank;
-    reg [9:0]  q5_wt_addr;
-    reg [7:0]  q5_wt_din;
+    reg        q5_clr_acc;
+    reg        q5_hdr_we0, q5_hdr_we1;
+    reg [2:0]  q5_hdr_bank;
+    reg [5:0]  q5_hdr_addr;
+    reg [7:0]  q5_hdr_din;
+    reg [2:0]  q5_hdr_sub;
+    reg [5:0]  q5_hdr_block;
+    reg        q5_hdr_core;
+    reg [127:0] q5_qs_word0, q5_qs_word1;
     reg        q5_sc_we;
     reg [2:0]  q5_sc_addr;
     reg [15:0] q5_sc_din;
@@ -233,23 +238,31 @@ module hp_fsm_top (
     reg [15:0] q5_act_din;
     reg [0:0]  q5_res_addr;
     wire [47:0] q5_res0, q5_res1;
+    reg [5:0]  q5_blk_counter;      // block counter (0..55)
+    wire [5:0] q5_blk_num;
+    assign q5_blk_num = q5_blk_counter;
+    reg        q5_start_pulsed;         // prevents re-pulsing start every cycle
 
     matmul_q5_0_core u_q5_core0 (
         .clk(clk), .rst_n(rst_n), .start(q5_start),
         .done(q5_done0), .busy(q5_busy0),
-        .wt_we(q5_wt_we0), .wt_bank(q5_wt_bank), .wt_addr(q5_wt_addr), .wt_din(q5_wt_din),
+        .hdr_we(q5_hdr_we0), .hdr_bank(q5_hdr_bank), .hdr_addr(q5_hdr_addr), .hdr_din(q5_hdr_din),
+        .qs_word(q5_qs_word0),
         .sc_we(q5_sc_we), .sc_addr(q5_sc_addr), .sc_din(q5_sc_din),
         .act_we(q5_act_we), .act_addr(q5_act_addr), .act_din(q5_act_din),
         .res_addr(q5_res_addr), .res_dout(q5_res0), .core_id(2'd0),
+        .blk_num(q5_blk_num), .clr_acc(q5_clr_acc),
         .dbg_tile_start(1'b0), .dbg_tile_cycles(), .dbg_tile_id(), .dbg_verbose(1'b0)
     );
     matmul_q5_0_core u_q5_core1 (
         .clk(clk), .rst_n(rst_n), .start(q5_start),
         .done(q5_done1), .busy(q5_busy1),
-        .wt_we(q5_wt_we1), .wt_bank(q5_wt_bank), .wt_addr(q5_wt_addr), .wt_din(q5_wt_din),
+        .hdr_we(q5_hdr_we1), .hdr_bank(q5_hdr_bank), .hdr_addr(q5_hdr_addr), .hdr_din(q5_hdr_din),
+        .qs_word(q5_qs_word1),
         .sc_we(q5_sc_we), .sc_addr(q5_sc_addr), .sc_din(q5_sc_din),
         .act_we(q5_act_we), .act_addr(q5_act_addr), .act_din(q5_act_din),
         .res_addr(q5_res_addr), .res_dout(q5_res1), .core_id(2'd1),
+        .blk_num(q5_blk_num), .clr_acc(q5_clr_acc),
         .dbg_tile_start(1'b0), .dbg_tile_cycles(), .dbg_tile_id(), .dbg_verbose(1'b0)
     );
 
@@ -267,11 +280,12 @@ module hp_fsm_top (
     reg [1:0] compute_type;
 
     // ===== Q5_0 helper regs =====
-    reg [15:0] q5_wt_byte_idx;      // overall byte position in Q5_0 weight (0..4927)
     reg [7:0]  q5_unpack_cnt;       // counter for unpacking DDR words (0..7)
     reg [9:0]  q5_copy_act_idx;     // activation copy index (0..895)
     reg [1:0]  q5_res_core;         // result readback core index (0..3)
     reg [0:0]  q5_res_row;          // result readback local row (0..1)
+    reg [9:0]  q5_hdr_bytes;        // header byte index (0..671)
+    reg [5:0]  q5_qs_words;         // qs 32-bit word counter (0..3)
 
     // ===== Buffer =====
     reg [7:0] desc_buf [0:31];    // 32-byte descriptor
@@ -329,15 +343,15 @@ module hp_fsm_top (
     localparam COPY_ACC_TO_BUF = 5'd17;
     localparam TIMEOUT_ERROR  = 5'd18;
     localparam WRITE_RES_BURST  = 5'd19;
-    // Q5_0 compute path states
-    localparam Q5_LOAD_WEIGHT   = 5'd20;
-    localparam Q5_LOAD_WEIGHT_W = 5'd21;
+    // Q5_0 compute path states (per-block burst design)
+    localparam Q5_PRELOAD_HDR   = 5'd20;
+    localparam Q5_PRELOAD_HDR_W = 5'd21;
     localparam Q5_LOAD_SCALES   = 5'd22;
     localparam Q5_LOAD_SCALES_W = 5'd23;
     localparam Q5_COPY_ACT      = 5'd24;
     localparam Q5_COPY_ACT_W    = 5'd25;
-    localparam Q5_COMPUTE       = 5'd26;
-    localparam Q5_COMPUTE_W     = 5'd27;
+    localparam Q5_BLOCK_COMPUTE = 5'd26;
+    localparam Q5_BLOCK_COMPUTE_W = 5'd27;
     localparam Q5_READ_RES      = 5'd28;
 
     // Multi-group flag: non-zero when q8_num_groups > 1 (from descriptor, fallback to GP0 reg)
@@ -417,16 +431,22 @@ module hp_fsm_top (
             wt_burst_done   <= 0;
             sc_burst_done   <= 0;
             q5_start        <= 0;
-            q5_wt_we0       <= 0; q5_wt_we1 <= 0;
-            q5_wt_bank      <= 0; q5_wt_addr <= 0; q5_wt_din <= 0;
+            q5_clr_acc      <= 0;
+            q5_hdr_we0      <= 0; q5_hdr_we1 <= 0;
+            q5_hdr_bank     <= 0; q5_hdr_addr <= 0; q5_hdr_din <= 0;
+            q5_hdr_sub      <= 0; q5_hdr_block <= 0; q5_hdr_core <= 0;
+            q5_qs_word0 <= 128'd0; q5_qs_word1 <= 128'd0;  // will be overwritten in COMPUTE_W
             q5_sc_we        <= 0; q5_sc_addr <= 0; q5_sc_din <= 0;
             q5_act_we       <= 0; q5_act_addr <= 0; q5_act_din <= 0;
             q5_res_addr     <= 0;
-            q5_wt_byte_idx  <= 0;
+            q5_blk_counter  <= 0;
             q5_unpack_cnt   <= 0;
             q5_copy_act_idx <= 0;
             q5_res_core     <= 0;
             q5_res_row      <= 0;
+            q5_hdr_bytes    <= 0;
+            q5_qs_words     <= 0;
+            q5_start_pulsed <= 0;
             compute_type    <= 0;
         end else begin
             reg_clk_cnt <= reg_clk_cnt + 1;
@@ -441,7 +461,8 @@ module hp_fsm_top (
             q8_act_we <= 0;
             // Default-off for Q5_0 core control signals
             q5_start <= 0;
-            q5_wt_we0 <= 0; q5_wt_we1 <= 0;
+            q5_hdr_we0 <= 0; q5_hdr_we1 <= 0;
+            // q5_qs_word0/1 NOT reset here — must be held stable during compute
             q5_sc_we <= 0;
             q5_act_we <= 0;
 
@@ -497,10 +518,11 @@ module hp_fsm_top (
                             // CPU_OP: passthrough activation to DDR
                             state <= LOAD_ACT;
                         end else if ({desc_buf[17], desc_buf[16]} == 1) begin
-                            // Q5_0 compute path
+                            // Q5_0 compute path (per-block burst)
                             compute_type <= 1;
-                            q5_wt_byte_idx <= 0;
-                            state <= Q5_LOAD_WEIGHT;
+                            q5_blk_counter <= 0;
+                            q5_hdr_bytes <= 0;
+                            state <= Q5_PRELOAD_HDR;
                         end else begin
                             // Q8 compute path (default)
                             compute_type <= 0;
@@ -695,75 +717,126 @@ module hp_fsm_top (
                 end
 
                 // =====================================================================
-                // Q5_0 Compute Path
+                // Q5_0 Compute Path (per-block burst with double-buffered qs)
                 // =====================================================================
+                //
+                // DDR layout:
+                //   weight_addr[0..335]:   core0 headers (56 blocks × 6 bytes)
+                //   weight_addr[336..671]:  core1 headers (56 blocks × 6 bytes)
+                //   weight_addr[672..1567]: core0 qs (56 blocks × 16 bytes)
+                //   weight_addr[1568..2463]: core1 qs (56 blocks × 16 bytes)
+                //   weight_addr[2464..2471]: scales (8 × 16-bit)
+                //
+                // Flow:
+                //   1. PRELOAD_HDR: load 672B headers → hdr_* ports (LUTRAM banks 0-5)
+                //   2. LOAD_SCALES: load 16B → sc_* ports
+                //   3. COPY_ACT:    load 1792B acts → act_* ports (shared BRAM)
+                //   4. BLOCK_COMPUTE loop (56×):
+                //      a. read 16B qs from DDR → qs_* ports (shadow buffer)
+                //      b. pulse start, wait both cores done
+                //   5. READ_RES: read 4 results into act_buf
 
-                Q5_LOAD_WEIGHT: begin
-                    // Start burst read: 64 bytes from DDR
-                    rd_addr <= weight_addr + q5_wt_byte_idx;
-                    rd_len <= 8'd15;    // 16 AXI beats = 64 bytes
+                Q5_PRELOAD_HDR: begin
+                    if ($time < 50000000) $display("  [Q5_HDR] ENTER t=%0t weight=0x%08x desc_idx=%0d", $time, weight_addr, reg_desc_head);
+                    // Start HP burst from header region (672 bytes total)
+                    rd_addr <= weight_addr;
+                    rd_len <= 8'd15;    // 64 bytes per burst
                     rd_start <= 1;
                     q5_unpack_cnt <= 0;
-                    wt_burst_done <= 0;
-                    state <= Q5_LOAD_WEIGHT_W;
+                    sc_burst_done <= 0;
+                    q5_hdr_bytes <= 0;
+                    q5_hdr_sub <= 0; q5_hdr_block <= 0; q5_hdr_core <= 0;
+                    q5_qs_word0 <= 128'd0; q5_qs_word1 <= 128'd0;
+                    state <= Q5_PRELOAD_HDR_W;
                 end
 
-                Q5_LOAD_WEIGHT_W: begin
+                Q5_PRELOAD_HDR_W: begin
+                    if ($time < 50000000) begin
+                        if (rd_done_rise) $display("  [Q5_HDRW] DONE_RISE t=%0t hdr_bytes=%0d sc_burst=%0d", $time, q5_hdr_bytes, sc_burst_done);
+                        if (sc_burst_done) $display("  [Q5_HDRW] SC_BURST t=%0t hdr_bytes=%0d", $time, q5_hdr_bytes);
+                        if (rd_valid && rd_ready) $display("  [Q5_HDRW] CAPTURE t=%0t hdr_bytes=%0d", $time, q5_hdr_bytes);
+                        if (rd_valid && rd_ready && q5_hdr_bytes == 336)
+                            $display("  [Q5_HDRW] CORE1 BLOCK0 CAPTURE: rd_data=%0h t=%0t", rd_data, $time);
+                        if (state != Q5_PRELOAD_HDR_W) $display("  [Q5_HDRW] EXIT state=%0d hdr_bytes=%0d", $time, state);
+                        if (q5_hdr_core == 1 && rd_unpack_active) begin
+                            $display("  [Q5_HDRW] WRITE: din=%0h bank=%0d addr=%0d cnt=%0d t=%0t weight=0x%08x", q5_hdr_din, q5_hdr_sub, q5_hdr_block, q5_unpack_cnt, $time, weight_addr);
+                            if (q5_hdr_block == 0 && q5_hdr_sub == 0)
+                                $display("  [Q5_HDRW] *** FIRST CORE1 BYTE: rd_unpack_buf=%0h", rd_unpack_buf);
+                        end
+                        if (q5_hdr_we1)
+                            $display("  [Q5_HDRW] HDR_WE1: t=%0t state=%0d q5_hdr_core=%d q5_hdr_bytes=%d", $time, state, q5_hdr_core, q5_hdr_bytes);
+                        if (q5_hdr_bytes == 0 && q5_unpack_cnt == 0)
+                            $display("  [Q5_HDRW] ENTER_QS_CHECK t=%0t qs_w=%d state=%0d", $time, q5_qs_words, state);
+                    end
                     if (!rd_unpack_active) begin
-                        // Capture next 64-bit word from DDR
                         rd_ready <= rd_valid;
                         if (rd_valid && rd_ready) begin
                             rd_unpack_buf <= rd_data;
                             rd_unpack_active <= 1;
                             q5_unpack_cnt <= 0;
+                        if (q5_hdr_bytes == 336)
+                            $display("  [Q5_HDRW] *** CAPTURE @336: rd_data=%0h rd_unpack_buf(old)=%0h", rd_data, rd_unpack_buf);
+                        if (q5_hdr_bytes >= 336 && q5_hdr_bytes < 340 && rd_unpack_active)
+                            $display("  [Q5_HDRW] CORE1 WRITE: we0=%b we1=%b bank=%d addr=%d din=%0h cnt=%0d core=%d bytes=%0d",
+                                q5_hdr_we0, q5_hdr_we1, q5_hdr_bank, q5_hdr_block, q5_hdr_din, q5_unpack_cnt, q5_hdr_core, q5_hdr_bytes);
                         end
                     end else begin
                         rd_ready <= 0;
-                        // Extract one byte from rd_unpack_buf
+                        // Extract byte, route to core/bank/addr
                         case (q5_unpack_cnt)
-                            0: q5_wt_din <= rd_unpack_buf[7:0];
-                            1: q5_wt_din <= rd_unpack_buf[15:8];
-                            2: q5_wt_din <= rd_unpack_buf[23:16];
-                            3: q5_wt_din <= rd_unpack_buf[31:24];
-                            4: q5_wt_din <= rd_unpack_buf[39:32];
-                            5: q5_wt_din <= rd_unpack_buf[47:40];
-                            6: q5_wt_din <= rd_unpack_buf[55:48];
-                            7: q5_wt_din <= rd_unpack_buf[63:56];
+                            0: q5_hdr_din <= rd_unpack_buf[7:0];
+                            1: q5_hdr_din <= rd_unpack_buf[15:8];
+                            2: q5_hdr_din <= rd_unpack_buf[23:16];
+                            3: q5_hdr_din <= rd_unpack_buf[31:24];
+                            4: q5_hdr_din <= rd_unpack_buf[39:32];
+                            5: q5_hdr_din <= rd_unpack_buf[47:40];
+                            6: q5_hdr_din <= rd_unpack_buf[55:48];
+                            7: q5_hdr_din <= rd_unpack_buf[63:56];
                         endcase
-                        // Compute routing: bank, addr based on byte position
-                        q5_wt_bank <= (q5_wt_byte_idx % 22 < 6) ?
-                            (q5_wt_byte_idx % 22) : 3'd6;
-                        q5_wt_addr <= (q5_wt_byte_idx % 22 < 6) ?
-                            ((q5_wt_byte_idx / 22) % 56) :
-                            (((q5_wt_byte_idx / 22) % 56) * 16 + (q5_wt_byte_idx % 22) - 6);
-                        // Per-core write enable by row (2 cores, 4 rows)
-                        case ((q5_wt_byte_idx / 22) / 28)
-                            3'd0: begin q5_wt_we0 <= 1; q5_wt_we1 <= 0; end
-                            3'd1: begin q5_wt_we0 <= 1; q5_wt_we1 <= 0; end
-                            3'd2: begin q5_wt_we0 <= 0; q5_wt_we1 <= 1; end
-                            3'd3: begin q5_wt_we0 <= 0; q5_wt_we1 <= 1; end
-                            default: begin q5_wt_we0 <= 0; q5_wt_we1 <= 0; end
-                        endcase
-                        q5_wt_byte_idx <= q5_wt_byte_idx + 1;
+                        // Only write header if within 672-byte limit (guard against burst over-read)
+                        if (q5_hdr_bytes < 672) begin
+                            q5_hdr_we0 <= ~q5_hdr_core; q5_hdr_we1 <= q5_hdr_core;
+                            q5_hdr_bank <= q5_hdr_sub;
+                            q5_hdr_addr <= q5_hdr_block;
+                        end else begin
+                            q5_hdr_we0 <= 0; q5_hdr_we1 <= 0;
+                        end
+                        // Advance counters (every byte = one hdr write)
+                        q5_hdr_bytes <= q5_hdr_bytes + 1;
+                        if (q5_hdr_sub == 5) begin
+                            q5_hdr_sub <= 0;
+                            if (q5_hdr_block == 55) begin
+                                q5_hdr_block <= 0;
+                                q5_hdr_core <= 1;
+                            end else begin
+                                q5_hdr_block <= q5_hdr_block + 1;
+                            end
+                        end else begin
+                            q5_hdr_sub <= q5_hdr_sub + 1;
+                        end
                         if (q5_unpack_cnt == 7) begin
                             rd_unpack_active <= 0;
                         end
                         q5_unpack_cnt <= q5_unpack_cnt + 1;
                     end
-                    // Burst done: start next burst if more data needed
-                    if (rd_done_rise) wt_burst_done <= 1;
-                    if (wt_burst_done && !rd_unpack_active) begin
-                        wt_burst_done <= 0;
-                        if (q5_wt_byte_idx < 4928) begin
-                            rd_addr <= weight_addr + q5_wt_byte_idx;
-                            rd_len <= 8'd15;
+                    // Burst done: start next burst or exit
+                    if (rd_done_rise) sc_burst_done <= 1;
+                    if (sc_burst_done && !rd_unpack_active) begin
+                        sc_burst_done <= 0;
+                        if (q5_hdr_bytes < 672) begin
+                            rd_addr <= weight_addr + q5_hdr_bytes;
+                            // Clamp burst length to not exceed 672 total header bytes
+                            if (672 - q5_hdr_bytes < 64)
+                                rd_len <= (672 - q5_hdr_bytes) / 4 - 1;
+                            else
+                                rd_len <= 8'd15;
                             rd_start <= 1;
+                        end else begin
+                            $display("  [Q5_HDRW] HEADERS DONE t=%0t", $time);
+                            timeout_cnt <= 0;
+                            q5_blk_counter <= 0;
+                            state <= Q5_LOAD_SCALES;
                         end
-                    end
-                    // All 4928 bytes loaded: transition to scale load
-                    if (q5_wt_byte_idx >= 4928 && !rd_unpack_active && !wt_burst_done) begin
-                        timeout_cnt <= 0;
-                        state <= Q5_LOAD_SCALES;
                     end else if (&timeout_cnt && !rd_unpack_active) begin
                         timeout_cnt <= 0;
                         timeout_src <= state;
@@ -774,7 +847,8 @@ module hp_fsm_top (
                 end
 
                 Q5_LOAD_SCALES: begin
-                    rd_addr <= weight_addr + 4928;  // scales follow weight data
+                    $display("  [Q5_SCALES] ENTER t=%0t", $time);
+                    rd_addr <= weight_addr + 2464;  // scales at end of weight region
                     rd_len <= 8'd3;     // 4 AXI beats = 16 bytes = 8 × 16-bit scales
                     rd_start <= 1;
                     q5_unpack_cnt <= 0;
@@ -824,7 +898,7 @@ module hp_fsm_top (
                 Q5_COPY_ACT: begin
                     // Read 64 bytes from DDR = 8 × 64-bit words = 32 activation values
                     rd_addr <= act_addr + q5_copy_act_idx * 2;
-                    rd_len <= 8'd15;    // 16 AXI beats = 64 bytes
+                    rd_len <= 8'd15;
                     rd_start <= 1;
                     sc_burst_done <= 0;
                     state <= Q5_COPY_ACT_W;
@@ -860,8 +934,8 @@ module hp_fsm_top (
                         if (q5_copy_act_idx < 896) begin
                             state <= Q5_COPY_ACT;
                         end else begin
-                            q5_copy_act_idx <= 0;
-                            state <= Q5_COMPUTE;
+                            q5_blk_counter <= 0;
+                            state <= Q5_BLOCK_COMPUTE;
                         end
                     end else if (&timeout_cnt && !rd_unpack_active) begin
                         timeout_cnt <= 0;
@@ -872,35 +946,106 @@ module hp_fsm_top (
                     end
                 end
 
-                Q5_COMPUTE: begin
-                    q5_start <= 1;
-                    state <= Q5_COMPUTE_W;
+                Q5_BLOCK_COMPUTE: begin
+                    $display("  [Q5_BCOMP] ENTER t=%0t blk=%d", $time, q5_blk_counter);
+                    // Read 32 bytes (interleaved core0+core1 qs) from DDR
+                    rd_addr <= weight_addr + 672 + q5_blk_counter * 32;
+                    rd_len <= 8'd7;     // 8 AXI beats = 32 bytes = both cores
+                    rd_start <= 1;
+                    q5_unpack_cnt <= 0;
+                    sc_burst_done <= 0;
+                    if (q5_blk_counter == 0) q5_clr_acc <= 1;
+                    q5_qs_words <= 0;
+                    q5_start_pulsed <= 0;
+                    state <= Q5_BLOCK_COMPUTE_W;
                 end
 
-                Q5_COMPUTE_W: begin
+                Q5_BLOCK_COMPUTE_W: begin
                     q5_start <= 0;
+                    q5_clr_acc <= 0;
+                    rd_start <= 0;
+                    // Phase 1: capture DDR data and assemble qs word
+                    if (!rd_unpack_active && q5_qs_words < 8) begin
+                        rd_ready <= rd_valid;
+                        if (rd_valid && rd_ready) begin
+                            rd_unpack_buf <= rd_data;
+                            rd_unpack_active <= 1;
+                        end
+                    end else if (rd_unpack_active && q5_qs_words < 8) begin
+                        rd_ready <= 0;
+                        if (q5_qs_words < 2)
+                            $display("  [Q5_BCOMP] QSWORD: beat=%d rd_unpack_buf=%0h t=%0t", q5_qs_words, rd_unpack_buf, $time);
+                        // Assemble q5_qs_word0/1 from 4*32-bit beats per core
+                        // q5_qs_words 0..3 → core0's 4 words (at addr 0..3)
+                        // q5_qs_words 4..7 → core1's 4 words (at addr 0..3)
+                        // Each DDR word gives two 32-bit beats: lower then upper
+                        if (q5_qs_words[2]) begin
+                            if (q5_qs_words[1:0] == 0) q5_qs_word1[31:0]   <= rd_unpack_buf[31:0];
+                            if (q5_qs_words[1:0] == 1) q5_qs_word1[63:32]  <= rd_unpack_buf[63:32];
+                            if (q5_qs_words[1:0] == 2) q5_qs_word1[95:64]  <= rd_unpack_buf[31:0];
+                            if (q5_qs_words[1:0] == 3) q5_qs_word1[127:96] <= rd_unpack_buf[63:32];
+                        end else begin
+                            if (q5_qs_words[1:0] == 0) q5_qs_word0[31:0]   <= rd_unpack_buf[31:0];
+                            if (q5_qs_words[1:0] == 1) q5_qs_word0[63:32]  <= rd_unpack_buf[63:32];
+                            if (q5_qs_words[1:0] == 2) q5_qs_word0[95:64]  <= rd_unpack_buf[31:0];
+                            if (q5_qs_words[1:0] == 3) q5_qs_word0[127:96] <= rd_unpack_buf[63:32];
+                        end
+                        q5_qs_words <= q5_qs_words + 1;
+                        if (q5_qs_words[0]) begin
+                            // Upper half consumed — done with this 64-bit word
+                            rd_unpack_active <= 0;
+                        end
+                    end
+                    // Phase 2: after all qs words written, pulse start (once only)
+                    if (q5_qs_words == 8 && !q5_start_pulsed) begin
+                        if (q5_blk_counter == 0) $display("  [Q5_BCOMP] PULSE START t=%0t", $time);
+                        q5_start <= 1;
+                        q5_start_pulsed <= 1;
+                        q5_qs_words <= 8;  // keep >= 8 to prevent re-entry into capture phase
+                    end
+                    // Burst tracking
+                    if (rd_done_rise) sc_burst_done <= 1;
+                    // Wait for compute done (start was pulsed when all qs loaded)
                     if (q5_done_rise) begin
+                        if (q5_blk_counter == 0) $display("  [Q5_BCOMP] DONE_RISE t=%0t (blk=%d)", $time, q5_blk_counter);
+                        q5_blk_counter <= q5_blk_counter + 1;
                         timeout_cnt <= 0;
-                        q5_res_core <= 0;
-                        q5_res_row <= 0;
-                        state <= Q5_READ_RES;
+                        if (q5_blk_counter == 55) begin
+                            q5_res_core <= 0;
+                            q5_res_row <= 0;
+                            q5_res_addr <= 0;  // pre-set for row 0 capture
+                            state <= Q5_READ_RES;
+                        end else begin
+                            state <= Q5_BLOCK_COMPUTE;
+                        end
                     end else if (&timeout_cnt) begin
+                        $display("  [Q5_BCOMP] TIMEOUT t=%0t q5_all_done=%b timeout_cnt=%h q5_qs_words=%d q5_start=%b",
+                            $time, q5_all_done, timeout_cnt, q5_qs_words, q5_start);
                         timeout_cnt <= 0;
                         timeout_src <= state;
                         state <= TIMEOUT_ERROR;
-                    end else begin
+                    end else if (!q5_start) begin
                         timeout_cnt <= timeout_cnt + 1;
+                        if (q5_blk_counter == 0 && timeout_cnt[5:0] == 0)
+                            $display("  [Q5_BCOMP] WAIT t=%0t q5_all_done=%b q5_start=%b timeout=%d",
+                                $time, q5_all_done, q5_start, timeout_cnt);
                     end
                 end
 
                 Q5_READ_RES: begin
-                    // Read 4 results (2 cores x 2 rows = 4 rows)
-                    q5_res_addr <= q5_res_row;
+                    // Capture current row (addr pre-set for this cycle)
+                    if (q5_res_core == 1 && q5_res_row == 1) begin
+                        $display("  [Q5_READ_RES] core1 row1: res1=%0h res_addr=%b acc0=%0d acc1=%0d t=%0t", q5_res1, q5_res_addr, u_q5_core1.acc[0], u_q5_core1.acc[1], $time);
+                    end
+                    if (q5_res_core == 0 && q5_res_row == 1)
+                        $display("  [Q5_READ_RES] core0 row1: res0=%0h res_addr=%b t=%0t", q5_res0, q5_res_addr, $time);
                     act_buf[{q5_res_core, q5_res_row}] <= {16'd0,
                         (q5_res_core == 0) ? q5_res0 : q5_res1};
+                    // Set addr for NEXT row (opposite of current)
+                    q5_res_addr <= ~q5_res_row;
                     if (q5_res_row == 1) begin
                         q5_res_row <= 0;
-                        if (q5_res_core == 1) begin  // last core
+                        if (q5_res_core == 1) begin
                             byte_idx <= 0;
                             state <= WRITE_RES;
                         end else begin
@@ -1099,6 +1244,13 @@ module hp_fsm_top (
                 end
             endcase
 
+            // DEBUG: hdr_we monitor — prints when any HDR_WR is happening in core
+            if (q5_hdr_we1 && q5_hdr_addr < 2 && q5_hdr_bank < 2) begin
+                $display("  [FSM] HDR_WE1: we1=%b addr=%d bank=%d din=%0h state=%0d bytes=%0d t=%0t",
+                    q5_hdr_we1, q5_hdr_addr, q5_hdr_bank, q5_hdr_din, state, q5_hdr_bytes, $time);
+                $display("  [FSM] HDR_RD: weight=0x%08x rd_addr=%0h rd_unpack_cnt=%0d rd_unpack_buf=%0h",
+                    weight_addr, rd_addr, q5_unpack_cnt, rd_unpack_buf);
+            end
             // DEBUG: expose state and status continuously
             reg_debug[31:27] <= state;       // 5-bit state (was 4 bits, lost state[4])
             reg_debug[26]    <= rd_done;

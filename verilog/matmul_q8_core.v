@@ -128,6 +128,10 @@ module matmul_q8_core (
     // BRAM read outputs
     reg signed [47:0] acc_r [0:7];
 
+    // BRAM pre-read address (alias g from dq pipeline)
+    reg [2:0] pre_read_g;
+    reg [4:0] acc_clr_cnt;
+
     always @(posedge clk) begin
         acc_r[0] <= acc_b0[pre_read_g];
         acc_r[1] <= acc_b1[pre_read_g];
@@ -154,10 +158,6 @@ module matmul_q8_core (
         endcase
     end
     assign res_dout = res_dout_r;
-
-    // BRAM pre-read address (alias g from dq pipeline)
-    reg [2:0] pre_read_g;
-    reg [4:0] acc_clr_cnt;
 
     // ======================================================================
     // BRAM read data (registered outputs from wmem and smem banks, act_bram)
@@ -222,6 +222,11 @@ module matmul_q8_core (
         end
     end
 `endif
+
+    // PRE-stage address registration (only update in COMPUTE state)
+    reg [8:0]  pre_wmem_addr;  // {g,k} for wmem banks
+    reg [3:0]  pre_smem_addr;  // {g,k[5]} for smem banks
+    reg [5:0]  pre_act_addr;   // k for act_bram
 
     // ======================================================================
     // FSM
@@ -515,11 +520,6 @@ module matmul_q8_core (
     //
     // However, to save power, we only update addresses when in COMPUTE/DRAIN.
     // ======================================================================
-
-    // PRE-stage address registration (only update in COMPUTE state)
-    reg [8:0]  pre_wmem_addr;  // {g,k} for wmem banks
-    reg [3:0]  pre_smem_addr;  // {g,k[5]} for smem banks
-    reg [5:0]  pre_act_addr;   // k for act_bram
 
     always @(posedge clk) begin
         if (state == COMPUTE) begin

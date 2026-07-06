@@ -50,6 +50,8 @@ module axihp_read_master (
     reg [7:0] beat_cnt;          // 0..burst_len, counts AXI beats received
     reg       even_beat;         // 0=accumulating low half, 1=accumulating high half
     reg [31:0] rdata_lo, rdata_hi;
+    reg       start_prev;
+    wire      start_rise = start && !start_prev;
 
     assign rdata       = {rdata_hi, rdata_lo};
     assign dbg_state   = state;
@@ -67,13 +69,15 @@ module axihp_read_master (
             even_beat      <= 0;
             rdata_lo       <= 0;
             rdata_hi       <= 0;
+            start_prev     <= 0;
         end else begin
             rvalid <= 0;
             done   <= 0;
+            start_prev <= start;
 
             case (state)
                 IDLE: begin
-                    if (start && !busy) begin
+                    if (start_rise && !busy) begin
                         busy          <= 1;
                         m_axi_arid    <= 6'd0;
                         m_axi_araddr  <= src_addr;
