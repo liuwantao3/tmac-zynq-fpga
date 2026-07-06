@@ -110,7 +110,7 @@ else → matmul_fpga_int16()   (F32 norms, fallback)
 | Type | Tile | Blocks | Bytes/tile | weight_buf | Result Bytes/row |
 |------|------|--------|------------|------------|-----------------|
 | Q8_0 | 64×896 | — | 4100 | 4096 | 8 |
-| Q5_0 | 8×896 | 224 | 4928 | 8192 | 8 |
+| Q5_0 | 4×896 | 112 | 4928 | 8192 | 8 |
 | Q6_K | 32×256 | 32 | 6720 | 8192 | 8 |
 | Q4_K | 56×256 | 56 | 8064 | 8192 | 8 |
 | INT16 | 64×64 | — | 8192 | 8192 | 8 |
@@ -379,7 +379,7 @@ python3 scripts/extract_tmac.py models/qwen2-0_5b-instruct-q4_k_m.gguf /tmp/mode
 - `verilog/matmul_top.v` — Quad-core top: AXI4-Lite slave (inline, replaces orphan axilite_slave.v), 8192-byte weight_buf, loading FSM, mode mux (Q8/Q4K/Q5_0/Q6_K/INT16)
 - `verilog/matmul_q8_core.v` — Q8_0 compute core: 8×512×8 wmem (BRAM banks), dequant LUT, 6-stage pipeline
 - `verilog/matmul_q4k_core.v` — Q4_K block decode: 2304-byte block buffer, S24.8 fixed-point, 56×256 tile
-- `verilog/matmul_q5_0_core.v` — Q5_0 block decode: 8×896 tile, 4× parallel cores, 4-stage pipeline (R→D1→D2→A), 1 DSP multiply/stage, combinational BRAM addresses (off-by-one fix)
+- `verilog/matmul_q5_0_core.v` — Q5_0 block decode: 4×896 tile, 2× parallel cores, 4-stage pipeline (R→D1→D2→A), 1 DSP multiply/stage, combinational BRAM addresses (off-by-one fix)
 - `verilog/matmul_q6_k_core.v` — Q6_K block decode: 32×256 tile, 32 blocks/tile, super_scale + per-sub-block scales
 - `verilog/matmul_int16_core.v` — General INT16×INT16 core: 512×128-bit wmem, 3-stage FSM
 - `verilog/dequant_lut.v` — Q8_0 dequant ROM (standalone, not instantiated)
@@ -462,7 +462,7 @@ python3 scripts/extract_tmac.py models/qwen2-0_5b-instruct-q4_k_m.gguf /tmp/mode
 | `vivado_integration/build_bd.tcl` | Vivado batch build | `C:\Xilinx\Vivado\2023.1\bin\vivado.bat -mode batch -source vivado_integration/build_bd.tcl` |
 | `vivado_integration/sw/rebuild.tcl` | XSCT: rebuild Vitis app | `C:\Xilinx\Vitis\2023.1\bin\xsct.bat vivado_integration/sw/rebuild.tcl` |
 | `vivado_integration/sw/run_hp_fsm_comprehensive.tcl` | XSDB: all 7 HP FSM tests (basic, min, 2-burst, 4-burst, chain 2, chain 3, restart) + Test 8-9 (Q8 all-1s, Q8 multi-group) | `C:\Xilinx\Vivado\2023.1\bin\xsdb.bat vivado_integration/sw/run_hp_fsm_comprehensive.tcl` |
-| `vivado_integration/sw/run_hp_fsm_q5_0.tcl` | XSDB: Q5_0 compute test (all-1s, 8 rows, 896 each) | `C:\Xilinx\Vivado\2023.1\bin\xsdb.bat vivado_integration/sw/run_hp_fsm_q5_0.tcl` |
+| `vivado_integration/sw/run_hp_fsm_q5_0.tcl` | XSDB: Q5_0 compute test (all-1s, 4 rows, 896 each) | `C:\Xilinx\Vivado\2023.1\bin\xsdb.bat vivado_integration/sw/run_hp_fsm_q5_0.tcl` |
 
 ### Debug Workflow
 
@@ -635,7 +635,7 @@ Three bugs in the multi-group Q8 iteration were found and fixed during iVerilog 
 - `vivado_integration/build_bd.tcl`: Vivado batch build — HP0 config (`PCW_S_AXI_HP0_DATA_WIDTH=64`) set before `apply_bd_automation`. Sources `hp_fsm_top.v` + `axihp_read_master.v` + `axihp_write_master.v`.
 - `vivado_integration/rtl/hp_fsm_top.v`: HP descriptor-chain FSM — AXI4-Lite slave, desc_buf (32B), act_buf (512B), Q8 matmul core + 64×896 tile (14 groups), multi-group accumulator (64×48-bit acc_buf), 32-bit HP read/write masters. 18-state FSM: IDLE→FETCH_DESC→LOAD_WEIGHT→LOAD_SCALES→LOAD_ACT→COPY_ACT_TO_CORE→COMPUTE→READ_RES_ACC (×groups)→COPY_ACC_TO_BUF→WRITE_RES→DONE.
 - `vivado_integration/sw/run_hp_fsm_comprehensive.tcl`: XSDB flow — all 7 HP FSM tests (basic, min 8B, 128B 2-burst, 256B 4-burst, chain of 2, chain of 3, re-start). Polls HEAD register for completion.
-- `vivado_integration/sw/run_hp_fsm_q5_0.tcl`: XSDB flow — Q5_0 all-1s test. Loads weight/scales/acts, sets tensor_type=1 descriptor, verifies 8 rows = 896.
+- `vivado_integration/sw/run_hp_fsm_q5_0.tcl`: XSDB flow — Q5_0 all-1s test. Loads weight/scales/acts, sets tensor_type=1 descriptor, verifies 4 rows = 896.
 - `vivado_integration/sw/regs.h`: Register map
 - `vivado_integration/ps7_init.tcl`: Modified — AFI1 + LVL_SHFTR_EN config in ps7_post_config
 - `verilog/axihp_read_master.v`: HP read master — ARSIZE=2 (4 bytes/beat), always captures RDATA[31:0], byte-stream output. DRAIN state per-beat. 32-bit mode.

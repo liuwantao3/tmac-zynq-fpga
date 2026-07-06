@@ -15,7 +15,7 @@ Custom Verilog RTL for 5 quantization formats on Xilinx Zynq 7010:
 |-----------|--------|
 | Q8_0 core (`matmul_q8_core.v`) | Complete — 6-stage pipeline, 8×BRAM18, 524 cycles/tile, 6/6 tests PASS |
 | Q4_K core (`matmul_q4k_core.v`) | Complete — 56×256 tile, 4/4 tests PASS |
-| Q5_0 core (`matmul_q5_0_core.v`) | Complete — 8×896 tile, 32/32 tests PASS |
+| Q5_0 core (`matmul_q5_0_core.v`) | Complete — 4×896 tile, 32/32 tests PASS |
 | Q6_K core (`matmul_q6_k_core.v`) | Complete — 32×256 tile, 97/97 tests PASS |
 | INT16 core (`matmul_int16_core.v`) | Complete — 64×64 tile, smoke test (addressing issue) |
 | HP FSM Top (`hp_fsm_top.v`) | Complete — AXI4-Lite + HP read/write + Q8 compute, 9/9 HW tests PASS |
@@ -53,9 +53,9 @@ PRE → Stage 0 → Stage 1a → Stage 1b → Stage 2a → Stage 2b
 
 Block buffer decode. Decodes Q4_K blocks into S24.8 fixed-point values, accumulates row-wise. No wmem (streaming block decode). Cycles: 14,337/tile (56 rows × 256 cols, one element/cycle).
 
-### Q5_0 Core (8×896 tile)
+### Q5_0 Core (4×896 tile)
 
-Serial block decode (2 cycles/element). 224 blocks of 32 elements each = 7,168 elements. Cycles: 14,338/tile.
+Serial block decode (2 cycles/element). 112 blocks of 32 elements each = 3,584 elements. Cycles: ~7,170/tile (1792 iterations × 4 pipeline stages + drain).
 
 ### Q6_K Core (32×256 tile)
 

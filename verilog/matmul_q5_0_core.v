@@ -47,14 +47,15 @@ module matmul_q5_0_core (
     reg [31:0] tile_start_cycle;
     reg [7:0]  tile_counter;
 
-    // BRAMs
-    (* ram_style = "block" *) reg [7:0] bank0 [0:1023];
-    (* ram_style = "block" *) reg [7:0] bank1 [0:1023];
-    (* ram_style = "block" *) reg [7:0] bank2 [0:1023];
-    (* ram_style = "block" *) reg [7:0] bank3 [0:1023];
-    (* ram_style = "block" *) reg [7:0] bank4 [0:1023];
-    (* ram_style = "block" *) reg [7:0] bank5 [0:1023];
-    (* ram_style = "block" *) reg [7:0] bank6 [0:1023];
+    // Banks 0-5: f16 scale + qh (1 addr/block × 56 blks). LUTRAM (small).
+    reg [7:0] bank0 [0:63];
+    reg [7:0] bank1 [0:63];
+    reg [7:0] bank2 [0:63];
+    reg [7:0] bank3 [0:63];
+    reg [7:0] bank4 [0:63];
+    reg [7:0] bank5 [0:63];
+    // Bank6: qs (16 addr/block × 56 blks = 896). BRAM (still needs depth).
+    (* ram_style = "block" *) reg [7:0]  bank6  [0:1023];
     (* ram_style = "block" *) reg [15:0] act_mem [0:1023];
 
     reg [15:0] row_scale [0:7];
@@ -182,10 +183,14 @@ module matmul_q5_0_core (
     end
 
 `ifdef __ICARUS__
+    integer k;
     initial begin
-        for (integer k = 0; k < 1024; k = k + 1) begin
-            bank0[k] = 8'd0; bank1[k] = 8'd0; bank2[k] = 8'd0; bank3[k] = 8'd0;
-            bank4[k] = 8'd0; bank5[k] = 8'd0; bank6[k] = 8'd0;
+        for (k = 0; k < 64; k = k + 1) begin
+            bank0[k] = 8'd0; bank1[k] = 8'd0; bank2[k] = 8'd0;
+            bank3[k] = 8'd0; bank4[k] = 8'd0; bank5[k] = 8'd0;
+        end
+        for (k = 0; k < 1024; k = k + 1) begin
+            bank6[k] = 8'd0;
             act_mem[k] = 16'd0;
         end
     end

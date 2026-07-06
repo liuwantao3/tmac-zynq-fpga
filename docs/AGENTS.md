@@ -139,7 +139,7 @@ C:\Xilinx\Vivado\2023.1\bin\xsim.bat tb_hw_fsm --runall
 ### Verilog RTL
 - `verilog/matmul_q8_core.v` — Q8_0 compute: 8×BRAM18 wmem+banks, 6-stage pipeline, 524 cycles/tile
 - `verilog/matmul_q4k_core.v` — Q4_K: 2304-byte block buffer, S24.8, 56×256 tile
-- `verilog/matmul_q5_0_core.v` — Q5_0: 8×896 tile, 224 blocks, row_scale normalization
+- `verilog/matmul_q5_0_core.v` — Q5_0: 4×896 tile, 112 blocks, row_scale normalization
 - `verilog/matmul_q6_k_core.v` — Q6_K: 32×256 tile, super_scale + sub-block scales
 - `verilog/matmul_int16_core.v` — INT16×INT16: 512×128 wmem, 3-stage FSM
 - `vivado_integration/rtl/hp_fsm_top.v` — Top FSM: AXI4-Lite, HP read/write masters, descriptor chain, Q8 compute integration
