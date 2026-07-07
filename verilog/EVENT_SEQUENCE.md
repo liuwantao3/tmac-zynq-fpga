@@ -1,5 +1,10 @@
 # Full Event Sequence: C++ → FPGA MatMul → C++
 
+> **DEPRECATED (2026-07-07):** This documents the old `matmul_top.v` AXI-Lite
+> buffer-based flow. The current active FSM is `hp_fsm_top.v` (HP descriptor-chain
+> DMA). See `AGENTS.md` §"HP FSM flow" and `vivado_integration/API.md` for
+> the current architecture and register map.
+
 ## Overview
 
 This document describes the complete event sequence from when a C++ application calls the Q8_0 matrix multiplication accelerator, through data transfer and computation on the FPGA, back to result retrieval by C++.

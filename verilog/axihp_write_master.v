@@ -1,7 +1,7 @@
 `timescale 1ns / 1ps
 
 // AXI HP Write Master — 64-bit wdata, INCR burst, AWSIZE=3 (8 bytes/beat)
-// Zynq-7010 HP port with x16 DDR3: HP0 is 32-bit, RDATA[63:32]=0.
+// Zynq-7010 HP port with x16 DDR3: each 8-byte beat issues two 32-bit DDR accesses.
 // AWSIZE=3 sends 8 bytes per beat — the Zynq HP port handles this
 // by performing two 32-bit DDR accesses per beat.
 module axihp_write_master (

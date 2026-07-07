@@ -1,6 +1,7 @@
 /*
  * T-MAC FPGA Interface Implementation
- * Zynq 7010 ARM-side driver for matmul_q8 IP
+ * Zynq 7010 ARM-side driver for HP FSM descriptor-chain accelerator
+ * (hp_fsm_top.v — aspirational, implementation pending)
  *
  * ARM prepares: Q8_0 weight bytes + UQ8.8 combined scales + INT16 activations
  * FPGA does: Q8→INT16 dequant (LUT) + INT16×INT16 systolic matmul (DSP)

@@ -182,6 +182,20 @@ module tb_hw_fsm_comprehensive;
         ddr_write32(desc_addr + 28, 32'h00000000);
     endtask
 
+    // Q8 descriptor: tensor_type=0, num_groups=1 (single column group, 64 cols)
+    task setup_q8_desc(input [31:0] desc_addr, input [31:0] next_addr,
+                       input [31:0] weight_addr, input [31:0] act_addr,
+                       input [31:0] res_addr, input [15:0] num_tiles);
+        ddr_write32(desc_addr + 0,  next_addr);
+        ddr_write32(desc_addr + 4,  weight_addr);
+        ddr_write32(desc_addr + 8,  act_addr);
+        ddr_write32(desc_addr + 12, res_addr);
+        ddr_write32(desc_addr + 16, 32'h00000000);  // tensor_type=0 (Q8_0), groups=0→GP0 fallback
+        ddr_write32(desc_addr + 20, {num_tiles[15:8], num_tiles[7:0], 8'h00, 8'h01});  // num_groups=1, num_tiles
+        ddr_write32(desc_addr + 24, 24'd128);  // act_total_bytes = 64 × INT16
+        ddr_write32(desc_addr + 28, 32'h00000000);
+    endtask
+
     // Write incrementing pattern to DDR at base_addr for nbytes (must be multiple of 4)
     task write_pattern_inc(input [31:0] base_addr, input [23:0] nbytes);
         integer j;
@@ -208,6 +222,41 @@ module tb_hw_fsm_comprehensive;
         integer j;
         for (j = 0; j < nbytes/4; j = j + 1)
             ddr_write32(base_addr + j*4, 32'h00000000);
+    endtask
+
+    // Fill 4096-byte Q8 weight tile with all 0x01 bytes (INT8 1)
+    task fill_q8_weight_all1(input [31:0] base_addr);
+        integer j;
+        for (j = 0; j < 4096/4; j = j + 1)
+            ddr_write32(base_addr + j*4, 32'h01010101);
+    endtask
+
+    // Fill 256 bytes of Q8 scales with UQ8.8 256 (1.0, per column group)
+    // Each 32-bit word holds two 16-bit UQ8.8 values: {256, 256} = 32'h01000100
+    task fill_q8_scales_all1(input [31:0] base_addr);
+        integer j;
+        for (j = 0; j < 256/4; j = j + 1)
+            ddr_write32(base_addr + j*4, 32'h01000100);
+    endtask
+
+    // Fill activation with INT16 1 (0x0001 little-endian)
+    task fill_act_all1(input [31:0] base_addr, input [23:0] nbytes);
+        integer j;
+        for (j = 0; j < nbytes/4; j = j + 1)
+            ddr_write32(base_addr + j*4, 32'h00010001);
+    endtask
+
+    // Verify 64-bit Q8 result word at offset (row * 8) in result buffer
+    task verify_q8_row(input [31:0] res_addr, input [31:0] row,
+                       input [63:0] expected, input [31:0] test_id);
+        reg [63:0] got;
+        got[31:0]  = ddr_read32(res_addr + row * 8 + 0);
+        got[63:32] = ddr_read32(res_addr + row * 8 + 4);
+        if (got !== expected) begin
+            $display("  FAIL[%0d]: row %0d addr=0x%08x expected=0x%016x got=0x%016x",
+                test_id, row, res_addr + row * 8, expected, got);
+            fail_count = fail_count + 1;
+        end
     endtask
 
     // Configure and start the FSM
@@ -299,7 +348,7 @@ module tb_hw_fsm_comprehensive;
         $dumpfile("tb_hw_fsm_comprehensive.vcd");
         $dumpvars(0, tb_hw_fsm_comprehensive);
         $display("==============================================");
-        $display("  HP FSM Comprehensive Test Suite (7 tests)");
+        $display("  HP FSM Comprehensive Test Suite (8 tests)");
         $display("==============================================");
         #12 rst_n = 1; #20;
         pass_count = 0; fail_count = 0; test_num = 0;
@@ -460,6 +509,41 @@ module tb_hw_fsm_comprehensive;
         verify_pattern_inc(32'h00302500, 64, test_num);
         $display("  Verify second run result:");
         verify_pattern_const(32'h00302540, 32, 8'h5A, test_num);
+
+        // ===================================================================
+        // Test 8: Q8 multi-tile (2 tiles, all-1s, 1 column group)
+        //   weight=0x01 (INT8 1), scale=UQ8.8 256 (1.0), act=INT16 1
+        //   dequant_q8(1, 256) = 1*256>>8 = 1
+        //   Each row sum = 64 cols × 1 × 1 = 64
+        //   Two tiles = 128 rows, each = 64
+        // ===================================================================
+        test_num = test_num + 1;
+        $display("\n--- Test %0d: Q8 multi-tile (2 tiles, all-1s) ---", test_num);
+        // Q8 weight tile 0 at 0x00310000, scales at offset 4096
+        fill_q8_weight_all1(32'h00310000);
+        fill_q8_scales_all1(32'h00311000);    // weight_addr + 4096
+        // Q8 weight tile 1 at 0x00311100 (4352 stride/tile for 1 column group)
+        fill_q8_weight_all1(32'h00311100);
+        fill_q8_scales_all1(32'h00312100);    // tile 1 weight + 4096
+        // Activation: 64 × INT16 1
+        fill_act_all1(32'h00320000, 128);
+        // Zero-fill result area
+        zero_fill(32'h00321000, 1024);
+        // Descriptor: tensor_type=0, num_groups=1, num_tiles=2, act_bytes=128
+        setup_q8_desc(32'h00330000, 32'h00000000, 32'h00310000,
+                      32'h00320000, 32'h00321000, 16'd2);
+        // REG_Q8_NUM_GROUPS fallback not needed (descriptor has num_groups=1)
+        start_chain(32'h00330000);
+        wait_done(1);
+        axil_read(16'h14, rd_val);
+        $display("  STATUS=0x%08x (expect 0x300)", rd_val);
+        axil_read(16'h20, rd_val); $display("  HEAD=%d (expect 1)", rd_val);
+        // Verify tile 0 (rows 0-63) and tile 1 (rows 64-127)
+        for (i = 0; i < 64; i = i + 1)
+            verify_q8_row(32'h00321000, i, 64'd64, test_num);
+        for (i = 0; i < 64; i = i + 1)
+            verify_q8_row(32'h00321200, i, 64'd64, test_num);
+        $display("  Test %0d: verify done (failures counted above)", test_num);
 
         // ===================================================================
         // Summary

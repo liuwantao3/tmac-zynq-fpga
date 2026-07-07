@@ -1,5 +1,10 @@
 # Code Audit — Qwen2-0.5B FPGA Accelerator
 
+> **NOTE (2026-07-07):** This audit dates from 2026-05-27. Many items have since
+> been resolved: Q8 pipeline rewritten, BRAM conversions done, Q5_0 rewritten,
+> descriptor chain proven on hardware. Items 6, 8, 9, 10, 12 may still be relevant.
+> For current status see `AGENTS.md`.
+
 **Date:** 2026-05-27  
 **Scope:** `sim/tmac_gguf.cpp`, `sim/fpga_sim.hpp`, `verilog/` (all RTL)
 

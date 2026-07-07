@@ -449,8 +449,8 @@ inline void axi_vecmul_tile_int16(const in16_t vec[N], const in16_t W[N][N], acc
 // Q8_0 Direct Path — FPGA receives Q8_0 bytes + row scales, does Q8→INT16
 // internally. This moves the dequantization workload from CPU to FPGA.
 //
-// ARM side (CPU):   sends raw Q8_0 bytes (4 KB/tile) + row scales (56 B)
-// FPGA side:        Q8_0→INT16 dequant + INT16 systolic matmul + dequant
+// ARM side (CPU):   sends raw Q8_0 bytes (4 KB/tile) + combined scales (256 B)
+// FPGA side:        Q8_0→INT16 dequant + INT16×INT16 systolic matmul (DSP, 64×64 tile)
 // Tile transfer:    ~6.9 µs vs INT16 ~13.5 µs (2× faster)
 //
 // Usage:
@@ -512,6 +512,12 @@ constexpr int Q4K_TILE_BYTES = Q4K_TILE_BLOCKS * Q4K_BLOCK_BYTES;  // 32256
 constexpr int Q5_0_BLOCK_SIZE = 32;
 constexpr int Q5_0_BLOCK_BYTES = 22;
 constexpr int Q5_0_224BLOCK_BYTES = 224 * Q5_0_BLOCK_BYTES;  // 4928
+
+// HP FSM Q5_0 2-core 56-block interleaved format (48 bytes/block)
+constexpr int Q5_0_2CORE_BLOCK_BYTES = 48;         // 22+22+4 padding
+constexpr int Q5_0_56BLOCK_BYTES = 56 * Q5_0_2CORE_BLOCK_BYTES;  // 2688
+constexpr int Q5_0_TILE_NORM_BYTES = 4 * 2;        // 8 (4 × UQ8.8)
+constexpr int Q5_0_TILE_BYTES = Q5_0_56BLOCK_BYTES + Q5_0_TILE_NORM_BYTES;  // 2696
 
 // Q6_K block constants (256 values/block, 210 bytes)
 constexpr int Q6_K_BLOCK_SIZE = 256;
@@ -1179,6 +1185,69 @@ inline void axi_vecmul_q4k_row2(const uint8_t* tensor_data, int cols,
     result[1] = acc[1];
 }
 
+// =======================================================================
+// HP FSM Q5_0 4×896 model: 56 blocks (2 cores × 2 rows), interleaved
+// 48-byte per-block format: core0_d+qh+qs + core1_d+qh+qs + padding.
+// row_norm = UQ8.8 per row (4 values).
+// Matches verilog/matmul_q5_0_core.v (2-core, hp_fsm_top.v dispatch).
+// =======================================================================
+inline void axi_vecmul_tile_q5_0_4x896_axilite(
+    const uint8_t blocks_56[Q5_0_56BLOCK_BYTES],
+    const in16_t act_reg[896],
+    const float row_norm[4],
+    int64_t* result,
+    int row_base) {
+    constexpr int NROWS = 4;
+    constexpr int NBLOCKS = 56;
+    constexpr int BLOCK_COLS = 32;
+    constexpr int COLS = 896;
+    constexpr int ROW_BLOCKS = COLS / BLOCK_COLS;  // 28
+    int64_t acc[NROWS] = {0};
+
+    for (int bi = 0; bi < NBLOCKS; bi++) {
+        const uint8_t* blk = blocks_56 + bi * Q5_0_2CORE_BLOCK_BYTES;
+
+        float d0 = read_f16(blk);
+        uint32_t qh0;
+        memcpy(&qh0, blk + 2, 4);
+
+        float d1 = read_f16(blk + 22);
+        uint32_t qh1;
+        memcpy(&qh1, blk + 24, 4);
+
+        int row0 = (bi < ROW_BLOCKS) ? 0 : 1;  // core0 row within tile
+        int row1 = (bi < ROW_BLOCKS) ? 2 : 3;  // core1 row within tile
+        int col_base = (bi % ROW_BLOCKS) * BLOCK_COLS;
+
+        for (int wi = 0; wi < BLOCK_COLS; wi++) {
+            int col = col_base + wi;
+
+            int j = wi < 16 ? wi : wi - 16;
+            uint8_t qs_byte0 = blk[6 + j];
+            uint8_t ql0 = (wi < 16) ? (qs_byte0 & 0xF) : (qs_byte0 >> 4);
+            uint8_t qh_bit0 = (qh0 >> wi) & 1;
+            int q5_0 = ((qh_bit0 << 4) | ql0) - 16;
+
+            uint8_t qs_byte1 = blk[28 + j];
+            uint8_t ql1 = (wi < 16) ? (qs_byte1 & 0xF) : (qs_byte1 >> 4);
+            uint8_t qh_bit1 = (qh1 >> wi) & 1;
+            int q5_1 = ((qh_bit1 << 4) | ql1) - 16;
+
+            float norm0 = d0 * (float)q5_0 * row_norm[row0];
+            float norm1 = d1 * (float)q5_1 * row_norm[row1];
+
+            int16_t v0 = (norm0 > 32767.0f) ? 32767 : (norm0 < -32768.0f ? -32768 : (int16_t)roundf(norm0));
+            int16_t v1 = (norm1 > 32767.0f) ? 32767 : (norm1 < -32768.0f ? -32768 : (int16_t)roundf(norm1));
+
+            acc[row0] += (int64_t)v0 * (int64_t)act_reg[col];
+            acc[row1] += (int64_t)v1 * (int64_t)act_reg[col];
+        }
+    }
+
+    for (int i = 0; i < NROWS; i++)
+        result[row_base + i] += acc[i];
+}
+
 // ===========================================================================
 // Phase B Descriptor Chain — matches verilog/matmul_top.v descriptor format
 // ===========================================================================
@@ -1213,8 +1282,8 @@ constexpr uint8_t DESC_FLAG_INTERRUPT = 0x01;
 constexpr int PHASEB_Q5_0_ROWS        = 8;
 constexpr int PHASEB_Q5_0_COLS        = 896;
 constexpr int PHASEB_Q5_0_BLK_BYTES   = 224 * 22;  // 4928
-constexpr int PHASEB_Q5_0_SCL_BYTES   = 8 * 4;     // 32  (row_inv UQ24.8)
-constexpr int PHASEB_Q5_0_TILE_BYTES  = PHASEB_Q5_0_BLK_BYTES + PHASEB_Q5_0_SCL_BYTES; // 4960
+constexpr int PHASEB_Q5_0_SCL_BYTES   = 8 * 2;     // 16  (row_inv UQ16.8)
+constexpr int PHASEB_Q5_0_TILE_BYTES  = PHASEB_Q5_0_BLK_BYTES + PHASEB_Q5_0_SCL_BYTES; // 4944
 
 constexpr int PHASEB_Q6_K_ROWS        = 32;
 constexpr int PHASEB_Q6_K_COLS        = 256;

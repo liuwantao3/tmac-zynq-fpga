@@ -66,15 +66,17 @@ __pycache__/
 docker/xilinx_installers/*.tar.gz
 docker/xilinx_installers/*.tar
 
-# Editor temp files
+# Editor / temp files
 *.swp
 *.swo
 *~
 *.new
+*.bak
 
 # Simulation outputs (iverilog)
 *.vvp
 *.vcd
+verilog/hw_fsm_sim
 
 # XSIM simulation artifacts
 xsim.dir/

@@ -44,14 +44,17 @@ proc gp0_write {reg val} {
 # Write descriptor at physical addr
 # type: 15 = CPU_OP (default), 0 = Q8 compute, others = reserved
 # num_groups: 0 = use GP0 reg (backward compat), 1+ = Q8 column groups
-proc write_desc {addr next_addr weight_addr act_addr res_addr bytes {tensor_type 15} {num_groups 0}} {
+# num_tiles: number of tiles per descriptor (0→1 for backward compat), stored at bytes [22:23]
+proc write_desc {addr next_addr weight_addr act_addr res_addr bytes {tensor_type 15} {num_groups 0} {num_tiles 1}} {
     write32 $addr                  $next_addr   ;# bytes 0-3:  next_addr
     write32 [expr $addr + 4]       $weight_addr ;# bytes 4-7:  weight_addr
     write32 [expr $addr + 8]       $act_addr    ;# bytes 8-11: act_addr
     write32 [expr $addr + 12]      $res_addr    ;# bytes 12-15: result_addr
     # tensor_type stored as 16-bit at bytes 16-17 (little-endian)
     write32 [expr $addr + 16]      $tensor_type ;# bytes 16-19: {reserved[15:0], tensor_type}
-    write32 [expr $addr + 20]      $num_groups  ;# bytes 20-23: {reserved[27:0], num_groups[3:0]}
+    # byte 20: num_groups[3:0], bytes 22-23: num_tiles (16-bit LE)
+    set word20 [expr {($num_tiles << 16) | ($num_groups & 0xFF)}]
+    write32 [expr $addr + 20]      $word20      ;# bytes 20-23
     write32 [expr $addr + 24]      $bytes       ;# bytes 24-27: act_total_bytes
     write32 [expr $addr + 28]      0            ;# bytes 28-31: reserved
 }
@@ -194,7 +197,7 @@ proc run_chain {desc_base expected_head} {
 
 # ===== MAIN =====
 puts "=============================================="
-puts "  HP FSM Comprehensive Hardware Test (7+2 tests)"
+puts "  HP FSM Comprehensive Hardware Test (7+3 tests)"
 puts "=============================================="
 
 configparams force-mem-accesses 1
@@ -528,6 +531,79 @@ if {[run_chain $Q9_DESC_ADDR 1]} {
         incr pass_count
     } else {
         puts "  Test 9a: MISMATCH (rows shown above)"
+        incr fail_count
+    }
+} else { incr fail_count }
+
+# ===================================================================
+# Test 10: Q8 multi-tile — 2 tiles × 64 rows, all weights=1, act=1
+#   Tile 0: weight@addr, tile 1: weight@addr+4352 (1 column group)
+#   Expected: all rows = 64
+# ===================================================================
+puts "\n--- Test 10: Q8 multi-tile 2 tiles (all-1s) ---"
+
+set Q10_DESC_ADDR    0x001002A0
+set Q10_WEIGHT_ADDR  0x00108000
+set Q10_ACT_ADDR     0x00109000
+set Q10_RES_ADDR     0x0010A000
+set Q10_NUM_TILES    2
+set Q10_GROUPS       1
+set Q10_TILE_STRIDE  [expr 4096 + $Q10_GROUPS * 256]
+set Q10_EXPECTED     64
+
+# Tile 0 weight: all INT8 = 1 (4096 bytes)
+write_pattern_const $Q10_WEIGHT_ADDR 4096 0x01
+# Tile 0 scales: UQ8.8 1.0 = 0x0100 (256 bytes)
+set sc_pair [expr {0x0100 | (0x0100 << 16)}]
+for {set j 0} {$j < 64} {incr j} {
+    write32 [expr $Q10_WEIGHT_ADDR + 4096 + $j * 4] $sc_pair
+}
+
+# Tile 1 weight: all INT8 = 1 (4096 bytes at offset $Q10_TILE_STRIDE)
+write_pattern_const [expr $Q10_WEIGHT_ADDR + $Q10_TILE_STRIDE] 4096 0x01
+# Tile 1 scales
+for {set j 0} {$j < 64} {incr j} {
+    write32 [expr $Q10_WEIGHT_ADDR + $Q10_TILE_STRIDE + 4096 + $j * 4] $sc_pair
+}
+
+# Activations: 64 × int16 = 1 (128 bytes)
+set act_pair [expr {0x0001 | (0x0001 << 16)}]
+for {set j 0} {$j < 32} {incr j} {
+    write32 [expr $Q10_ACT_ADDR + $j * 4] $act_pair
+}
+
+# Result buffer: 2 tiles × 512 bytes = 1024 bytes
+zero_fill $Q10_RES_ADDR 1024
+
+# Descriptor: tensor_type=0, 1 group, 2 tiles, act_total_bytes=128
+write_desc $Q10_DESC_ADDR 0 $Q10_WEIGHT_ADDR $Q10_ACT_ADDR $Q10_RES_ADDR 128 0 $Q10_GROUPS $Q10_NUM_TILES
+
+if {[run_chain $Q10_DESC_ADDR 1]} {
+    set ok 1
+    # Verify tile 0 (rows 0-63)
+    for {set j 0} {$j < 64} {incr j} {
+        set addr [expr $Q10_RES_ADDR + $j * 8]
+        set lo [read32 $addr]
+        set hi [read32 [expr $addr + 4]]
+        if {$lo != $Q10_EXPECTED || $hi != 0} {
+            puts "  FAIL[10]: tile0 row $j addr=[format 0x%08x $addr] lo=[format 0x%08x $lo] hi=[format 0x%08x $hi]"
+            set ok 0
+        }
+    }
+    # Verify tile 1 (rows 64-127)
+    for {set j 0} {$j < 64} {incr j} {
+        set addr [expr $Q10_RES_ADDR + 512 + $j * 8]
+        set lo [read32 $addr]
+        set hi [read32 [expr $addr + 4]]
+        if {$lo != $Q10_EXPECTED || $hi != 0} {
+            puts "  FAIL[10]: tile1 row $j addr=[format 0x%08x $addr] lo=[format 0x%08x $lo] hi=[format 0x%08x $hi]"
+            set ok 0
+        }
+    }
+    if {$ok} {
+        puts "  Test 10: PASS (all 128 rows = $Q10_EXPECTED)"
+        incr pass_count
+    } else {
         incr fail_count
     }
 } else { incr fail_count }

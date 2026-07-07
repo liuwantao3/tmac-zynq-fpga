@@ -1,5 +1,11 @@
 # Q5_0 Core Data Path Analysis & Bug Fix
 
+> **DEPRECATED (2026-07-07):** This documents the old byte-at-a-time header
+> loading architecture (Q5_PRELOAD_HDR states, hdr_packed LUTRAM). The Q5_0
+> clean-slate rewrite (see AGENTS.md Key Decision #9) replaced this with a
+> per-block wide register interface (blk_d/blk_qh/blk_qs/blk_valid).
+> The spurious block 56 bug fix section remains relevant history.
+
 **Date**: 2026-07-06
 **Author**: Systematic review of `matmul_q5_0_core.v` and `hp_fsm_top.v` Q5_0 states.
 

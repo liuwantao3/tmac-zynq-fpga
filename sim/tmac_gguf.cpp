@@ -1281,7 +1281,7 @@ void matmul_fpga_q5_0(const Tensor* A, const float* x, float* y, int rows, int c
 
             // Cosimulation tile dump for Q5_0
             if (g_dump_q5_0_file && g_dump_q5_0_tiles_remaining > 0) {
-                // Dump: 112 blocks (2464) + scales (4*2) + activations (896*2) + expected result (4*8)
+                // Dump: 224 blocks (4928) + scales (8*4 FP32) + activations (896*2) + expected result (8*8 int64)
                 fwrite(blocks, 1, fpga_sim::Q5_0_224BLOCK_BYTES, g_dump_q5_0_file);
                 fwrite(x_q.data(), 2, 896, g_dump_q5_0_file);
                 fwrite(row_inv.data() + row0, 4, 8, g_dump_q5_0_file);

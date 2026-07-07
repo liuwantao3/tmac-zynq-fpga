@@ -152,13 +152,14 @@ module tb_hp_fsm_q5_0;
     // --- Q5_0 descriptor setup ---
     task setup_q5_desc(input [31:0] desc_addr, input [31:0] next_addr,
                        input [31:0] weight_addr, input [31:0] act_addr,
-                       input [31:0] res_addr, input [23:0] act_bytes);
+                       input [31:0] res_addr, input [23:0] act_bytes,
+                       input [15:0] num_tiles);
         ddr_write32(desc_addr + 0,  next_addr);
         ddr_write32(desc_addr + 4,  weight_addr);
         ddr_write32(desc_addr + 8,  act_addr);
         ddr_write32(desc_addr + 12, res_addr);
         ddr_write32(desc_addr + 16, 32'h00000001);  // tensor_type=1 (Q5_0)
-        ddr_write32(desc_addr + 20, 32'h00000000);
+        ddr_write32(desc_addr + 20, {num_tiles[15:8], num_tiles[7:0], 8'h00, 8'h00});
         ddr_write32(desc_addr + 24, {8'h00, act_bytes});
         ddr_write32(desc_addr + 28, 32'h00000000);
     endtask
@@ -197,53 +198,48 @@ module tb_hp_fsm_q5_0;
         if (!completed) $display("  WARN: wait_done timeout");
     endtask
 
-    // Write Q5_0 weight data in new separated layout:
-    //   Core0 headers: 56×6B = 336B at base+0
-    //   Core1 headers: 56×6B = 336B at base+336
-    //   Core0 qs: 56×16B = 896B at base+672
-    //   Core1 qs: 56×16B = 896B at base+1568
-    //   Total: 2464 bytes
+    // Write Q5_0 weight data in per-block layout:
+    //   Per block (48 bytes): core0_d[2] + qh[4] + qs[16] + core1_d[2] + qh[4] + qs[16] + pad[4]
+    //   56 blocks × 48 = 2688 bytes, then 4 × UQ8.8 norm values at offset 2688
     task fill_q5_weight(input [31:0] base, input [3:0] q5_val);
         integer b, k;
         begin
-            // Core0 headers: f16=0x3C00 (1.0), qh=0xFFFFFFFF
             for (b = 0; b < 56; b = b + 1) begin
-                ddr_write8(base + b*6 + 0, 8'h00);
-                ddr_write8(base + b*6 + 1, 8'h3C);
-                ddr_write8(base + b*6 + 2, 8'hFF);
-                ddr_write8(base + b*6 + 3, 8'hFF);
-                ddr_write8(base + b*6 + 4, 8'hFF);
-                ddr_write8(base + b*6 + 5, 8'hFF);
-            end
-            // Core1 headers: same content at offset 336
-            for (b = 0; b < 56; b = b + 1) begin
-                ddr_write8(base + 336 + b*6 + 0, 8'h00);
-                ddr_write8(base + 336 + b*6 + 1, 8'h3C);
-                ddr_write8(base + 336 + b*6 + 2, 8'hFF);
-                ddr_write8(base + 336 + b*6 + 3, 8'hFF);
-                ddr_write8(base + 336 + b*6 + 4, 8'hFF);
-                ddr_write8(base + 336 + b*6 + 5, 8'hFF);
-            end
-            // Per-block interleaved qs: core0[16B] + core1[16B] = 32B/block
-            // Total: 56 blocks × 32 bytes = 1792 bytes starting at offset 672
-            for (b = 0; b < 56; b = b + 1) begin
+                // Core0 d = 0x3C00 (f16 1.0)
+                ddr_write8(base + b*48 + 0, 8'h00);
+                ddr_write8(base + b*48 + 1, 8'h3C);
+                // Core0 qh = 0xFFFFFFFF (all high bits = 1)
+                ddr_write8(base + b*48 + 2, 8'hFF);
+                ddr_write8(base + b*48 + 3, 8'hFF);
+                ddr_write8(base + b*48 + 4, 8'hFF);
+                ddr_write8(base + b*48 + 5, 8'hFF);
+                // Core0 qs: each nibble = q5_val
                 for (k = 0; k < 16; k = k + 1)
-                    ddr_write8(base + 672 + b*32 + k, {q5_val, q5_val});       // core0
+                    ddr_write8(base + b*48 + 6 + k, {q5_val, q5_val});
+                // Core1 d = 0x3C00
+                ddr_write8(base + b*48 + 22, 8'h00);
+                ddr_write8(base + b*48 + 23, 8'h3C);
+                // Core1 qh = 0xFFFFFFFF
+                ddr_write8(base + b*48 + 24, 8'hFF);
+                ddr_write8(base + b*48 + 25, 8'hFF);
+                ddr_write8(base + b*48 + 26, 8'hFF);
+                ddr_write8(base + b*48 + 27, 8'hFF);
+                // Core1 qs: each nibble = q5_val
                 for (k = 0; k < 16; k = k + 1)
-                    ddr_write8(base + 672 + b*32 + 16 + k, {q5_val, q5_val});  // core1
+                    ddr_write8(base + b*48 + 28 + k, {q5_val, q5_val});
+                // Bytes 44-47: padding (unused)
             end
         end
     endtask
 
-    // Fill 4 row scales at weight_base + 2464
-    // Scale = 0x0100 (UQ8.8 = 1.0). DDR big-endian pairs (byte-swapped by FSM).
-    // Little-endian DDR: byte0=0x00, byte1=0x01 gives q5_sc_din={0x01,0x00}=0x0100
+    // Fill 4 row_norm values at weight_base + 2688
+    // norm = 0x0100 (UQ8.8 = 1.0). Little-endian: byte0=0x00, byte1=0x01 gives 0x0100
     task fill_q5_scales(input [31:0] weight_base);
         integer s;
         begin
             for (s = 0; s < 4; s = s + 1) begin
-                ddr_write8(weight_base + 2464 + s*2, 8'd0);
-                ddr_write8(weight_base + 2464 + s*2 + 1, 8'd1);
+                ddr_write8(weight_base + 2688 + s*2, 8'd0);
+                ddr_write8(weight_base + 2688 + s*2 + 1, 8'd1);
             end
         end
     endtask
@@ -304,7 +300,7 @@ module tb_hp_fsm_q5_0;
         test_num = test_num + 1;
         $display("\n--- Test %0d: Single Q5_0 all-1s (expect each row=229376) ---", test_num);
         setup_q5_desc(32'h00300000, 32'h00000000,
-                      32'h00310000, 32'h00320000, 32'h00330000, 1792);
+                      32'h00310000, 32'h00320000, 32'h00330000, 1792, 16'd1);
         fill_q5_weight(32'h00310000, 4'd1);
         fill_q5_scales(32'h00310000);
         fill_q5_acts(32'h00320000, 16'd1);
@@ -324,9 +320,9 @@ module tb_hp_fsm_q5_0;
         test_num = test_num + 1;
         $display("\n--- Test %0d: Chain of 2 Q5_0 (all-1s, then all-0s) ---", test_num);
         setup_q5_desc(32'h00300020, 32'h00300040,   // desc 0 -> desc 1
-                      32'h00310000, 32'h00320000, 32'h00330040, 1792);
+                      32'h00310000, 32'h00320000, 32'h00330040, 1792, 16'd1);
         setup_q5_desc(32'h00300040, 32'h00000000,   // desc 1 -> end
-                      32'h00313000, 32'h00322000, 32'h00330080, 1792);
+                      32'h00313000, 32'h00322000, 32'h00330080, 1792, 16'd1);
         fill_q5_weight(32'h00310000, 4'd1);   // Desc 0: weights=1 -> expect 229376
         fill_q5_scales(32'h00310000);
         fill_q5_weight(32'h00313000, 4'd0);   // Desc 1: weights=0 -> expect 0
@@ -356,7 +352,7 @@ module tb_hp_fsm_q5_0;
                        32'h00340000, 32'h00340040, 64);
         // Q5_0: weights=1, acts=1 -> 896
         setup_q5_desc(32'h00300080, 32'h00000000,
-                      32'h00314000, 32'h00323000, 32'h003300C0, 1792);
+                      32'h00314000, 32'h00323000, 32'h003300C0, 1792, 16'd1);
         // CPU_OP pattern: incrementing 64 bytes (0x00..0x3F)
         for (j = 0; j < 16; j = j + 1)
             ddr_write32(32'h00340000 + j*4,
@@ -398,11 +394,11 @@ module tb_hp_fsm_q5_0;
         test_num = test_num + 1;
         $display("\n--- Test %0d: Chain of 3 (Q5_0 -> CPU_OP -> Q5_0) ---", test_num);
         setup_q5_desc(32'h003000A0, 32'h003000C0,   // desc 0 -> desc 1
-                      32'h00315000, 32'h00324000, 32'h00330100, 1792);
+                      32'h00315000, 32'h00324000, 32'h00330100, 1792, 16'd1);
         setup_cpu_desc(32'h003000C0, 32'h003000E0,   // desc 1 -> desc 2
                        32'h00340100, 32'h00340140, 64);
         setup_q5_desc(32'h003000E0, 32'h00000000,   // desc 2 -> end
-                      32'h00317000, 32'h00325000, 32'h00330180, 1792);
+                      32'h00317000, 32'h00325000, 32'h00330180, 1792, 16'd1);
         // Desc 0: Q5_0 weights=1, acts=1 -> 896
         fill_q5_weight(32'h00315000, 4'd1);
         fill_q5_scales(32'h00315000);
@@ -446,7 +442,7 @@ module tb_hp_fsm_q5_0;
         test_num = test_num + 1;
         $display("\n--- Test %0d: Zero activations (expect all rows=0) ---", test_num);
         setup_q5_desc(32'h003000A0, 32'h00000000,
-                      32'h00318000, 32'h00326000, 32'h00330200, 1792);
+                      32'h00318000, 32'h00326000, 32'h00330200, 1792, 16'd1);
         fill_q5_weight(32'h00318000, 4'd1);
         fill_q5_scales(32'h00318000);
         fill_q5_acts(32'h00326000, 16'd0);    // act = 0
@@ -465,7 +461,7 @@ module tb_hp_fsm_q5_0;
         $display("\n--- Test %0d: Back-to-back restart (two chains) ---", test_num);
         // Chain A
         setup_q5_desc(32'h003000C0, 32'h00000000,
-                      32'h00319000, 32'h00327000, 32'h00330280, 1792);
+                      32'h00319000, 32'h00327000, 32'h00330280, 1792, 16'd1);
         fill_q5_weight(32'h00319000, 4'd1);
         fill_q5_scales(32'h00319000);
         fill_q5_acts(32'h00327000, 16'd1);
@@ -476,7 +472,7 @@ module tb_hp_fsm_q5_0;
         verify_q5_result(32'h00330280, 229376, test_num);
         // Chain B — different descriptor, same pattern
         setup_q5_desc(32'h003000E0, 32'h00000000,
-                      32'h00319000, 32'h00327000, 32'h00330300, 1792);
+                      32'h00319000, 32'h00327000, 32'h00330300, 1792, 16'd1);
         zero_res(32'h00330300);
         start_chain(32'h003000E0);
         wait_done(1);
@@ -492,16 +488,16 @@ module tb_hp_fsm_q5_0;
         $display("\n--- Test %0d: Chain of 4 Q5_0 ---", test_num);
         // Desc 0 → 1
         setup_q5_desc(32'h00300100, 32'h00300120,
-                      32'h0031A000, 32'h00328000, 32'h00330380, 1792);
+                      32'h0031A000, 32'h00328000, 32'h00330380, 1792, 16'd1);
         // Desc 1 → 2
         setup_q5_desc(32'h00300120, 32'h00300140,
-                      32'h0031B000, 32'h00329000, 32'h00330400, 1792);
+                      32'h0031B000, 32'h00329000, 32'h00330400, 1792, 16'd1);
         // Desc 2 → 3
         setup_q5_desc(32'h00300140, 32'h00300160,
-                      32'h0031C000, 32'h0032A000, 32'h00330480, 1792);
+                      32'h0031C000, 32'h0032A000, 32'h00330480, 1792, 16'd1);
         // Desc 3 → end
         setup_q5_desc(32'h00300160, 32'h00000000,
-                      32'h0031D000, 32'h0032B000, 32'h00330500, 1792);
+                      32'h0031D000, 32'h0032B000, 32'h00330500, 1792, 16'd1);
         fill_q5_weight(32'h0031A000, 4'd1);  // desc 0: weight=1 → 229376
         fill_q5_scales(32'h0031A000);
         fill_q5_weight(32'h0031B000, 4'd2);  // desc 1: weight=2 → ?
@@ -540,7 +536,7 @@ module tb_hp_fsm_q5_0;
         test_num = test_num + 1;
         $display("\n--- Test %0d: Negative activations (expect all rows=-229376) ---", test_num);
         setup_q5_desc(32'h00300180, 32'h00000000,
-                      32'h0031E000, 32'h0032C000, 32'h00330600, 1792);
+                      32'h0031E000, 32'h0032C000, 32'h00330600, 1792, 16'd1);
         fill_q5_weight(32'h0031E000, 4'd1);
         fill_q5_scales(32'h0031E000);
         fill_q5_acts(32'h0032C000, 16'hFFFF);   // act = -1
@@ -561,15 +557,15 @@ module tb_hp_fsm_q5_0;
         test_num = test_num + 1;
         $display("\n--- Test %0d: 5-desc mixed chain ---", test_num);
         setup_q5_desc(32'h003001A0, 32'h003001C0,   // desc 0 → 1
-                      32'h0031F000, 32'h0032D000, 32'h00330700, 1792);
+                      32'h0031F000, 32'h0032D000, 32'h00330700, 1792, 16'd1);
         setup_cpu_desc(32'h003001C0, 32'h003001E0,   // desc 1 → 2
                        32'h00340000, 32'h00340080, 128);
         setup_q5_desc(32'h003001E0, 32'h00300200,   // desc 2 → 3
-                      32'h00320000, 32'h0032E000, 32'h00330780, 1792);
+                      32'h00320000, 32'h0032E000, 32'h00330780, 1792, 16'd1);
         setup_cpu_desc(32'h00300200, 32'h00300220,   // desc 3 → 4
                        32'h00340100, 32'h00340180, 128);
         setup_q5_desc(32'h00300220, 32'h00000000,   // desc 4 → end
-                      32'h00321000, 32'h0032F000, 32'h00330800, 1792);
+                      32'h00321000, 32'h0032F000, 32'h00330800, 1792, 16'd1);
         // Desc 0: weights=1
         fill_q5_weight(32'h0031F000, 4'd1);
         fill_q5_scales(32'h0031F000);
@@ -630,6 +626,32 @@ module tb_hp_fsm_q5_0;
         end
         $display("  Verifying Q5_0 desc 4 (weights=1, expect 229376):");
         verify_q5_result(32'h00330800, 229376, test_num);
+
+        // =================================================================
+        // Test 10: Multi-tile Q5_0 descriptor (4 tiles, all-1s)
+        //   16 rows × 896 cols, all weights=1, acts=1 → each row = 229376
+        // =================================================================
+        test_num = test_num + 1;
+        $display("\n--- Test %0d: Multi-tile Q5_0 (4 tiles, expect 16×229376) ---", test_num);
+        setup_q5_desc(32'h00300240, 32'h00000000,
+                      32'h00322000, 32'h00325000, 32'h00330880, 1792, 16'd4);
+        // Fill 4 tiles of weight data at 2696-byte stride
+        for (j = 0; j < 4; j = j + 1) begin
+            fill_q5_weight(32'h00322000 + j * 2696, 4'd1);
+            fill_q5_scales(32'h00322000 + j * 2696);
+        end
+        fill_q5_acts(32'h00325000, 16'd1);
+        for (j = 0; j < 4; j = j + 1)
+            zero_res(32'h00330880 + j * 32);
+        start_chain(32'h00300240);
+        wait_done(1);
+        axil_read(16'h14, rd_val); $display("  STATUS=0x%08x", rd_val);
+        axil_read(16'h28, rd_val); $display("  DEBUG=0x%08x", rd_val);
+        axil_read(16'h20, rd_val); $display("  HEAD=%d (expect 1)", rd_val);
+        for (j = 0; j < 4; j = j + 1) begin
+            $display("  Verifying tile %0d (rows %0d-%0d):", j, j*4, j*4+3);
+            verify_q5_result(32'h00330880 + j * 32, 229376, test_num);
+        end
 
         // Summary
         $display("\n==============================================");

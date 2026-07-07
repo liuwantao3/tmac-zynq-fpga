@@ -258,7 +258,8 @@ module matmul_top (
         .res_dout  (q8_res_dout)
     );
 
-    // Q8 writes gated by mode_q8; Phase 3 will add HP read packing.
+    // Q8 writes gated by mode_q8 (legacy byte-loading path;
+    // hp_fsm_top.v uses direct 64-bit word writes).
     always @(posedge clk) begin
         if (wt_we && mode_q8) begin
             q8_wt_we   <= 1;
@@ -298,29 +299,12 @@ module matmul_top (
     );
 
     // ======================================================================
-    // Q5_0 core  (8×896 tile, 224 × 22-byte blocks)
+    // Q5_0 — handled by hp_fsm_top.v exclusively (new per-block interface)
+    //        Stub: report done=busy=0, res_dout=0
     // ======================================================================
-    wire        q5_0_done, q5_0_busy;
-    wire [47:0] q5_0_res_dout;
-
-    matmul_q5_0_core u_core_q5_0 (
-        .clk       (clk),
-        .rst_n     (rst_n),
-        .start     (core_start & mode_q5_0),
-        .done      (q5_0_done),
-        .busy      (q5_0_busy),
-        .wt_we     (wt_we),
-        .wt_addr   (wt_addr),
-        .wt_din    (wt_din),
-        .sc_we     (sc_we),
-        .sc_addr   (sc_addr[2:0]),
-        .sc_din    (sc_din),
-        .act_we    (act_we),
-        .act_addr  (act_addr),
-        .act_din   (act_din),
-        .res_addr  (res_addr[2:0]),
-        .res_dout  (q5_0_res_dout)
-    );
+    wire        q5_0_done = 1'b0;
+    wire        q5_0_busy = 1'b0;
+    wire [47:0] q5_0_res_dout = 48'd0;
 
     // ======================================================================
     // Q6_K core (32×256 tile, 32 × 210-byte blocks, auto-increment write_ptr)
@@ -555,10 +539,9 @@ module matmul_top (
     wire        hp_read_done;
     reg  [31:0] hp_read_addr;
     reg  [7:0]  hp_read_len;
-    wire [7:0]  hp_read_data;
+    wire [63:0] hp_read_data;
     wire        hp_read_valid;
     reg         hp_read_ready;
-    reg [2:0]   beat_byte_cnt;  // bytes stored in current beat (0-4)
     reg         hp_read_start_raw;
 
     axihp_read_master u_hp_read (
@@ -705,7 +688,7 @@ module matmul_top (
 
     // Misc
     reg        core_start_pulse;
-    reg        hp_read_done_ff;
+
 
     // Tile config per type
     reg [13:0] tile_block_bytes;  // bytes of block data (excluding scales)
@@ -772,7 +755,6 @@ module matmul_top (
             burst_bytes_rem   <= 0;
             desc_byte_idx     <= 0;
             hp_read_ready     <= 0;
-            beat_byte_cnt     <= 0;
             hp_write_start    <= 0;
             hp_write_valid    <= 0;
             fsm_we_ctrl_user  <= 0;
@@ -829,29 +811,26 @@ module matmul_top (
                 end
 
                 // ==========================================================
-                // PH_FETCH_WAIT: drain descriptor bytes from HP read master
+                // PH_FETCH_WAIT: drain 32-byte descriptor from HP read master
                 //
-                // beat_byte_cnt tracks bytes stored per AXI beat (max 4).
-                // The first hp_read_valid cycle has hp_read_ready=0 (NBA
-                // delay), so we skip it.  Subsequent cycles with both valid
-                // and ready asserted store exactly 4 bytes per beat.
+                // Read master outputs 64-bit words (2 AXI beats combined).
+                // Descriptor = 4 words × 8 bytes = 32 bytes.  Capture all 8
+                // bytes per handshake using delayed handshake to avoid 0-cycle
+                // rvalid pulse from read master's PRESENT state.
                 // ==========================================================
                 PH_FETCH_WAIT: begin
-                    if (hp_read_valid) begin
-                        hp_read_ready <= 1;
-                        // hp_read_ready is from previous cycle's NBA; skip
-                        // the first valid cycle to let data_ready handshake.
-                        if (hp_read_ready && beat_byte_cnt < 4 && desc_byte_idx < 32) begin
-                            $display("[TB] FETCH @%0t idx=%0d data=0x%02x buf_idx=%0d rdata=0x%08x",
-                                $time, desc_byte_idx, hp_read_data,
-                                u_hp_read.buf_idx, u_hp_read.rdata_buf[31:0]);
-                            desc_buf[desc_byte_idx] <= hp_read_data;
-                            desc_byte_idx <= desc_byte_idx + 1;
-                            beat_byte_cnt <= beat_byte_cnt + 1;
-                        end
-                    end else begin
-                        hp_read_ready <= 0;
-                        beat_byte_cnt <= 0;
+                    hp_read_ready <= hp_read_valid;
+                    if (hp_read_valid && hp_read_ready) begin
+                        desc_buf[desc_byte_idx]     <= hp_read_data[7:0];
+                        desc_buf[desc_byte_idx + 1] <= hp_read_data[15:8];
+                        desc_buf[desc_byte_idx + 2] <= hp_read_data[23:16];
+                        desc_buf[desc_byte_idx + 3] <= hp_read_data[31:24];
+                        desc_buf[desc_byte_idx + 4] <= hp_read_data[39:32];
+                        desc_buf[desc_byte_idx + 5] <= hp_read_data[47:40];
+                        desc_buf[desc_byte_idx + 6] <= hp_read_data[55:48];
+                        desc_buf[desc_byte_idx + 7] <= hp_read_data[63:56];
+                        desc_byte_idx <= desc_byte_idx + 8;
+                        $display("[TB] FETCH @%0t word=%0d data=0x%016h", $time, desc_byte_idx >> 3, hp_read_data);
                     end
                     if (hp_read_done) begin
                         // Descriptor fully read — parse fields

@@ -1,5 +1,10 @@
 # Q4_K FPGA Accelerator — Implementation Plan
 
+> **STATUS: IMPLEMENTED (2026-07-05).** The actual implementation is in
+> `verilog/matmul_q4k_core.v` with a 56×256 tile and block-streaming decode.
+> This document represents the planning phase and differs from the final
+> implementation in several key areas (tile size, memory architecture, etc.).
+
 ## 1. Overview
 
 ### Current State

@@ -1,11 +1,12 @@
 // System integration test — exercises INT16 and Q4_K FPGA simulation paths
 // 
 // Architecture:
-//   - INT16: general matmul (attention QKV, etc.) — CPU dequants weights to INT16
-//   - Q4_K:  FFN layers (gate/up/down) — raw Q4_K blocks through AXI-Lite buffers
-//   - Q8_0:  logits only (token embeddings) — tested via matmul_q8.cpp + tmac_gguf --fpga-q8
+//   - INT16: general matmul fallback — CPU dequants weights to INT16
+//   - Q4_K:  ffn_down (odd layers) — raw Q4_K blocks through AXI-Lite buffers
+//   - Q5_0, Q6_K: tested via dedicated testbenches (tb_matmul_q5_0, tb_matmul_q6_k, tb_hp_fsm_q5_0)
+//   - Q8_0:  token_embd, attn_v, logits — tested via matmul_q8.cpp + tmac_gguf --fpga-q8
 //
-// Phase 2: Q4_K block decode is on FPGA. Tests verify raw block path matches CPU.
+// Q4_K block decode is on FPGA. Tests verify raw block path matches CPU.
 //
 // Compile: g++ -std=c++14 -O2 -I. -o test_integration test_integration.cpp -lpthread
 // Run:     ./test_integration
@@ -215,7 +216,7 @@ int main() {
     int total_tests = 0;
 
     printf("========================================\n");
-    printf("FPGA Integration Test Suite (Phase 2)\n");
+    printf("FPGA Integration Test Suite\n");
     printf("========================================\n\n");
 
     // Test 1: AXI-Lite address mapping
@@ -230,7 +231,7 @@ int main() {
     total_tests++;
     printf("\n");
 
-    // Test 3: Q4_K raw block path (Phase 2)
+    // Test 3: Q4_K raw block path
     printf("Test 3: Q4_K raw block AXI-Lite path vs reference\n");
     total_errors += test_q4k_blocks();
     total_tests++;

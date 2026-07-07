@@ -1,3 +1,10 @@
+// =======================================================================
+// Q8_0 dequant-matmul core: 64×896 per tile, 6-stage pipeline, 8 DSPs.
+// Memory: 8× BRAM18 wmem (512×8), 8× LUTRAM smem (16×16), LUTRAM act,
+//         8× distributed RAM/FFs acc banks (512×48 effective).
+// Pipeline: PRE → S0 → S1a (dequant) → S1b (act mul) → S2a (acc read)
+//           → S2b (accumulate). ~515 cycles/tile + CLEAR_ACC (512).
+// =======================================================================
 `timescale 1ns / 1ps
 
 module matmul_q8_core (
@@ -69,20 +76,20 @@ module matmul_q8_core (
     end
 
     // ======================================================================
-    // Scale storage: 8 BRAM banks (one per column lane)
-    //   Each bank = 512 x 16-bit (padded, 16 entries used)
+    // Scale storage: 8 LUTRAM banks (one per column lane)
+    //   Each bank = 16 x 16-bit (exact fit, no padding)
     //   bank wi_i holds scales for column lane wi_i.
     //   Read address (shared across all banks): {g, k[5]} (4 bits, 0..15)
     //   Write: bank = sc_addr[3:1], local_addr = {sc_addr[6:4], sc_addr[0]}
     // ======================================================================
-    (* ram_style = "block" *) reg [15:0] smem_bank0 [0:511];
-    (* ram_style = "block" *) reg [15:0] smem_bank1 [0:511];
-    (* ram_style = "block" *) reg [15:0] smem_bank2 [0:511];
-    (* ram_style = "block" *) reg [15:0] smem_bank3 [0:511];
-    (* ram_style = "block" *) reg [15:0] smem_bank4 [0:511];
-    (* ram_style = "block" *) reg [15:0] smem_bank5 [0:511];
-    (* ram_style = "block" *) reg [15:0] smem_bank6 [0:511];
-    (* ram_style = "block" *) reg [15:0] smem_bank7 [0:511];
+    (* ram_style = "distributed" *) reg [15:0] smem_bank0 [0:15];
+    (* ram_style = "distributed" *) reg [15:0] smem_bank1 [0:15];
+    (* ram_style = "distributed" *) reg [15:0] smem_bank2 [0:15];
+    (* ram_style = "distributed" *) reg [15:0] smem_bank3 [0:15];
+    (* ram_style = "distributed" *) reg [15:0] smem_bank4 [0:15];
+    (* ram_style = "distributed" *) reg [15:0] smem_bank5 [0:15];
+    (* ram_style = "distributed" *) reg [15:0] smem_bank6 [0:15];
+    (* ram_style = "distributed" *) reg [15:0] smem_bank7 [0:15];
 
     // Write address decode
     wire [2:0] smem_wbank = sc_addr[3:1];
@@ -104,9 +111,9 @@ module matmul_q8_core (
     end
 
     // ======================================================================
-    // Activation BRAM: 512 x 16-bit (64 entries used)
+    // Activation storage: 64 x 16-bit LUTRAM (exact fit)
     // ======================================================================
-    (* ram_style = "block" *) reg signed [15:0] act_bram [0:511];
+    (* ram_style = "distributed" *) reg signed [15:0] act_bram [0:63];
 
     always @(posedge clk) begin
         if (act_we)
@@ -114,16 +121,19 @@ module matmul_q8_core (
     end
 
     // ======================================================================
-    // Accumulator banks: 8 banks x 48-bit BRAM (padded to 512 depth)
+    // Accumulator banks: 8 banks x 48-bit
+    //   Only 8 entries/bank used (addressed by 3-bit g value).
+    //   ram_style=distributed — Vivado ignores block hint for 48-bit width
+    //   exceeding BRAM18 capacity, synthesizes as distributed RAM/FFs.
     // ======================================================================
-    (* ram_style = "block" *) reg signed [47:0] acc_b0 [0:511];
-    (* ram_style = "block" *) reg signed [47:0] acc_b1 [0:511];
-    (* ram_style = "block" *) reg signed [47:0] acc_b2 [0:511];
-    (* ram_style = "block" *) reg signed [47:0] acc_b3 [0:511];
-    (* ram_style = "block" *) reg signed [47:0] acc_b4 [0:511];
-    (* ram_style = "block" *) reg signed [47:0] acc_b5 [0:511];
-    (* ram_style = "block" *) reg signed [47:0] acc_b6 [0:511];
-    (* ram_style = "block" *) reg signed [47:0] acc_b7 [0:511];
+    (* ram_style = "distributed" *) reg signed [47:0] acc_b0 [0:511];
+    (* ram_style = "distributed" *) reg signed [47:0] acc_b1 [0:511];
+    (* ram_style = "distributed" *) reg signed [47:0] acc_b2 [0:511];
+    (* ram_style = "distributed" *) reg signed [47:0] acc_b3 [0:511];
+    (* ram_style = "distributed" *) reg signed [47:0] acc_b4 [0:511];
+    (* ram_style = "distributed" *) reg signed [47:0] acc_b5 [0:511];
+    (* ram_style = "distributed" *) reg signed [47:0] acc_b6 [0:511];
+    (* ram_style = "distributed" *) reg signed [47:0] acc_b7 [0:511];
 
     // BRAM read outputs
     reg signed [47:0] acc_r [0:7];
@@ -160,7 +170,7 @@ module matmul_q8_core (
     assign res_dout = res_dout_r;
 
     // ======================================================================
-    // BRAM read data (registered outputs from wmem and smem banks, act_bram)
+    // BRAM/LUTRAM read data (registered outputs from wmem, smem, act)
     // ======================================================================
     reg [7:0]  wmem_rdata [0:7];
     reg [15:0] smem_rdata [0:7];
@@ -181,8 +191,8 @@ module matmul_q8_core (
     //   Stage 0: capture BRAM outputs (wmem_rdata, smem_rdata, act_rdata)
     //   Stage 1a: dequant (wmem_rdata * sc >> 8)
     //   Stage 1b: multiply with activation (dq_act * dq_deq)
-    //   Stage 2a: BRAM acc read (1-cycle latency)
-    //   Stage 2b: accumulate into acc BRAM
+    //   Stage 2a: acc bank read (1-cycle latency)
+    //   Stage 2b: accumulate into acc banks
     // ======================================================================
     reg [2:0]  p1_g;
     reg [5:0]  p1_k;
@@ -210,15 +220,19 @@ module matmul_q8_core (
             wmem_bank2[_init_i] = 0; wmem_bank3[_init_i] = 0;
             wmem_bank4[_init_i] = 0; wmem_bank5[_init_i] = 0;
             wmem_bank6[_init_i] = 0; wmem_bank7[_init_i] = 0;
-            smem_bank0[_init_i] = 0; smem_bank1[_init_i] = 0;
-            smem_bank2[_init_i] = 0; smem_bank3[_init_i] = 0;
-            smem_bank4[_init_i] = 0; smem_bank5[_init_i] = 0;
-            smem_bank6[_init_i] = 0; smem_bank7[_init_i] = 0;
-            act_bram[_init_i] = 0;
             acc_b0[_init_i] = 0; acc_b1[_init_i] = 0;
             acc_b2[_init_i] = 0; acc_b3[_init_i] = 0;
             acc_b4[_init_i] = 0; acc_b5[_init_i] = 0;
             acc_b6[_init_i] = 0; acc_b7[_init_i] = 0;
+        end
+        for (_init_i = 0; _init_i < 16; _init_i = _init_i + 1) begin
+            smem_bank0[_init_i] = 0; smem_bank1[_init_i] = 0;
+            smem_bank2[_init_i] = 0; smem_bank3[_init_i] = 0;
+            smem_bank4[_init_i] = 0; smem_bank5[_init_i] = 0;
+            smem_bank6[_init_i] = 0; smem_bank7[_init_i] = 0;
+        end
+        for (_init_i = 0; _init_i < 64; _init_i = _init_i + 1) begin
+            act_bram[_init_i] = 0;
         end
     end
 `endif
@@ -295,7 +309,7 @@ module matmul_q8_core (
                 end
 
                 COMPUTE: begin
-                    // === Stage 2b: accumulate into BRAM (read-modify-write) ===
+                    // === Stage 2b: accumulate into acc banks (read-modify-write) ===
                     if (p2_valid) begin
                         acc_b0[p2_row_base[5:3]] <= acc_b0[p2_row_base[5:3]] + p2_partial[0];
                         acc_b1[p2_row_base[5:3]] <= acc_b1[p2_row_base[5:3]] + p2_partial[1];
@@ -307,7 +321,7 @@ module matmul_q8_core (
                         acc_b7[p2_row_base[5:3]] <= acc_b7[p2_row_base[5:3]] + p2_partial[7];
                     end
 
-                    // === Stage 2a: pre-read acc BRAM ===
+                    // === Stage 2a: pre-read acc banks ===
                     if (dq_valid) begin
                         pre_read_g <= dq_row_base[5:3];
                         p2a_valid <= 1;

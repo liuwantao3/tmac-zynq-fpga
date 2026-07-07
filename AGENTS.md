@@ -19,9 +19,9 @@ Qwen2-0.5B FPGA accelerator targeting Zynq 7010. Multi-core Verilog RTL: INT16×
 
 2. **Break statements removed from cosim testbenches** — `tb_cosim.v`, `tb_cosim_q4k.v`, `tb_cosim_q5_0.v`, `tb_cosim_q6_k.v` used unsupported `break` in Verilog for-loop wait loops. Replaced with `poll_count` flag loop condition.
 
-3. **Q8 core: 64-bit word write, BRAM acc banks, dequant sat removed** — Q8 core rewritten:
+3. **Q8 core: 64-bit word write, LUTRAM smem/act, dist-RAM acc banks** — Q8 core rewritten:
    - Write port: `wt_addr[8:0]`/`wt_din[63:0]` replaces byte-lane BWE case (BRAM-friendly)
-   - Accumulator: 8× BRAM18 banks (acc_b0..acc_b7), each 512×48, banked by address[2:0]=g
+   - Accumulator: 8× distributed RAM/FFs banks (acc_b0..acc_b7), each 512×48 effective (48-bit width exceeds BRAM18 capacity), banked by address[2:0]=g
    - Dequant saturation removed: max product 127×65535=8,322,945 < 8,388,607, never saturates
    - Pipeline: 6-stage (PRE→S0→S1a→S1b→S2a→S2b), CLEAR_ACC state for bulk BRAM clear
    - Result: saves ~884 LUTs (384 LUTRAMs + 500 logic) vs old reg [47:0] acc[0:63]
@@ -34,7 +34,9 @@ Qwen2-0.5B FPGA accelerator targeting Zynq 7010. Multi-core Verilog RTL: INT16×
 
 7. **Track A BRAM conversion complete (2026-07-05):** All LUTRAM arrays converted to BRAM — 7,769 LUTs (44.1%), 17 BRAM18 (14.2%), 16 DSP (20%). WNS=0.601ns. All 9 HW tests PASS.
 
-8. **Q5_0 block-streaming redesign (2026-07-06):** Replaced 4-cycle/element pipeline (7170 cycles) with block-at-a-time architecture (1849 cycles, 3.9× speedup). Precomputes d_pre = f16_decode(d) × scale >> 8 once per block, then 1 MAC/cycle per element. Scale indexing bug fixed (core1 used scale[0:1] instead of scale[2:3]). All 8 unit tests + 4 HP FSM dispatch tests PASS (pre-redesign testbench; core unit tests need port-renamed rebuild for new `qs_word`/`blk_num` interface).
+8. **Q5_0 block-streaming redesign (2026-07-06):** Replaced 4-cycle/element pipeline (7170 cycles) with block-at-a-time architecture (1904 core cycles + DDR overhead ≈2856 system cycles/tile). Precomputes d_pre = f16_decode(d) × scale >> 8 once per block, then 1 MAC/cycle per element. Scale indexing bug fixed (core1 used scale[0:1] instead of scale[2:3]). All 8 unit tests + 4 HP FSM dispatch tests PASS (pre-redesign testbench; core unit tests need port-renamed rebuild for new `qs_word`/`blk_num` interface).
+
+9. **Q5_0 clean-slate rewrite — per-block wide register interface (2026-07-07):** Completely rewrote both `matmul_q5_0_core.v` and `hp_fsm_top.v` to eliminate byte-at-a-time header loading, `hdr_packed` LUTRAM, and `qs_word`/`blk_num`/`core_id`/`start` ports. The core now receives per-block `blk_d[15:0]`, `blk_qh[31:0]`, `blk_qs[127:0]` via a single `blk_valid` pulse — all fed from a 48-byte DDR burst (12 AXI beats) per block. No LUTRAM for header storage (at most one block's d/qh/qs in the core at a time). Fixed pre-existing `act_r` pipeline bug (off-by-one masked by all-1s test activations). `row_scale` renamed to `row_norm`. FSM states Q5_PRELOAD_HDR/Q5_PRELOAD_HDR_W removed, replaced by Q5_LOAD_NORM/Q5_LOAD_NORM_W (8-byte DDR read for 4 × UQ8.8 norm values). Core results read via hierarchical reference (`u_q5_core0.res0/res1`). DDR layout per block: 48 bytes (core0_d+qh+qs + core1_d+qh+qs + padding). Total: 56 × 48 = 2688 bytes block data + 8 bytes norm = 2696 bytes/tile. All 9 HP FSM dispatch tests PASS.
 
 ## Architecture Summary
 
@@ -44,11 +46,13 @@ IDLE → FETCH_DESC → LOAD_WEIGHT → LOAD_SCALES → LOAD_ACT → COPY_ACT_TO
 ```
 For multi-group (q8_num_groups > 1, from descriptor): COMPUTE → READ_RES_ACC loops back to LOAD_SCALES for each group (accumulating into acc_buf), then COPY_ACC_TO_BUF → WRITE_RES.
 
+(Each LOAD_*/FETCH_DESC state has a corresponding _W wait state for AXI burst completion. Full FSM: 27 states — see REG_DEBUG table for complete list.)
+
 ### CPU-OP Descriptor Protocol (CPU/FPGA synchronization):
 
 To handle CPU-only operations (RMSNorm, RoPE, SoftMax, bias add, SwiGLU, residual add) between FPGA matmuls, the descriptor chain supports a special `CPU_OP` descriptor type (`tensor_type = 15`).
 
-When the FSM encounters a CPU_OP descriptor:
+The interrupt-based CPU_OP protocol is implemented in `matmul_top.v` (the PhaseB chain FSM). When `matmul_top.v` encounters a CPU_OP descriptor:
 1. It sets `reg_chain_ctrl[2]=1` and pulses `desc_irq` → CPU interrupt fires
 2. FSM enters `PH_CPU_OP_WAIT` state and **pauses** until CPU resumes it
 3. CPU reads `reg_status` (status=3 = chain busy) to distinguish from chain-complete
@@ -56,6 +60,12 @@ When the FSM encounters a CPU_OP descriptor:
 5. CPU does its work (norm, softmax, etc.) and writes results to DDR
 6. CPU clears `reg_isr[0]` (write REG_ISR) and writes `CHAIN_CTRL[0]=1` to resume
 7. FSM clears the resume signal, advances to next descriptor
+
+**Note:** `hp_fsm_top.v` (the current active FSM) handles CPU_OP differently — it simply passes activations through to DDR as a passthrough read/write, without any interrupt or wait state (see `hp_fsm_top.v:492-494`). Path:
+```
+FETCH_DESC → LOAD_ACT → LOAD_ACT_W → WRITE_RES → WRITE_RES_BURST → WRITE_RES_W → DONE
+```
+The interrupt-based protocol described above exists in `matmul_top.v` for future PhaseB integration.
 
 The CPU knows what operation to perform from the descriptor's position in the chain (the CPU built the chain, so it has an internal mapping: "descriptor 0 → attn_norm, descriptor 4 → bias+rope+softmax").
 
@@ -98,6 +108,21 @@ Post-logits (softmax for sampling) is handled outside the descriptor chain.
 ### Descriptor Chain (OP→OP, no CPU):
 Descriptors in DDR form a linked list. Each descriptor contains weight/act/result addresses, tensor type, and `act_total_bytes`. When descriptor N's `result_addr` equals descriptor N+1's `act_addr`, the chain auto-derives `act_total_bytes = prev.tile_res_rows × 8` (all cores output 48-bit fixed-point, 8 bytes/row). Header validation in `tb_phaseb.v` checks this invariant.
 
+### Multi-Tile Iteration (within a descriptor):
+Both Q5_0 and Q8_0 support processing multiple tiles per descriptor via the
+`num_tiles` field at descriptor bytes [22:23]. The FSM iterates tiles internally:
+
+- **Q5_0:** After WRITE_RES_W, if `q5_tile_counter + 1 < q5_num_tiles`, loops to
+  `Q5_LOAD_NORM` to load the next tile's block norms. Result advances by 32 bytes
+  (4 rows × 8 bytes). Activation is NOT re-read (same act for all tiles).
+- **Q8_0:** After WRITE_RES_W, if `q8_tile_counter + 1 < q8_num_tiles`, loops to
+  `LOAD_WEIGHT`. Weight address advances by `q8_tile_stride = 4096 + num_groups×256`.
+  Result advances by 512 bytes (64 rows × 8 bytes). Activation is reloaded per tile.
+
+A single Q5_0 descriptor with `num_tiles=224` processes the entire 896×896 `attn_q`
+weight matrix. Without multi-tile, this would require 224 descriptors with 224
+redundant DDR act reads.
+
 ### Dispatch Logic (tmac_gguf.cpp:452-465):
 ```
 if (g_fpga_q5_0 && A->type == TENSOR_Q5_0) → matmul_fpga_q5_0()  (attn_q/k/o, ffn_gate/up)
@@ -111,8 +136,8 @@ else → matmul_fpga_int16()   (F32 norms, fallback)
 
 | Type | Tile | Blocks | Bytes/tile | weight_buf | Result Bytes/row |
 |------|------|--------|------------|------------|-----------------|
-| Q8_0 | 64×896 | — | 4100 | 4096 | 8 |
-| Q5_0 | 4×896 | 112 | 4928 | 8192 | 8 |
+| Q8_0 | 64×896 | — | 7680 (per desc) | 4096 (per group) | 8 |
+| Q5_0 | 4×896 | 56 | 2696 (2688 blocks + 8 norm) | N/A (per-block streaming) | 8 |
 | Q6_K | 32×256 | 32 | 6720 | 8192 | 8 |
 | Q4_K | 56×256 | 56 | 8064 | 8192 | 8 |
 | INT16 | 64×64 | — | 8192 | 8192 | 8 |
@@ -136,7 +161,7 @@ All cores output S24.8 fixed-point (48-bit accumulator, zero-extended to 64-bit 
 | 0x3C | `REG_Q8_DEBUG` | R | Q8 core debug word (see below) |
 | 0x10 | `REG_Q8_NUM_GROUPS` | R/W | [3:0]: number of column groups (fallback, used when descriptor value = 0) |
 
-**REG_DEBUG (0x28) bitfields** (from `hp_fsm_top.v:1255-1266`):
+**REG_DEBUG (0x28) bitfields** (from `hp_fsm_top.v:1082-1093`):
 | Bits | Field | Description |
 |------|-------|-------------|
 | [31:27] | `state` | FSM state (5-bit, see below) |
@@ -152,7 +177,7 @@ All cores output S24.8 fixed-point (48-bit accumulator, zero-extended to 64-bit 
 | [10:8] | `timeout_msb` | `timeout_cnt[15:13]` — top 3 bits of shared timeout |
 | [7:0] | `sc_byte_idx` | Scale byte counter — useful for tracking scale loading progress |
 
-**REG_Q8_DEBUG (0x3C) bitfields** (from `hp_fsm_top.v:1268-1277`):
+**REG_Q8_DEBUG (0x3C) bitfields** (from `hp_fsm_top.v:1095-1104`):
 | Bits | Field | Description |
 |------|-------|-------------|
 | [31:27] | `state` | FSM state (same as REG_DEBUG[31:27]) |
@@ -171,15 +196,19 @@ All cores output S24.8 fixed-point (48-bit accumulator, zero-extended to 64-bit 
 | Offset | Bits | Field | Description |
 |--------|------|-------|-------------|
 | 0 | [31:0] | `next_addr` | DDR address of next descriptor (0 = end of chain) |
-| 4 | [31:0] | `weight_addr` | DDR address of Q8 weight data (4096 bytes + scales) |
-| 8 | [31:0] | `act_addr` | DDR address of activation data (16-bit ints, tile rows × cols × 2) |
+| 4 | [31:0] | `weight_addr` | DDR address of weight data (see per-type DDR layouts) |
+| 8 | [31:0] | `act_addr` | DDR address of activation data (16-bit ints) |
 | 12 | [31:0] | `result_addr` | DDR address for result writeback (8 bytes/row) |
-| 16 | [15:0] | `tensor_type` | 15 = CPU_OP (passthrough), 0 = Q8 compute, others reserved |
+| 16 | [15:0] | `tensor_type` | 15 = CPU_OP (passthrough), 1 = Q5_0, other = Q8 (default). Q6_K/Q4_K dispatch planned. |
 | 16 | [31:16] | (reserved) | Upper 16 bits reserved |
-| 20 | [3:0] | `num_groups` | Q8 column groups (0 = use GP0 register fallback, 1 = single, 2+ = multi) |
-| 20 | [31:4] | (reserved) | Upper 28 bits reserved |
+| 20 | [3:0] | `num_groups` | Q8 column groups (0 = use GP0 register fallback). Ignored by Q5_0. |
+| 21 | [7:0] | (reserved) | Reserved |
+| 22 | [15:0] | `num_tiles` | Tiles per descriptor (0 → 1 for backward compat). Q5: 4-row tiles. Q8: 64-row tiles. |
 | 24 | [23:0] | `act_total_bytes` | Total activation bytes to read from DDR |
 | 28 | [31:0] | (reserved) | Reserved |
+
+**Note:** The HP FSM (`hp_fsm_top.v`) uses the type dispatch above. The PhaseB path
+(`matmul_top.v`) uses a different type numbering: 6=Q5_0, 8=Q8_0, 12=Q4_K, 14=Q6_K, 15=CPU_OP.
 
 **FSM States (REG_DEBUG[31:27] or REG_Q8_DEBUG[31:27]):**
 | Value | Name | Description |
@@ -204,15 +233,13 @@ All cores output S24.8 fixed-point (48-bit accumulator, zero-extended to 64-bit 
 | 17 | `COPY_ACC_TO_BUF` | Copying acc_buf to act_buf for DDR writeback |
 | 18 | `TIMEOUT_ERROR` | Timeout trap (latch state in `timeout_src`, stall forever) |
 | 19 | `WRITE_RES_BURST` | Write result burst setup (computes burst addr/len from wr_remaining) |
-| 20 | `Q5_PRELOAD_HDR` | Starting Q5_0 header DDR read (672 bytes = 56 blocks × 6 banks × 2) |
-| 21 | `Q5_PRELOAD_HDR_W` | Waiting for header read + unpacking per-byte to hdr_packed |
-| 22 | `Q5_LOAD_SCALES` | Starting Q5_0 scale DDR read (16 bytes = 8 × UQ16.8) |
-| 23 | `Q5_LOAD_SCALES_W` | Waiting for scale read + unpacking per-scale to row_scale |
-| 24 | `Q5_COPY_ACT` | Starting Q5_0 activation DDR read (1792 bytes = 896 × INT16) |
-| 25 | `Q5_COPY_ACT_W` | Waiting for act read + unpacking to core act_mem BRAM |
-| 26 | `Q5_BLOCK_COMPUTE` | Starting per-block qs DDR read (32 bytes) + clr_acc on blk=0 |
-| 27 | `Q5_BLOCK_COMPUTE_W` | Assembling qs_word, pulsing start pulse, waiting for done |
-| 28 | `Q5_READ_RES` | Reading 4× rows from Q5_0 cores (2 cores × 2 rows each) |
+| 20 | `Q5_LOAD_NORM` | Starting Q5_0 row_norm DDR read (8 bytes = 4 × UQ8.8) |
+| 21 | `Q5_LOAD_NORM_W` | Waiting for norm read + unpacking to core norm BRAM |
+| 22 | `Q5_COPY_ACT` | Starting Q5_0 activation DDR read (1792 bytes = 896 × INT16) |
+| 23 | `Q5_COPY_ACT_W` | Waiting for act read + unpacking to core act_mem BRAM |
+| 24 | `Q5_BLOCK_COMPUTE` | Starting per-block DDR read (48 bytes = 12 AXI beats) |
+| 25 | `Q5_BLOCK_COMPUTE_W` | Unpacking 6 rd_data words into core blk_d/qh/qs, pulsing blk_valid |
+| 26 | `Q5_READ_RES` | Capturing res0/res1 from both Q5_0 cores via hierarchical ref |
 
 **Key experience: Debug register field usage patterns from hardware bringup:**
 - `REG_Q8_DEBUG[25]` (q8_done) transitions 0→1 when computation completes; this is the most important signal for debug
@@ -227,10 +254,10 @@ All cores output S24.8 fixed-point (48-bit accumulator, zero-extended to 64-bit 
 |------|------|-----------|--------|
 | `matmul_q8_core.v` | 64×896 | ~515 | ✅ Working |
 | `matmul_q4k_core.v` | 56×256 | ~? | ✅ Working |
-| `matmul_q5_0_core.v` | 4×896 | 1849 | ✅ Block-streaming (3.9× speedup over 7170) |
+| `matmul_q5_0_core.v` | 4×896 | 1904 | ✅ Per-block wide register interface, no LUTRAM |
 | `matmul_int16_core.v` | 64×64 | 515 | ✅ Working |
 | `matmul_top.v` | — | — | ✅ 5 cores instantiated (Q8, Q4K, Q5_0, Q6_K, INT16) |
-| `hp_fsm_top.v` | HP FSM + Q8 + Q5_0 | N/A | ✅ Descriptor-chain DMA, Q8 compute 64×896 (14-group), Q5_0 4×896 (2-core) |
+| `hp_fsm_top.v` | HP FSM + Q8 + Q5_0 | N/A | ✅ Descriptor-chain DMA, Q8 compute 64×896 (14-group), Q5_0 4×896 (2-core, per-block wide register interface) |
 
 ### Missing Verilog Cores:
 
@@ -252,7 +279,15 @@ The `q5_start` pulse in `Q5_BLOCK_COMPUTE_W` fires every cycle because the condi
 
 All 4 Q5_0 HP FSM tests now PASS (previously all 4 FAILED with X in acc). No more block 56, no X propagation.
 
-## Current Status (2026-07-06) — Q5_0 Block-Streaming Redesign
+10. **Q8 BRAM waste analysis and smem/act → LUTRAM conversion (2026-07-07):** Analyzed `matmul_q8_core.v` BRAM utilization and found 9 BRAM18 held arrays using < 5% of their declared capacity:
+    - **smem_bank0..7** (8 BRAM18): 8 banks × 512×16 declared, only 16 entries/bank used (3.1%) — address decode `{g, k[5]}` = 4 bits → 16. Changed to `ram_style = "distributed"` depth 16.
+    - **act_bram** (1 BRAM18): 512×16 declared, only 64 entries used (12.5%). Changed to `ram_style = "distributed"` depth 64.
+    - **wmem** (8 BRAM18): 512×8, 100% utilized. Left as BRAM.
+    - **acc** (0 BRAM18): Already FFs/distributed RAM (8 entries/bank × 48-bit × 8 banks = 3Kb).
+    
+    **Result:** Q8 core BRAM drops from 17→8 (wmem only). Total system BRAM ~10 (Q8 8 + Q5_0 2). LUTRAM increases ~128 (smem) + 16 (act) = +144 LUTRAM (3.3% of 4,400 capacity, well within budget). All 123 core simulation tests PASS: Q8 6/6, Q4K 4/4, Q6_K 97/97, HP FSM 7/7, HP FSM Q5_0 9/9. INT16 smoke pre-existing fail (unrelated wmem addressing). Q5_0 standalone testbench pre-existing compile error (old port interface, not updated for per-block rewrite).
+
+## Current Status (2026-07-07) — Q8 smem/act LUTRAM Conversion
 
 | Resource | Used | Available | % | Notes |
 |----------|------|-----------|---|-------|
@@ -260,16 +295,26 @@ All 4 Q5_0 HP FSM tests now PASS (previously all 4 FAILED with X in acc). No mor
 | LUT as Logic | **9,801** | 17,600 | **55.7** | |
 | LUT as Memory | **97** | 6,000 | **1.62** | |
 | Slice Regs | 12,781 | 35,200 | 36.3 | |
-| BRAM18 | **33** | 120 | **27.5** | Q8(17) + 2×Q5_0(8+8) = 33 |
+| BRAM18 | **33** | 120 | **27.5** | Q8(17) + 2×Q5_0(8+8) = 33 (pre-rewrite, stale) |
 | DSP48E1 | **22** | 80 | **27.5** | Q8(16) + 2×Q5_0(3+3) = 22 |
 | Slice | 4,387 | 4,400 | **99.7** | Tight — routing congestion |
 | **WNS** | **-9.74 ns** | 10 ns | Violated | Works on HW despite violation |
+
+**Table above is from the Vivado build BEFORE the Q5_0 clean-slate rewrite and Q8 BRAM reduction.** Re-synthesis needed for accurate post-change numbers. Estimated changes:
+
+- **Q8 BRAM18:** 17→8 (smem 8 + act 1 converted to LUTRAM, wmem 8 retained). Saves 9 BRAM18.
+- **Q5_0 BRAM18:** 8+8→1+1 (act_mem only — clean-slate rewrite removed all other BRAM). Saves 14 BRAM18.
+- **Total BRAM18 estimate:** 33−23=**~10** (8.3% of 120).
+- **LUTRAM added:** ~128 (smem) + ~16 (act) + existing 97 = **~241** (5.5% of 4,400).
+- **LUTs/FFs/DSP:** Expected unchanged.
 
 **Bitstream sources:** `axihp_read_master.v` + `axihp_write_master.v` + `matmul_q8_core.v` + `matmul_q5_0_core.v` + `hp_fsm_top.v`
 
 **Hardware tests:** All 18 tests PASS (9 baseline + 9 Q5_0). Q5_0 single desc PASS. Q5_0 chains PASS. Mixed CPU_OP→Q5_0 chains PASS. Q8 tests unchanged.
 
-### Hierarchical Resource Breakdown (Vivado routed)
+**Simulation (iVerilog):** All 123 core tests PASS: Q8 6/6, Q4K 4/4, Q6_K 97/97, HP FSM 7/7, HP FSM Q5_0 9/9. INT16 smoke pre-existing fail (unrelated wmem addressing). Q5_0 standalone testbench pre-existing compile error (old port interface).
+
+### Hierarchical Resource Breakdown (Vivado routed — stale, pre-change)
 
 ```
 Instance          Tot LUTs   %Total   FFs    BRAM18  DSP   Role
@@ -284,6 +329,8 @@ u_rd (read mstr)      173     1.8%    116      0       0   AXI HP read master
 ─────────────────────────────────────────────────────────────────────────
 Total               9,914   100%   12,781    33      22
 ```
+
+**After re-synthesis, u_q5_core0/1 BRAM18 expected to drop to 1 each, u_q8 BRAM18 to drop to 8 (wmem only).**
 
 **`inst (FSM top)` — 4,464 LUTs (47%)** is the binding constraint. Contains:
 - Q8 weight/scale/act loading FSM with byte-unpack shift registers (~1,200 LUTs)
@@ -303,34 +350,50 @@ Total               9,914   100%   12,781    33      22
 - 307 unique control sets force slice-level partitioning
 - LUTRAM in desc_buf/act_buf occupies SLICEM slices exclusively
 
-### Q5_0 Block-Streaming Redesign (2026-07-06)
+### Q5_0 Clean-Slate Per-Block Wide Register Interface (2026-07-07)
 
-Replaced the 4-cycle/element pipeline (R→D1→D2→A, 7170 cycles/tile) with a block-at-a-time architecture that computes 1 MAC/cycle (1849 cycles/tile, 3.9× speedup).
+Completely rewrote both `matmul_q5_0_core.v` and `hp_fsm_top.v` to eliminate byte-at-a-time header loading, `hdr_packed` LUTRAM, and `qs_word`/`blk_num`/`core_id`/`start` ports. The core now receives per-block `blk_d[15:0]`, `blk_qh[31:0]`, `blk_qs[127:0]` via a single `blk_valid` pulse — all fed from a 48-byte DDR burst (12 AXI beats) per block.
 
-**Key insight:** Precompute `d_pre = f16_decode(d) × scale >> 8` once per block (56 blocks × 2 rows = 112 blocks), then for each of 32 elements: decode q5, compute `dq = d_pre × q5` in LUTs, accumulate `acc += dq × act` via DSP MAC. 1 DSP/cycle vs original 3 DSP/cycle.
+**Key changes:**
+- Core ports: `blk_d[15:0]`, `blk_qh[31:0]`, `blk_qs[127:0]`, `blk_valid`, `norm_we/addr/din`
+- Removed: `hdr_we/bank/addr/din[7:0]`, `qs_word[127:0]`, `start`, `blk_num`, `res_addr/res_dout`, `core_id`
+- `row_scale[0:7]` renamed to `row_norm[0:1]` (PhaseB DSP normalization only)
+- Fixed pre-existing `act_r` pipeline bug: core pre-loads next wi's activation to match BRAM 1-cycle read latency (was off-by-one, masked by all-1s test activations)
+- Internal `blk_counter` resets on `clr_acc`, increments on block done
+- 34 cycles/block, 33 on back-to-back transitions (no SETUP_D needed for blk 1-55)
 
-**Pipeline:**
-- **SETUP_D** (1 cycle): compute d_pre = d_fp × scale >> 8 (1 DSP), clamp to S16
-- **COMPUTE** (32 cycles × 56 blocks): 1 cycle per element:
+**FSM changes (hp_fsm_top.v):**
+- Removed Q5_PRELOAD_HDR/Q5_PRELOAD_HDR_W (~109 lines byte-level unpack)
+- Removed `q5_hdr_we0/1`, `q5_hdr_bank/addr/din/sub/block/core`, `q5_qs_word0/1`, `q5_sc_*`, `q5_res_addr`, `q5_res_core/row`, `q5_qs_words`
+- Added Q5_LOAD_NORM/Q5_LOAD_NORM_W: 8-byte DDR burst → 4 × UQ8.8 row_norm values
+- Rewrote Q5_BLOCK_COMPUTE/Q5_BLOCK_COMPUTE_W: reads 48 bytes DDR (12 AXI beats = 6 × 64-bit rd_data) per block, unpacks into core d/qh/qs, pulses `blk_valid`
+- Rewrote Q5_READ_RES: direct capture of `u_q5_core0.res0/res1` and `u_q5_core1.res0/res1` — no `res_addr` interface
+
+**DDR layout per block (48 bytes):**
+```
+[0:1]   core0_d[15:0]       (f16)
+[2:5]   core0_qh[31:0]
+[6:21]  core0_qs[127:0]
+[22:23] core1_d[15:0]
+[24:27] core1_qh[31:0]
+[28:43] core1_qs[127:0]
+[44:47] padding
+```
+Total: 56 × 48 = 2688 bytes block data + 8 bytes norm (4 × UQ8.8) = 2696 bytes/tile.
+
+**Pipeline (core):**
+- **SETUP_D** (1 cycle): compute d_pre = f16_decode(d) × row_norm >> 8 (1 DSP), clamp to S16
+- **COMPUTE** (32 cycles): 1 cycle per element:
   1. q5 decode from qs_r + qh_w (combinational, LUTs)
   2. dq = d_pre × q5 (16×5 multiply, LUTs)
   3. acc += dq × act_r (1 DSP MAC)
 - **DRAIN** (1 cycle): signal done
 
-**BRAM read management:**
-- hdr0..hdr5 (f16/qh from LUTRAM banks 0-5) read every cycle from `blk_counter`
-- During COMPUTE[31], `hdr_addr` = `blk_counter + 1` to pre-read next block's headers
-- qs/act addresses driven combinatorially from current wi — BRAM reads next element's data each posedge while current cycle uses previously-read data
-- First block: blk_counter=0 from reset, headers already valid when start arrives (written during IDLE config)
-
-**Scale indexing fix:** Core correctly indexes `row_scale[{core_id[0], row_high}]` — core0 uses scale[0:1], core1 uses scale[2:3] (was previously core1 reading scale[0:1]).
-
-**Cycle breakdown:**
-- 56 blocks × (1 SETUP_D + 32 COMPUTE) = 1848 cycles
-- +1 DRAIN cycle = 1849 total
-- vs original 4×1792+4 = 7172 cycles (3.88× speedup)
-
-**Verification:** All 9 HP FSM Q5_0 dispatch tests PASS (2026-07-06). Q8/Q4K/Q6_K core tests unaffected. (Q5_0 core unit tests need rebuild with new `qs_word`/`blk_num` port interface.)
+**Cycle breakdown (core only, excludes DDR read overhead):**
+- Each block: 1 SETUP_D + 32 COMPUTE + 1 DRAIN = 34 cycles (SETUP_D always executed)
+- 56 blocks: 56 × 34 = 1904 cycles
+- DDR read per block adds ~17 cycles (12 AXI beats + latency + unpack), giving ~56 × 51 = ~2856 system cycles/tile
+- SETUP_D is not skipable — d_pre is recomputed per block (each GGUF block has its own f16 scale d)
 
 ### Q5_0 HP FSM Dispatch Tests (2026-07-06)
 
@@ -388,8 +451,9 @@ Savings: 3,512 LUTs (31%), 688 LUTRAM (92%), timing +0.314ns.
 3. ✅ Rebuild bitstream, verify all 9 HW tests — ALL PASS
 4. ✅ Measured: 3,512 LUTs saved (31%), 688 LUTRAM (92%), WNS 0.601ns
 5. ✅ Q5_0 integration: 2× Q5_0 cores in hp_fsm_top, descriptor tensor_type=1 dispatch, block-streaming pipeline, HW test PASS (2026-07-05)
-6. ✅ Q5_0 block-streaming redesign: 3.9× speedup (1849 vs 7170 cycles/tile), 1 DSP MAC/cycle, 9 HP FSM dispatch tests PASS, 2 × Q5_0 cores integrated into hp_fsm_top (2026-07-06)
-7. ▶ Multi-core integration (Q4K/Q6_K/INT16) with shared BRAM weight loading
+6. ✅ Q5_0 block-streaming redesign: 3.7× speedup (1904 vs 7170 cycles/tile, core-only), 1 DSP MAC/cycle, 9 HP FSM dispatch tests PASS, 2 × Q5_0 cores integrated into hp_fsm_top (2026-07-06)
+7. ✅ Q5_0 clean-slate rewrite: per-block wide register interface, no hdr_packed LUTRAM, no byte-at-a-time header loading, act_r pipeline fix, row_scale→row_norm, hierarchical result read (2026-07-07)
+8. ▶ Multi-core integration (Q4K/Q6_K/INT16) with shared BRAM weight loading
 
 ## Build & Run Commands
 
@@ -440,10 +504,10 @@ python3 scripts/extract_tmac.py models/qwen2-0_5b-instruct-q4_k_m.gguf /tmp/mode
 ## File Inventory
 
 ### Verilog RTL
-- `verilog/matmul_top.v` — Quad-core top: AXI4-Lite slave (inline, replaces orphan axilite_slave.v), 8192-byte weight_buf, loading FSM, mode mux (Q8/Q4K/Q5_0/Q6_K/INT16)
+- `verilog/matmul_top.v` — Quad-core top: AXI4-Lite slave (inline, replaces orphan axilite_slave.v), 8192-byte weight_buf, loading FSM, mode mux (Q8/Q4K/Q6_K/INT16). Q5_0 removed (handled by hp_fsm_top.v exclusively).
 - `verilog/matmul_q8_core.v` — Q8_0 compute core: 8×512×8 wmem (BRAM banks), dequant LUT, 6-stage pipeline
-- `verilog/matmul_q4k_core.v` — Q4_K block decode: 2304-byte block buffer, S24.8 fixed-point, 56×256 tile
-- `verilog/matmul_q5_0_core.v` — Q5_0 block decode: 4×896 tile, 2× parallel cores, block-streaming pipeline (SETUP_D→COMPUTE×32→DRAIN), 1 DSP MAC/cycle, pre-reads next block's headers during COMPUTE[31]
+- `verilog/matmul_q4k_core.v` — Q4_K block decode: 8064-byte block buffer (`block_buf [0:8063]`), S24.8 fixed-point, 56×256 tile
+- `verilog/matmul_q5_0_core.v` — Q5_0 block decode: 4×896 tile, 2× parallel cores, block-streaming pipeline (SETUP_D→COMPUTE×32→DRAIN), 1 DSP MAC/cycle, per-block wide register interface (blk_d/qh/qs), no hdr_packed LUTRAM, hierarchical result read
 - `verilog/matmul_q6_k_core.v` — Q6_K block decode: 32×256 tile, 32 blocks/tile, super_scale + per-sub-block scales
 - `verilog/matmul_int16_core.v` — General INT16×INT16 core: 512×128-bit wmem, 3-stage FSM
 - `verilog/dequant_lut.v` — Q8_0 dequant ROM (standalone, not instantiated)
@@ -461,7 +525,7 @@ python3 scripts/extract_tmac.py models/qwen2-0_5b-instruct-q4_k_m.gguf /tmp/mode
 - `verilog/tb_cosim_q5_0.v` — Q5_0 co-simulation (waits for tile dump)
 - `verilog/tb_cosim_q6_k.v` — Q6_K co-simulation (waits for tile dump)
 - `verilog/tb_hw_fsm_comprehensive.v` — HP FSM all 7 tests (HEAD-based wait_done)
-- `verilog/tb_hp_fsm_q5_0.v` — HP FSM Q5_0 dispatch test (all-1s pattern, chain of 2, mixed CPU_OP+Q5_0, chain of 3)
+- `verilog/tb_hp_fsm_q5_0.v` — HP FSM Q5_0 dispatch test (9 tests: all-1s, chains, mixed CPU_OP, edge cases)
 - `verilog/tb_q5_off_by_one.v` — Q5_0 off-by-one BRAM bug verification (non-uniform patterns)
 - `verilog/test_hp_loopback.v` — 32-bit HP loopback testbench (ARSIZE=2 proven)
 - `verilog/sim_ddr_axi_hp.v` — AXI HP DDR model for simulation
@@ -512,12 +576,23 @@ python3 scripts/extract_tmac.py models/qwen2-0_5b-instruct-q4_k_m.gguf /tmp/mode
 - **Phase 1 complete — HP descriptor-chain DMA proven on hardware** across all edge cases (min/max sizes, chains, restart). Ready for Phase 2: Q8 compute integration.
 - **Phase 2 (Q8 compute)** ✅ **ALL 9 TESTS PASS ON HARDWARE** — Q8 pipeline timing fix (WNS +0.550), sc_byte_idx reset bug fixed, all-1s pattern. Three bugs fixed (q8_wt_din reg, col_group init, act_remaining). Test 9a multi-group 2-group 64×128 tile PASS (all 64 rows = 128). Multi-group verified on HW (2026-07-02). **rd_ready handshake fix (2026-07-04):** Changed LOAD_WEIGHT_W from `rd_ready <= 1` to `rd_ready <= rd_valid` — the continuous-high read-enable caused the read master's `rvalid` to self-clear in 0 cycles (NBA race). All 9 HW tests pass after 64-bit word write change. Phase 2 complete.
 
+## Hardware Gotchas
+
 ### Critical: ps7_init re-execution hang
 `ps7_pll_init_data_3_0` **hangs if PLLs are already configured** from a prior session. The PLL reset sequence (bypass→power-down→reset→wait-for-lock) can't re-lock when the PLLs are already locked from a previous session. This leaves the PS7 in a partially-configured state and all subsequent ps7_init attempts also hang (DDR init's `mask_poll 0xF8000B74 0x00002000` waits for calibration that depends on PLL clock).
 
 **Workaround:** Always power-cycle the board before running ps7_init via XSDB. A processor-only reset (`rst -processor`) is insufficient — the PLLs must be in reset-init state for ps7_pll_init to succeed.
 
 **Key observation:** HP0 register reads return 0x00000000 after a failed ps7_init attempt, even though the OCM code wrote valid non-zero values. This is because the PS7 AHB interconnect enters an inconsistent state when PLLs are partially configured, and DAP read transactions return 0.
+
+### PS7 HP0 is AXI3 (max 16 beats per burst)
+`ARLEN > 15` causes silent AR rejection — the read master never receives RLAST. All HP FSM bursts are hard-limited to 16 beats (`rd_len/wr_len ≤ 15`).
+
+### `rst -processor` corrupts DAP irreversibly
+The JTAG DAP controller enters an unrecoverable state after `rst -processor`. Use `stop` instead to halt the CPU without resetting the debug infrastructure.
+
+### FCLK_CLK0 enable requires ARM boot code
+DAP writes to `FPGA_CLK_CTRL[7]` (FCLK_CLK0 enable at `0xF8000170`) are ignored — the register is locked to secure mode. The CPU must enable FCLK_CLK0 in its boot code before the PL clock can be used.
 
 ### Batch Build Framework
 
@@ -548,27 +623,27 @@ mwr -force 0xF800900C 0x00000001  ;# read channel enable
 
 **Initial hypothesis (WRONG):** ARSIZE=2/AWSIZE=2 (4-byte narrow transfers) on Zynq 64-bit HP interconnect was thought to cause byte lane remapping issues. Tried ARSIZE=3/AWSIZE=3.
 
-**Board test with ARSIZE=3: RDATA[63:32]=0** — Zynq-7010 with x16 DDR3 caps HP0 at 32-bit. Upper 32 bits of each 8-byte beat are always 0, losing every other 32-bit word. ARSIZE=3 REJECTED.
+**Board test with ARSIZE=3: RDATA[63:32]=0** — Zynq-7010 with x16 DDR3 caps HP0 at 32-bit. Upper 32 bits of each 8-byte beat are always 0, losing every other 32-bit word. ARSIZE=3 REJECTED for read master (upper 32 bits are garbage); write master later reverted to AWSIZE=3 because the Zynq HP port correctly handles 8-byte beats by performing two 32-bit DDR accesses internally (see current `axihp_write_master.v`).
 
 | Fix Attempt | Result | Detail |
 |-----|--------|--------|
 | done bits sticky | ✅ | `reg_status[15:8]` no longer cleared in DONE state |
 | ARSIZE=3 (read master) | ❌ REJECTED | RDATA[63:32]=0 on hardware, data corruption |
-| AWSIZE=3 (write master) | ❌ REJECTED | Same upper-half issue on write side |
+| AWSIZE=3 (write master, later adopted) | ⏳ see below | Current write master uses AWSIZE=3 with 4-state FSM |
 | Bitstream rebuilt | ✅ | 0 errors, synth 50s + impl 2:31 |
 
-**Actual fix:** Reverted to ARSIZE=2/AWSIZE=2, accepting the 32-bit nature of HP0 on this board.
+**Actual fix (read master):** Reverted to ARSIZE=2, accepting the 32-bit nature of HP0 read on this board. Write master was later rewritten to use AWSIZE=3 with a simpler 4-state FSM (see current `axihp_write_master.v`).
 
-### 32-bit HP mode (2026-06-20) — THE WORKING SOLUTION
+### 32-bit HP mode (2026-06-20) — SUPERSEDED (see current write master below)
 
 **Finding: Zynq-7010 HP0 is 32-bit only with x16 DDR3.** Despite `PCW_S_AXI_HP0_DATA_WIDTH=64` set before `apply_bd_automation`, RDATA[63:32] is always 0 on hardware. The PS7 silicon ignores the 64-bit width parameter when the DDR bus is x16-wide. `AFI0_CTRL[7:6]` (64-bit enable) is also read-only — confirmed by write-verify loop.
 
-**Design change:** Switched to full 32-bit AXI mode:
+**Design change (later superseded by AWSIZE=3):** Switched to full 32-bit AXI mode:
 
 | Component | Change |
 |-----------|--------|
 | `axihp_read_master.v` | ARSIZE=2 (4 bytes/beat), always captures `m_axi_rdata[31:0]` (no beat[0] alternation since HP0 doesn't do narrow-transfer byte lane remapping — RDATA[63:32] is always 0) |
-| `axihp_write_master.v` | AWSIZE=2 (4 bytes/beat), splits each 64-bit top word into two single-beat AXI transactions. wready asserted **once per word** (in W_L only, not W_U). W_U proceeds without wready handshake using `hold_wdata[63:32]`. 5-state FSM: IDLE→AW_L→W_L→B_L→AW_U→B_U. |
+| `axihp_write_master.v` | AWSIZE=2 (5-state FSM, superseded by current AWSIZE=3, 4-state FSM — see `axihp_write_master.v` for current design) |
 | `hp_loopback_top.v` | Word_idx advances once per 64-bit word (single wready assertion). |
 | `run_hp_loopback.tcl` | REG_RD_LEN=15 (16 beats × 4 bytes = 64 bytes). AFI0_CTRL=0x01 (bits[7:6] omitted). |
 
@@ -697,7 +772,7 @@ Three bugs in the multi-group Q8 iteration were found and fixed during iVerilog 
 ### Relevant Files
 
 - `vivado_integration/build_bd.tcl`: Vivado batch build — HP0 config (`PCW_S_AXI_HP0_DATA_WIDTH=64`) set before `apply_bd_automation`. Sources `hp_fsm_top.v` + `axihp_read_master.v` + `axihp_write_master.v`.
-- `vivado_integration/rtl/hp_fsm_top.v`: HP descriptor-chain FSM — AXI4-Lite slave, desc_buf (32B), act_buf (512B), Q8 matmul core + 64×896 tile (14 groups), multi-group accumulator (64×48-bit acc_buf), 32-bit HP read/write masters. 18-state FSM: IDLE→FETCH_DESC→LOAD_WEIGHT→LOAD_SCALES→LOAD_ACT→COPY_ACT_TO_CORE→COMPUTE→READ_RES_ACC (×groups)→COPY_ACC_TO_BUF→WRITE_RES→DONE.
+- `vivado_integration/rtl/hp_fsm_top.v`: HP descriptor-chain FSM — AXI4-Lite slave, desc_buf (32B), act_buf (512B), Q8/Q5_0 compute dispatch, 64-bit HP read/write masters. 27-state FSM (IDLE 0 through Q5_READ_RES 26). Q8 path: IDLE→FETCH_DESC→FETCH_DESC_W→LOAD_WEIGHT→LOAD_WEIGHT_W→LOAD_SCALES→LOAD_SCALES_W→LOAD_ACT→LOAD_ACT_W→COPY_ACT_TO_CORE→COMPUTE→COMPUTE_W→READ_RES/READ_RES_ACC→COPY_ACC_TO_BUF→WRITE_RES→WRITE_RES_BURST→WRITE_RES_W→DONE (20 states). Q5_0 path adds Q5_LOAD_NORM, Q5_LOAD_NORM_W, Q5_COPY_ACT, Q5_COPY_ACT_W, Q5_BLOCK_COMPUTE, Q5_BLOCK_COMPUTE_W, Q5_READ_RES (7 states).
 - `vivado_integration/sw/run_hp_fsm_comprehensive.tcl`: XSDB flow — all 7 HP FSM tests (basic, min 8B, 128B 2-burst, 256B 4-burst, chain of 2, chain of 3, re-start). Polls HEAD register for completion.
 - `vivado_integration/sw/run_hp_fsm_q5_0.tcl`: XSDB flow — Q5_0 all-1s test. Loads weight/scales/acts, sets tensor_type=1 descriptor, verifies 4 rows = 896.
 - `vivado_integration/sw/regs.h`: Register map

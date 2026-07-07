@@ -1,18 +1,13 @@
 /*
- * T-MAC FPGA Interface Layer
- * Zynq 7010 ARM-side driver for matmul_q8 IP
+ * T-MAC FPGA Interface Layer (aspirational — implementation pending)
+ * Zynq 7010 ARM-side driver for HP FSM descriptor-chain accelerator (hp_fsm_top.v)
  *
- * FPGA Design: Q8_0 direct path — receives Q8_0 bytes + UQ8.8 combined scales,
- * does Q8→INT16 dequant (LUT-based), then INT16×INT16→INT64 systolic matmul.
+ * The current FPGA uses a descriptor-chain protocol: CPU builds 32-byte
+ * descriptors in DDR, writes REG_DESC_BASE (0x43C00018), then pulses REG_START.
+ * See vivado_integration/API.md for the complete register map and API.
  *
- * ARM handles: FP32→INT16 quantization of activations, combined scale precompute.
- * FPGA handles: Q8→INT16 dequant, INT16 systolic array, output accumulation.
- *
- * Usage:
- *   TMacFPGA fpga;
- *   fpga.init();
- *   fpga.gemm(q8_weights, combined_scales, activation, result, config);
- *   fpga.gemv(activation, q8_weights, result, N);
+ * This header targets the legacy matmul_q8 AXI-Lite IP (0x40000000 base);
+ * a full descriptor-chain driver is pending implementation.
  */
 
 #ifndef T_MAC_FPGA_HPP
