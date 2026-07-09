@@ -131,6 +131,7 @@ module hp_fsm_top (
     wire [2:0] rd_dbg_state;
     wire [7:0] rd_beat_cnt;
     reg        rd_start, rd_ready;
+    reg        q5_start_pending;   // Q5: hold rd_start request across default clear
     reg [31:0] rd_addr;
     reg [7:0]  rd_len;
 
@@ -833,7 +834,7 @@ module hp_fsm_top (
                     // Read 48 bytes (12 AXI beats = 6 × 64-bit) per-block data from DDR
                     rd_addr <= weight_addr + q5_tile_counter * 2696 + q5_blk_counter * 48;
                     rd_len <= 8'd11;    // 12 beats × 4 bytes = 48 bytes
-                    rd_start <= 1;
+                    rd_start <= 1;      // pulse start for read master
                     q5_unpack_cnt <= 0;
                     q5_unpack_word <= 0;
                     sc_burst_done <= 0;
@@ -843,7 +844,7 @@ module hp_fsm_top (
 
                 Q5_BLOCK_COMPUTE_W: begin
                     q5_clr_acc <= 0;
-                    rd_start <= 0;
+                    // rd_start stays high until read master accepts (default clears it next cycle)
                     // Capture rd_data words and unpack into core d/qh/qs
                     if (!rd_unpack_active && q5_unpack_word < 6) begin
                         rd_ready <= rd_valid;
@@ -879,13 +880,17 @@ module hp_fsm_top (
                         q5_unpack_word <= q5_unpack_word + 1;
                         rd_unpack_active <= 0;
                     end
-                    // After all 6 words captured, pulse blk_valid to both cores
+                    // Burst tracking: reset timeout on read completion (like LOAD_ACT_W)
+                    if (rd_done_rise) begin
+                        sc_burst_done <= 1;
+                        timeout_cnt <= 0;
+                    end
+                    // After all 6 words captured, pulse blk_valid and wait for compute done
                     if (q5_unpack_word == 6 && !q5_blk_valid) begin
                         q5_blk_valid <= 1;
+                        timeout_cnt <= 0;
                     end
-                    // Burst tracking
-                    if (rd_done_rise) sc_burst_done <= 1;
-                    // Wait for compute done
+                    // Wait for compute done (timeout reset above on rd_done_rise)
                     if (q5_done_rise) begin
                         q5_blk_counter <= q5_blk_counter + 1;
                         timeout_cnt <= 0;
