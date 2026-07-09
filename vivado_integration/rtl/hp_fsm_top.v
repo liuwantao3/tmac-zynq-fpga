@@ -838,6 +838,7 @@ module hp_fsm_top (
                     q5_unpack_cnt <= 0;
                     q5_unpack_word <= 0;
                     sc_burst_done <= 0;
+                    timeout_cnt <= 0;   // reset timeout counter at entry
                     if (q5_blk_counter == 0) q5_clr_acc <= 1;
                     state <= Q5_BLOCK_COMPUTE_W;
                 end
@@ -885,12 +886,12 @@ module hp_fsm_top (
                         sc_burst_done <= 1;
                         timeout_cnt <= 0;
                     end
-                    // After all 6 words captured, pulse blk_valid and wait for compute done
+                    // After all 6 words captured, pulse blk_valid to Q5 core
                     if (q5_unpack_word == 6 && !q5_blk_valid) begin
                         q5_blk_valid <= 1;
                         timeout_cnt <= 0;
                     end
-                    // Wait for compute done (timeout reset above on rd_done_rise)
+                    // Wait for compute done
                     if (q5_done_rise) begin
                         q5_blk_counter <= q5_blk_counter + 1;
                         timeout_cnt <= 0;
@@ -899,11 +900,11 @@ module hp_fsm_top (
                         end else begin
                             state <= Q5_BLOCK_COMPUTE;
                         end
-                    end else if (&timeout_cnt) begin
+                    end else if (&timeout_cnt && !rd_unpack_active) begin
                         timeout_cnt <= 0;
                         timeout_src <= state;
                         state <= TIMEOUT_ERROR;
-                    end else begin
+                    end else if (!rd_unpack_active) begin
                         timeout_cnt <= timeout_cnt + 1;
                     end
                 end
