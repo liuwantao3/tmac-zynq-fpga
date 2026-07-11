@@ -123,7 +123,23 @@ module hp_fsm_top (
     reg [31:0] reg_act_info;       // 0x34: act_addr from descriptor
     reg [31:0] reg_desc_info;      // 0x38: {8'h0, act_total_bytes[23:0]}
     reg [31:0] reg_q8_debug;       // 0x3C: Q8 core debug status
+    reg [31:0] reg_q5_debug;       // 0x40: Q5 core debug status
+    reg [31:0] reg_q5_dbg_cap0;    // 0x44: Q5 debug capture 0 (core0/1 d_pre)
+    reg [31:0] reg_q5_dbg_cap1;    // 0x48: Q5 debug capture 1 (d_fp, norm, blk_counter)
+    reg [31:0] reg_q5_dbg_trig;    // 0x4C: Q5 debug trigger (W: arm, R: status)
+    reg [31:0] reg_q5_dbg_live;    // 0x50: Q5 live debug (always updated)
+    reg [31:0] reg_q5_dbg_cap2;    // 0x54: Q5 acc capture 2 (core1.acc[1][31:0])
+    reg [31:0] reg_q5_dbg_cap3;    // 0x58: Q5 acc capture 3 (core1.acc[0] lo, core1 state)
+    reg [31:0] reg_q5_dbg_cap4;    // 0x5C: Q5 debug capture 4 (core0_act_r[15:0], core0_q5[4:0])
+    reg [31:0] reg_q5_dbg_cap5;    // 0x60: Q5 debug capture 5 (core1_act_r[15:0], core1_q5[4:0])
+    reg [31:0] reg_q5_dbg_snap;    // 0x64: Q5 snapshot on CPU write
+    reg [31:0] reg_q5_dbg_wi_start; // 0x68: wi captured on first blk_entry after clr_acc
+    reg        q5_wi_arm;           // armed after clr_acc deasserts, captures wi on next blk_entry
+    reg        q5_clr_acc_d;        // delayed clr_acc for edge detection
+    reg        q5_blk_valid_r;      // delayed blk_valid for edge detection
     reg  [3:0] reg_q8_num_groups;  // 0x10[3:0]: number of column groups (0=single)
+    // Snapshot trigger: combinatorial from AXI4-Lite write decode
+    wire q5_snap_trig = aw_got && w_got && !bvalid_r && awaddr_r[15:0] == 16'h64;
 
     // ===== HP Read Master (64-bit word output) =====
     wire       rd_busy, rd_done, rd_valid;
@@ -223,6 +239,7 @@ module hp_fsm_top (
     wire       q5_done0, q5_done1;
     wire       q5_busy0, q5_busy1;
     reg        q5_clr_acc;
+    reg  [4:0] q5_clr_acc_cnt;
     reg        q5_norm_we;
     reg [1:0]  q5_norm_addr;
     reg [15:0] q5_norm_din;
@@ -233,6 +250,7 @@ module hp_fsm_top (
     reg [31:0] q5_blk_qh1;
     reg [127:0] q5_blk_qs1;
     reg        q5_blk_valid;
+    reg        q5_blk_valid_pulsed;
     reg        q5_act_we;
     reg [9:0]  q5_act_addr;
     reg [15:0] q5_act_din;
@@ -244,6 +262,17 @@ module hp_fsm_top (
     reg [15:0] q8_tile_counter;     // current Q8 tile index
     reg [15:0] q8_tile_stride;      // bytes per Q8 tile
 
+    // Q5 debug wires from cores
+    wire [15:0] q5_core0_d_pre,  q5_core1_d_pre;
+    wire [5:0]  q5_core0_blk_cnt, q5_core1_blk_cnt;
+    wire [31:0] q5_core0_d_fp,   q5_core1_d_fp;
+    wire [15:0] q5_core0_norm,   q5_core1_norm;
+    wire [2:0]  q5_core0_state,  q5_core1_state;
+    wire [15:0] q5_core0_act_r,  q5_core1_act_r;
+    wire [4:0]  q5_core0_q5,     q5_core1_q5;
+    wire [4:0]  q5_core0_wi,     q5_core1_wi;
+    wire [47:0] q5_core0_res0, q5_core0_res1, q5_core1_res0, q5_core1_res1;
+
     matmul_q5_0_core u_q5_core0 (
         .clk(clk), .rst_n(rst_n),
         .core_id(1'b0),
@@ -252,7 +281,13 @@ module hp_fsm_top (
         .blk_d(q5_blk_d0), .blk_qh(q5_blk_qh0), .blk_qs(q5_blk_qs0),
         .blk_valid(q5_blk_valid),
         .act_we(q5_act_we), .act_addr(q5_act_addr), .act_din(q5_act_din),
-        .clr_acc(q5_clr_acc)
+        .clr_acc(q5_clr_acc),
+        .res0(q5_core0_res0), .res1(q5_core0_res1),
+        .dbg_d_pre(q5_core0_d_pre), .dbg_blk_counter(q5_core0_blk_cnt),
+        .dbg_d_fp(q5_core0_d_fp), .dbg_norm(q5_core0_norm),
+        .dbg_state(q5_core0_state),
+        .dbg_act_r(q5_core0_act_r), .dbg_q5(q5_core0_q5),
+        .dbg_wi(q5_core0_wi)
     );
     matmul_q5_0_core u_q5_core1 (
         .clk(clk), .rst_n(rst_n),
@@ -262,11 +297,18 @@ module hp_fsm_top (
         .blk_d(q5_blk_d1), .blk_qh(q5_blk_qh1), .blk_qs(q5_blk_qs1),
         .blk_valid(q5_blk_valid),
         .act_we(q5_act_we), .act_addr(q5_act_addr), .act_din(q5_act_din),
-        .clr_acc(q5_clr_acc)
+        .clr_acc(q5_clr_acc),
+        .res0(q5_core1_res0), .res1(q5_core1_res1),
+        .dbg_d_pre(q5_core1_d_pre), .dbg_blk_counter(q5_core1_blk_cnt),
+        .dbg_d_fp(q5_core1_d_fp), .dbg_norm(q5_core1_norm),
+        .dbg_state(q5_core1_state),
+        .dbg_act_r(q5_core1_act_r), .dbg_q5(q5_core1_q5),
+        .dbg_wi(q5_core1_wi)
     );
 
-    wire q5_all_done = q5_done0 & q5_done1;
-    wire q5_any_busy = q5_busy0 | q5_busy1;
+    wire q5_all_done  = q5_done0 & q5_done1;
+    wire q5_any_busy  = q5_busy0 | q5_busy1;
+    wire q5_busy_both = q5_busy0 & q5_busy1;
     reg q5_done_d;
     wire q5_done_rise;
     always @(posedge clk or negedge rst_n) begin
@@ -274,6 +316,86 @@ module hp_fsm_top (
         else q5_done_d <= q5_all_done;
     end
     assign q5_done_rise = q5_all_done && !q5_done_d;
+
+    // ── Q5 debug capture — continuous track with trigger freeze ──
+    // reg_q5_dbg_cap0 (0x44): [31:16]=core0_d_pre, [15:0]=core1_d_pre
+    // reg_q5_dbg_cap1 (0x48): [31:16]=core0_d_fp[15:0], [15:9]=norm[15:9],
+    //                         [8:6]=core0_state, [5:0]=blk_counter
+    // reg_q5_dbg_trig (0x4C): W:arm, R:live core0_dpre[31:16]+status
+    reg q5_dbg_frozen;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            reg_q5_dbg_cap0 <= 0;
+            reg_q5_dbg_cap1 <= 0;
+            reg_q5_dbg_live <= 0;
+            reg_q5_dbg_cap4 <= 0;
+            reg_q5_dbg_cap5 <= 0;
+            reg_q5_dbg_snap <= 0;
+            q5_dbg_frozen   <= 0;
+        end else begin
+            // Always update live debug (unconditional, every cycle)
+            reg_q5_dbg_live <= {5'b0,                          // [31:27] reserved
+                                state,                          // [26:22] FSM state (5 bits)
+                                q5_dbg_frozen,                  // [21] frozen
+                                q5_any_busy,                    // [20] busy
+                                q5_tile_counter[5:0],           // [19:14] tile counter (6 bits)
+                                q5_blk_counter[5:0],            // [13:8]  block counter (6 bits)
+                                3'b0,                           // [7:5]  reserved
+                                q5_core0_state};                // [4:2]  core0 state (3 bits)
+            if (q5_snap_trig) begin
+                // Snapshot on CPU write to 0x64
+                reg_q5_dbg_snap <= {q5_core0_wi, q5_core1_wi,
+                                    q5_core0_q5[4:0], q5_core1_q5[4:0],
+                                    q5_core0_state, q5_core1_state,
+                                    q5_blk_counter[5:0]};
+                q5_dbg_frozen <= 1;
+            end else if (q5_dbg_frozen) begin
+                // Hold: keep last captured values (do nothing)
+            end else begin
+                // Continuous track: update with live values every cycle
+                reg_q5_dbg_cap0 <= {q5_core0_d_pre[15:0], q5_core1_d_pre[15:0]};
+                reg_q5_dbg_cap1 <= {q5_core0_d_fp[15:0], q5_core0_norm[15:9],
+                                    q5_core0_state, q5_blk_counter[5:0]};
+                reg_q5_dbg_cap4 <= {q5_core0_q5[4:0], 11'b0, q5_core0_act_r[15:0]};
+                reg_q5_dbg_cap5 <= {q5_core1_q5[4:0], 11'b0, q5_core1_act_r[15:0]};
+                // Freeze on trigger match (CPU clears armed bit manually via write to 0x4C)
+                if (reg_q5_dbg_trig[0] && q5_core0_blk_cnt == reg_q5_dbg_trig[15:10]) begin
+                    q5_dbg_frozen <= 1;
+                end
+            end
+            // Re-arm (unfreeze) when CPU writes to trig register
+            if (aw_got && w_got && awaddr_r[15:0] == 16'h4C) begin
+                q5_dbg_frozen <= 0;
+            end
+        end
+    end
+
+    // ── wi_start capture: captures wi on first blk_entry after clr_acc ──
+    // reg_q5_dbg_wi_start (0x68): [31:27]=core0_wi, [26:22]=core1_wi,
+    //                             [21:19]=core0_state, [18:16]=core1_state,
+    //                             [15:10]=reserved, [5:0]=blk_counter
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            q5_clr_acc_d     <= 0;
+            q5_wi_arm        <= 0;
+            reg_q5_dbg_wi_start <= 0;
+            q5_blk_valid_r   <= 0;
+        end else begin
+            q5_blk_valid_r   <= q5_blk_valid;
+            q5_clr_acc_d     <= q5_clr_acc;
+            // Falling edge of clr_acc: arm wi capture
+            if (!q5_clr_acc && q5_clr_acc_d) begin
+                q5_wi_arm <= 1;
+            end
+            // On blk_valid rising edge, if armed: capture wi (before blk_entry resets it)
+            if (q5_blk_valid && !q5_blk_valid_r && q5_wi_arm) begin
+                reg_q5_dbg_wi_start <= {q5_core0_wi, q5_core1_wi,
+                                        3'b0, 3'b0,
+                                        10'b0, q5_blk_counter[5:0]};
+                q5_wi_arm <= 0;
+            end
+        end
+    end
 
     // ===== Compute type: 0=Q8, 1=Q5_0 =====
     reg [1:0] compute_type;
@@ -365,6 +487,15 @@ module hp_fsm_top (
     end
     assign rd_done_rise = rd_done && !rd_done_d;
     assign wr_done_rise = wr_done && !wr_done_d;
+
+    // Rising-edge detection for reg_start (to avoid multi-driver)
+    reg reg_start_d;
+    wire reg_start_rise;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) reg_start_d <= 0;
+        else reg_start_d <= reg_start;
+    end
+    assign reg_start_rise = reg_start && !reg_start_d;
     assign wr_wdata = act_buf[wr_byte_offset[8:3]];
     assign q8_done_rise = q8_done && !q8_done_d;
 
@@ -375,6 +506,8 @@ module hp_fsm_top (
             reg_desc_head <= 0;
             reg_debug <= 0;
             reg_q8_debug <= 0;
+            reg_q5_debug <= 0;
+            reg_q5_dbg_trig <= 0;
             rd_start <= 0; rd_ready <= 0;
             rd_addr <= 0; rd_len <= 0;
             wr_start <= 0; wr_wvalid <= 0;
@@ -425,15 +558,19 @@ module hp_fsm_top (
             wt_burst_done   <= 0;
             sc_burst_done   <= 0;
             q5_clr_acc      <= 0;
+            q5_clr_acc_cnt  <= 0;
             q5_norm_we      <= 0; q5_norm_addr <= 0; q5_norm_din <= 0;
             q5_blk_d0       <= 16'd0; q5_blk_qh0 <= 32'd0; q5_blk_qs0 <= 128'd0;
             q5_blk_d1       <= 16'd0; q5_blk_qh1 <= 32'd0; q5_blk_qs1 <= 128'd0;
             q5_blk_valid    <= 0;
+            q5_blk_valid_pulsed <= 0;
             q5_act_we       <= 0; q5_act_addr <= 0; q5_act_din <= 0;
             q5_blk_counter  <= 0;
             q5_unpack_cnt   <= 0;
             q5_copy_act_idx <= 0;
             q5_unpack_word  <= 0;
+            reg_q5_dbg_cap2 <= 0;
+            reg_q5_dbg_cap3 <= 0;
             q8_num_tiles    <= 0;
             q8_tile_counter <= 0;
             q8_tile_stride  <= 0;
@@ -457,7 +594,7 @@ module hp_fsm_top (
             case (state)
                 IDLE: begin
                     reg_status[15:8] <= 0;
-                    if (reg_start) begin
+                    if (reg_start_rise) begin
                         reg_desc_head <= 0;
                         desc_addr <= reg_desc_base;
                         state <= FETCH_DESC;
@@ -504,6 +641,7 @@ module hp_fsm_top (
                         // Use desc_buf directly (tensor_type register lags by 1 cycle)
                         if ({desc_buf[17], desc_buf[16]} == 15) begin
                             // CPU_OP: passthrough activation to DDR
+                            col_group <= 0;
                             state <= LOAD_ACT;
                         end else if ({desc_buf[17], desc_buf[16]} == 1) begin
                             // Q5_0 compute path (per-block, tile iteration)
@@ -819,6 +957,8 @@ module hp_fsm_top (
                             state <= Q5_COPY_ACT;
                         end else begin
                             q5_blk_counter <= 0;
+                            q5_clr_acc <= 1;
+                            q5_clr_acc_cnt <= 16;
                             state <= Q5_BLOCK_COMPUTE;
                         end
                     end else if (&timeout_cnt && !rd_unpack_active) begin
@@ -837,14 +977,23 @@ module hp_fsm_top (
                     rd_start <= 1;      // pulse start for read master
                     q5_unpack_cnt <= 0;
                     q5_unpack_word <= 0;
+                    q5_blk_valid_pulsed <= 0;
                     sc_burst_done <= 0;
                     timeout_cnt <= 0;   // reset timeout counter at entry
-                    if (q5_blk_counter == 0) q5_clr_acc <= 1;
+                    if (q5_blk_counter == 0) begin
+                        q5_clr_acc <= 1;  // DSP flush: prod forced to 0 while set
+                        q5_clr_acc_cnt <= 16;  // hold for 16 more cycles
+                    end
                     state <= Q5_BLOCK_COMPUTE_W;
                 end
 
                 Q5_BLOCK_COMPUTE_W: begin
-                    q5_clr_acc <= 0;
+                    if (q5_clr_acc_cnt > 0) begin
+                        q5_clr_acc_cnt <= q5_clr_acc_cnt - 1;
+                        q5_clr_acc <= 1;  // hold clr_acc for DSP pipeline flush
+                    end else begin
+                        q5_clr_acc <= 0;
+                    end
                     // rd_start stays high until read master accepts (default clears it next cycle)
                     // Capture rd_data words and unpack into core d/qh/qs
                     if (!rd_unpack_active && q5_unpack_word < 6) begin
@@ -887,15 +1036,18 @@ module hp_fsm_top (
                         timeout_cnt <= 0;
                     end
                     // After all 6 words captured, pulse blk_valid to Q5 core
-                    if (q5_unpack_word == 6 && !q5_blk_valid) begin
+                    if (q5_unpack_word == 6 && !q5_blk_valid && !q5_blk_valid_pulsed) begin
                         q5_blk_valid <= 1;
+                        q5_blk_valid_pulsed <= 1;
                         timeout_cnt <= 0;
                     end
                     // Wait for compute done
                     if (q5_done_rise) begin
                         q5_blk_counter <= q5_blk_counter + 1;
+                        q5_blk_valid <= 0;  // clear so next block can re-pulse
                         timeout_cnt <= 0;
                         if (q5_blk_counter == 55) begin
+                            q5_unpack_word <= 0;
                             state <= Q5_READ_RES;
                         end else begin
                             state <= Q5_BLOCK_COMPUTE;
@@ -911,10 +1063,13 @@ module hp_fsm_top (
 
                 Q5_READ_RES: begin
                     // Results available directly from core wires
-                    act_buf[0] <= {16'd0, u_q5_core0.res0};
-                    act_buf[1] <= {16'd0, u_q5_core0.res1};
-                    act_buf[2] <= {16'd0, u_q5_core1.res0};
-                    act_buf[3] <= {16'd0, u_q5_core1.res1};
+                    act_buf[0] <= {16'd0, q5_core0_res0};
+                    act_buf[1] <= {16'd0, q5_core0_res1};
+                    act_buf[2] <= {16'd0, q5_core1_res0};
+                    act_buf[3] <= {16'd0, q5_core1_res1};
+                    // Debug capture: core1 acc values
+                    reg_q5_dbg_cap2 <= {q5_core1_res1[31:0]};  // row 3 low 32 bits
+                    reg_q5_dbg_cap3 <= {q5_core1_res1[47:32], q5_core1_res0[15:0]};
                     byte_idx <= 0;
                     state <= WRITE_RES;
                 end
@@ -1106,7 +1261,7 @@ module hp_fsm_top (
 
                 DONE: begin
                     reg_status[15] <= 1'b0;
-                    if (reg_start) begin
+                    if (reg_start_rise) begin
                         reg_status[15:8] <= 0;
                         reg_desc_head <= 0;
                         desc_addr <= reg_desc_base;
@@ -1118,7 +1273,7 @@ module hp_fsm_top (
                     reg_status[15] <= 1'b0;
                     reg_act_info[4:0] <= timeout_src;  // expose source state
                     // Stay here until reg_start re-triggers
-                    if (reg_start) begin
+                    if (reg_start_rise) begin
                         reg_status[15:8] <= 0;
                         reg_desc_head <= 0;
                         desc_addr <= reg_desc_base;
@@ -1151,6 +1306,17 @@ module hp_fsm_top (
             reg_q8_debug[16:11] <= q8_core_k;         // Q8 core's column counter
             reg_q8_debug[10:7]  <= {copy_act_idx[1:0], q8_sc_we, sc_byte_idx[0]};
             reg_q8_debug[6:0]   <= wt_byte_idx[6:0];
+
+            reg_q5_debug[31:27] <= state;
+            reg_q5_debug[26]    <= rd_unpack_active;
+            reg_q5_debug[25]    <= q5_blk_valid;
+            reg_q5_debug[24]    <= q5_any_busy;
+            reg_q5_debug[23]    <= q5_busy_both;
+            reg_q5_debug[22]    <= q5_done0;
+            reg_q5_debug[21]    <= q5_done1;
+            reg_q5_debug[20:15] <= {2'b0, q5_unpack_word[3:0]};
+            reg_q5_debug[14:9]  <= q5_blk_counter;
+            reg_q5_debug[7:0]   <= rd_beat_cnt;      // read master AXI beats received
         end
     end
 
@@ -1187,12 +1353,13 @@ module hp_fsm_top (
 
             if (aw_got && w_got && !bvalid_r) begin
                 bvalid_r <= 1; bresp_r <= 0;
-     case (awaddr_r[15:0])
-          0:       reg_start     <= wdata_r[0];
-          16'h10:  reg_q8_num_groups <= wdata_r[3:0];
-          16'h18:  reg_desc_base <= wdata_r;
-          16'h1C:  reg_desc_tail <= wdata_r;
-      endcase
+      case (awaddr_r[15:0])
+           0:       reg_start     <= wdata_r[0];
+           16'h10:  reg_q8_num_groups <= wdata_r[3:0];
+           16'h18:  reg_desc_base <= wdata_r;
+           16'h1C:  reg_desc_tail <= wdata_r;
+           16'h4C:  reg_q5_dbg_trig <= wdata_r;  // [15:10]=trig_blk, [0]=arm
+       endcase
                 aw_got <= 0; w_got <= 0;
             end
             if (bvalid_r && s_axil_bready) bvalid_r <= 0;
@@ -1228,7 +1395,25 @@ module hp_fsm_top (
                          16'h34:  s_axil_rdata <= reg_act_info;
                          16'h38:  s_axil_rdata <= reg_desc_info;
                   16'h3C:  s_axil_rdata <= reg_q8_debug;
-                          default: s_axil_rdata <= 32'h0;
+                   16'h40:  s_axil_rdata <= reg_q5_debug;
+                   16'h44:  s_axil_rdata <= reg_q5_dbg_cap0;
+                   16'h48:  s_axil_rdata <= reg_q5_dbg_cap1;
+                    16'h4C:  s_axil_rdata <= {q5_core0_d_pre[15:0],       // [31:16] live d_pre
+                                              reg_q5_dbg_trig[15:10],    // [15:10] trigger block
+                                              q5_dbg_frozen,             // [9] frozen
+                                              q5_any_busy,               // [8] busy
+                                              q5_core0_state,            // [7:5] core0 state
+                                              1'b0,                      // [4] reserved
+                                              2'b0,                      // [3:2] reserved
+                                              reg_q5_dbg_trig[0]};       // [0] armed
+                     16'h50:  s_axil_rdata <= reg_q5_dbg_live;
+                     16'h54:  s_axil_rdata <= reg_q5_dbg_cap2;
+                      16'h58:  s_axil_rdata <= reg_q5_dbg_cap3;
+                      16'h5C:  s_axil_rdata <= reg_q5_dbg_cap4;
+                       16'h60:  s_axil_rdata <= reg_q5_dbg_cap5;
+                        16'h64:  s_axil_rdata <= reg_q5_dbg_snap;
+                        16'h68:  s_axil_rdata <= reg_q5_dbg_wi_start;
+                             default: s_axil_rdata <= 32'h0;
                      endcase
                     end
                 end
