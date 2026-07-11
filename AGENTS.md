@@ -38,6 +38,25 @@ Qwen2-0.5B FPGA accelerator targeting Zynq 7010. Multi-core Verilog RTL: INT16×
 
 9. **Q5_0 clean-slate rewrite — per-block wide register interface (2026-07-07):** Completely rewrote both `matmul_q5_0_core.v` and `hp_fsm_top.v` to eliminate byte-at-a-time header loading, `hdr_packed` LUTRAM, and `qs_word`/`blk_num`/`core_id`/`start` ports. The core now receives per-block `blk_d[15:0]`, `blk_qh[31:0]`, `blk_qs[127:0]` via a single `blk_valid` pulse — all fed from a 48-byte DDR burst (12 AXI beats) per block. No LUTRAM for header storage (at most one block's d/qh/qs in the core at a time). Fixed pre-existing `act_r` pipeline bug (off-by-one masked by all-1s test activations). `row_scale` renamed to `row_norm`. FSM states Q5_PRELOAD_HDR/Q5_PRELOAD_HDR_W removed, replaced by Q5_LOAD_NORM/Q5_LOAD_NORM_W (8-byte DDR read for 4 × UQ8.8 norm values). Core results read via hierarchical reference (`u_q5_core0.res0/res1`). DDR layout per block: 48 bytes (core0_d+qh+qs + core1_d+qh+qs + padding). Total: 56 × 48 = 2688 bytes block data + 8 bytes norm = 2696 bytes/tile. All 9 HP FSM dispatch tests PASS.
 
+10. **CPU_OP col_group bug — `col_group` not reset on CPU_OP dispatch (2026-07-11):** The HP FSM's `LOAD_ACT` state always adds `col_group * 128` to `rd_addr` (`hp_fsm_top.v:675`). For Q8 compute, `col_group` is cleared in `LOAD_WEIGHT_W` before transitioning to `LOAD_SCALES`. For CPU_OP (tensor_type=15), the FETCH_DESC dispatch goes directly to `LOAD_ACT` without clearing `col_group`. If the previous descriptor was a multi-group Q8 (e.g., 14 groups), `col_group` retains its last value (e.g., 13), causing CPU_OP's `LOAD_ACT` to read from `act_addr + 13*128` — the wrong DDR address. E9's CPU_OP (which follows a single-group Q8 descriptor) works by accident because Q8 single-group also clears `col_group` in `LOAD_WEIGHT_W`.
+
+    **Test workaround:** Added dummy Q8 single-group chain (`write_desc ... 128 0 0`) before each CPU_OP test to force `col_group=0`. **Proper fix:** Add `col_group <= 0` in the CPU_OP branch of FETCH_DESC dispatch (near `hp_fsm_top.v:642-644`). Also affects Q5_0 path (second descriptor after multi-group Q8) if Q5_0 uses LOAD_ACT for any purpose — current Q5_0 uses Q5_LOAD_NORM/Q5_COPY_ACT/Q5_BLOCK_COMPUTE which don't use `col_group`.
+
+    **Extended HW test suite (11 tests, 2026-07-11):** Designed and verified 10 new edge-case tests covering:
+    - E1: Q8 negative weights (0xFF → -64/row) **PASS**
+    - E2: Q8 scale=0.5 (q8=2, scale=0x0100 → 64/row) **PASS**
+    - E3: Q8 full 14-group (all-1s → 896/row) **PASS**
+    - E4: Q5 negative q5 (qh=0, nibble=1 → -15 → -3,440,640/row) **PASS**
+    - E5: Q5 d=0.5 (d=0x3800 f16=0.5 → 114,688/row) **PASS**
+    - E6: Q5→CPU_OP→Q5 chain (mixed-type transitions) **PASS**
+    - E7: Q8 negative act (act=-1 → -64/row) **PASS**
+    - E8: Q5 negative act (act=-1 → -229,376/row) **PASS**
+    - E9: Mixed Q5→Q8→CPU_OP→Q5 chain (4-desc cross-type) **PASS**
+    - E10: Q5 alternating q5 nibbles (1,2 → 344,064/row) **PASS**
+    - E6a: Standalone CPU_OP passthrough (col_group reset needed) **PASS**
+
+    Debug aids added: pre-chain descriptor dumps with address layout comments, post-chain result + source data dumps, W0/W2 block data comparison. Bugs found during development: descriptor overlap (D2 only 16 bytes after D1 instead of 32), `write_pattern_const` TCL proc accepts byte value (not word).
+
 ## Architecture Summary
 
 ### HP FSM flow (hp_fsm_top.v, Q8 compute path):
@@ -533,14 +552,18 @@ $env:Path = "D:\Program Files\Git\bin;$env:Path"   # git
 # Verilog tests (iVerilog — d:\iVerilog\bin)
 make -C verilog all                     # Q8 + Q4K + Q5_0 + INT16 smoke
 
-# Vivado xsim (C:\Xilinx\Vivado\2023.1\bin\xsim.bat)
+# Vivado xsim
+#   C:\Xilinx\Vivado\2023.1\bin\xsim.bat
 xsim tb_hw_fsm --runall                  # HP FSM descriptor-chain test
 
 # Vivado batch build
-C:\Xilinx\Vivado\2023.1\bin\vivado.bat -mode batch -source vivado_integration/build_bd.tcl
+#   C:\Xilinx\Vivado\2023.1\bin\vivado.bat
+#   (NOT D:\Xilinx — Vivado is installed at C:\Xilinx)
+vivado.bat -mode batch -source vivado_integration/build_bd.tcl
 
 # JTAG load via XSDB (single session: program + init + run + capture)
-C:\Xilinx\Vivado\2023.1\bin\xsdb.bat vivado_integration\sw\run_hp_fsm_comprehensive.tcl
+#   C:\Xilinx\Vivado\2023.1\bin\xsdb.bat
+xsdb.bat vivado_integration\sw\run_hp_fsm_comprehensive.tcl
 
 # NOTE: Power-cycle the board before running ps7_init via XSDB!
 # ps7_pll_init hangs if PLLs are already configured from a prior session.
