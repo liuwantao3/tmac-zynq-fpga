@@ -72,12 +72,17 @@ typedef struct __attribute__((packed)) {
 #define Q8_NUM_GROUPS   14
 #define Q8_GROUP_BYTES  4096
 #define Q8_TILE_WEIGHT_BYTES (Q8_NUM_GROUPS * Q8_GROUP_BYTES)
+#define Q8_GROUP_SCALE_BYTES 256   // 64 × UQ8.8 per group
+#define Q8_TILE_SCALE_BYTES  (Q8_NUM_GROUPS * Q8_GROUP_SCALE_BYTES)
+#define Q8_TILE_STRIDE       (Q8_TILE_WEIGHT_BYTES + Q8_TILE_SCALE_BYTES) // 14 × 4352 = 60928
 
 // Q5_0 tile constants
-#define Q5_TILE_ROWS    4
-#define Q5_TILE_BLOCKS  224
-#define Q5_TILE_BYTES   4928
-#define Q5_TILE_TOTAL   4936
+#define Q5_TILE_ROWS        4
+#define Q5_TILE_BLOCKS      56   // FPGA blocks per tile (28/row × 2 rows per core)
+#define Q5_BLOCK_SIZE       48   // bytes per FPGA block (2 GGUF blocks × 22 + 4 pad)
+#define Q5_TILE_BYTES       2688 // 56 × 48
+#define Q5_TILE_NORM_OFFSET 2688 // norm follows block data
+#define Q5_TILE_TOTAL       2696 // 2688 + 8 bytes norm
 
 // ===== Tensor Table Entry =====
 typedef struct {

@@ -10,10 +10,12 @@ SECTIONS
     .text : {
         KEEP(*(.text.boot))
         *(.text*)
+        *(.text.*)
     } > DDR
 
     .rodata : {
         *(.rodata*)
+        *(.rodata.*)
     } > DDR
 
     .data : {
@@ -37,7 +39,9 @@ SECTIONS
 
     /DISCARD/ : {
         *(.ARM.exidx*)
+        *(.ARM.extab*)
         *(.comment*)
         *(.note*)
+        *(.debug*)
     }
 }

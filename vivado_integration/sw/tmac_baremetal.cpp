@@ -215,13 +215,6 @@ static void cpu_matmul(const Tensor* A, const float* x, float* y, int rows, int 
 //
 // For the first implementation, process one 64-row tile at a time
 // (build one descriptor, run, read results, dequantize, repeat).
-#define Q8_TILE_ROWS    64
-#define Q8_TILE_COLS    896
-#define Q8_GROUP_COLS   64
-#define Q8_NUM_GROUPS   14
-#define Q8_GROUP_BYTES  4096   // 64×64 INT8 = 4096 bytes
-#define Q8_TILE_WEIGHT_BYTES (Q8_NUM_GROUPS * Q8_GROUP_BYTES)  // 57344
-
 // Pre-process one Q8_0 tile: extract INT8 from Q8 blocks to FPGA format.
 // fpga_wt: output buffer (14336 bytes for 14 groups × 1024 bytes)
 // Actually Q8_GROUP_BYTES=4096 (512 × 64-bit words), so 14×4096=57344.
@@ -258,6 +251,17 @@ static void q8_preprocess_tile(const Tensor* A, int row0, uint8_t* fpga_wt) {
             }
         }
     }
+
+    // Write per-column scales (all 1.0 = 0x0100 UQ8.8) at offset Q8_TILE_WEIGHT_BYTES.
+    // The C post-processing in fpga_q8_tile handles the real dequantization via
+    // row_inv and x_scale; smem scales in the FPGA are no-ops for now.
+    uint8_t* scale_out = fpga_wt + Q8_TILE_WEIGHT_BYTES;
+    for (int g = 0; g < Q8_NUM_GROUPS; g++) {
+        for (int c = 0; c < Q8_GROUP_COLS; c++) {
+            scale_out[g * Q8_GROUP_SCALE_BYTES + c * 2 + 0] = 0x00;
+            scale_out[g * Q8_GROUP_SCALE_BYTES + c * 2 + 1] = 0x01; // 0x0100 LE = 1.0
+        }
+    }
 }
 
 // Row_inv computation for Q8_0 tile: 32767/max_abs for each of 64 rows
@@ -282,7 +286,7 @@ static void fpga_q8_tile(const uint8_t* fpga_wt, const int16_t* x_q,
                          const float* row_inv, int nrows)
 {
     // Format: one descriptor per tile
-    // weight_addr points to pre-processed weight data (57344 bytes)
+    // weight_addr points to pre-processed weight data + scales (Q8_TILE_STRIDE bytes)
     // act_addr points to INT16 activations (1792 bytes = 896×2)
     // result_addr points to 64×8 = 512 bytes output
 
@@ -291,8 +295,8 @@ static void fpga_q8_tile(const uint8_t* fpga_wt, const int16_t* x_q,
     uint32_t act_addr = FPGA_ACT_BUF;
     uint32_t res_addr = FPGA_RES_BUF;
 
-    // 1. Write weight data to scratch
-    memcpy((void*)(uintptr_t)wt_addr, fpga_wt, Q8_TILE_WEIGHT_BYTES);
+    // 1. Write weight data + scales to scratch
+    memcpy((void*)(uintptr_t)wt_addr, fpga_wt, Q8_TILE_STRIDE);
 
     // 2. Write activations
     memcpy((void*)(uintptr_t)act_addr, x_q, Q8_TILE_COLS * 2);
@@ -338,14 +342,18 @@ static void fpga_q8_tile(const uint8_t* fpga_wt, const int16_t* x_q,
 }
 
 // ---- Q5_0 FPGA Path via HP descriptor chain ----
-// Q5_0 tile: 4 rows × 896 cols = 224 blocks × 22 bytes = 4928 bytes
-// Weight data at weight_addr: 224 Q5_0 blocks (22 bytes each)
-// Row_inv at weight_addr + 4928: 4 × uint16_t (UQ16.8)
+// Each tile: 4 rows × 896 cols = 56 FPGA blocks (48 bytes each, interleaved)
+// FPGA block format (48 bytes):
+//   [0:1]   core0_d[15:0]  (GGUF f16 scale for core0's current row+block)
+//   [2:5]   core0_qh[31:0]
+//   [6:21]  core0_qs[127:0]
+//   [22:23] core1_d[15:0]  (GGUF f16 scale for core1's current row+block)
+//   [24:27] core1_qh[31:0]
+//   [28:43] core1_qs[127:0]
+//   [44:47] padding
+// Blocks 0-27 → row0/core0, row2/core1. Blocks 28-55 → row1/core0, row3/core1.
+// Norm (4 × UQ8.8 LE uint16) at tile offset 2688 (8 bytes).
 // Result: 4 rows × 8 bytes each = 32 bytes
-#define Q5_TILE_ROWS    4
-#define Q5_TILE_BLOCKS  224   // 4 × 28 blocks per row
-#define Q5_TILE_BYTES   4928  // 224 × 22
-#define Q5_TILE_TOTAL   4936  // 4928 + 8 bytes row_inv
 
 static void fpga_q5_0_tile(const Tensor* A, int row0, const int16_t* x_q,
                            float* y, float x_scale)
@@ -357,22 +365,43 @@ static void fpga_q5_0_tile(const Tensor* A, int row0, const int16_t* x_q,
 
     int cols = (int)A->cols;
     int stride_blocks = cols / 32;  // 28 for 896
+    int nrows = Q5_TILE_ROWS;
+    if (row0 + nrows > (int)A->rows) nrows = (int)A->rows - row0;
 
-    // 1. Copy Q5_0 blocks + row_inv to weight scratch buffer
-    for (int r = 0; r < Q5_TILE_ROWS && (row0 + r) < (int)A->rows; r++) {
-        int row = row0 + r;
-        uint64_t base_block = (uint64_t)row * stride_blocks;
-        for (int bi = 0; bi < stride_blocks; bi++) {
-            uint64_t src_off = (base_block + bi) * 22;
-            int dst_off = r * stride_blocks * 22 + bi * 22;
-            memcpy((void*)(uintptr_t)(wt_addr + dst_off),
-                   A->data + src_off, 22);
+    // 1. Generate 56 FPGA blocks (48 bytes each) from GGUF 22-byte blocks
+    // Interleave: blocks 0-27 use tile rows (0,2); blocks 28-55 use tile rows (1,3)
+    for (int bi = 0; bi < Q5_TILE_BLOCKS; bi++) {
+        int group = bi / 28;                    // 0 or 1 (within-tile row group)
+        int blk_in_row = bi % 28;               // block index within row (0..27)
+        int core0_model_row = row0 + group;      // core0 row for this FPGA block
+        int core1_model_row = row0 + 2 + group;  // core1 row for this FPGA block
+
+        uint8_t* fpga_blk = (uint8_t*)(uintptr_t)(wt_addr + bi * Q5_BLOCK_SIZE);
+
+        // Core0's GGUF block
+        if (core0_model_row < (int)A->rows) {
+            uint64_t src_off = ((uint64_t)core0_model_row * stride_blocks + blk_in_row) * 22;
+            memcpy(fpga_blk, A->data + src_off, 22);
+        } else {
+            memset(fpga_blk, 0, 22);
         }
+
+        // Core1's GGUF block
+        if (core1_model_row < (int)A->rows) {
+            uint64_t src_off = ((uint64_t)core1_model_row * stride_blocks + blk_in_row) * 22;
+            memcpy(fpga_blk + 22, A->data + src_off, 22);
+        } else {
+            memset(fpga_blk + 22, 0, 22);
+        }
+
+        // Zero padding
+        memset(fpga_blk + 44, 0, 4);
     }
 
-    // Compute row_inv (UQ16.8 format)
-    float ri[Q5_TILE_ROWS];
-    for (int r = 0; r < Q5_TILE_ROWS && (row0 + r) < (int)A->rows; r++) {
+    // Compute row_norm (UQ8.8) for each of the 4 rows
+    // norm_val = 32767 / max_abs, stored as uint16 LE (UQ8.8 format)
+    float ri[4];
+    for (int r = 0; r < nrows; r++) {
         float max_abs = 0.0f;
         int row = row0 + r;
         for (int bi = 0; bi < stride_blocks; bi++) {
@@ -389,11 +418,17 @@ static void fpga_q5_0_tile(const Tensor* A, int row0, const int16_t* x_q,
                 if (ab > max_abs) max_abs = ab;
             }
         }
+        // For out-of-range rows, use 1.0 norm (weights are zeroed, contributes nothing)
         max_abs = (max_abs < 1e-10f) ? 1.0f : max_abs;
         ri[r] = 32767.0f / max_abs;
-        // Write UQ16.8 to scratch
-        uint16_t uq = (uint16_t)(ri[r] * 256.0f + 0.5f);
-        memcpy((void*)(uintptr_t)(wt_addr + Q5_TILE_BYTES + r * 2), &uq, 2);
+    }
+
+    // Write norm values at tile offset 2688 (4 × UQ8.8 LE uint16)
+    for (int r = 0; r < 4; r++) {
+        uint16_t uq = (uint16_t)(ri[r < nrows ? r : 0] * 256.0f + 0.5f);
+        uint8_t* dst = (uint8_t*)(uintptr_t)(wt_addr + Q5_TILE_NORM_OFFSET + r * 2);
+        dst[0] = uq & 0xFF;
+        dst[1] = (uq >> 8) & 0xFF;
     }
 
     // 2. Write activations
@@ -427,8 +462,6 @@ static void fpga_q5_0_tile(const Tensor* A, int row0, const int16_t* x_q,
 
     // 6. Read results (48-bit signed in 64-bit words, zero-extended)
     uint32_t* res32 = (uint32_t*)(uintptr_t)res_addr;
-    int nrows = Q5_TILE_ROWS;
-    if (row0 + nrows > (int)A->rows) nrows = (int)A->rows - row0;
     for (int i = 0; i < nrows; i++) {
         uint32_t lo = res32[i * 2];
         uint32_t hi = res32[i * 2 + 1];

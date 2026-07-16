@@ -562,13 +562,13 @@ set E6_R2  [expr $E6_A2 + 1792]
 
 fill_q5_weight $E6_W0 1
 fill_q5_norms $E6_W0
-fill_q5_act $E6_A0 1
+fill_q5_acts $E6_A0 1
 zero_fill $E6_R0 32
 write_pattern_const $E6_CPU 64 0xA5
 zero_fill $E6_R1 64
 fill_q5_weight $E6_W2 1
 fill_q5_norms $E6_W2
-fill_q5_act $E6_A2 1
+fill_q5_acts $E6_A2 1
 zero_fill $E6_R2 32
 write_desc $E6_D0 $E6_D1 $E6_W0 $E6_A0 $E6_R0 1792 1
 write_desc_cpu $E6_D1 $E6_D2 $E6_CPU $E6_R1 64
@@ -675,39 +675,49 @@ set E9_Q5W2 [expr $E9_CPUR + 64]
 set E9_Q5A2 [expr $E9_Q5W2 + 2696]
 set E9_Q5R2 [expr $E9_Q5A2 + 1792]
 
-fill_q5_weight $E9_Q5W0 1
-fill_q5_norms   $E9_Q5W0
-fill_q5_acts    $E9_Q5A0 1
-zero_fill $E9_Q5R0 32
+puts "  Writing E9 data..."
+fill_q5_weight $E9_Q5W0 1;     puts "  Q5W0 done"
+fill_q5_norms   $E9_Q5W0;      puts "  norms0 done"
+fill_q5_acts    $E9_Q5A0 1;    puts "  acts0 done"
+zero_fill $E9_Q5R0 32;         puts "  res0 done"
 
-write_pattern_const $E9_Q8W 4096 0x01
-fill_q8_scales_const $E9_Q8S 1 0x0100
-fill_q8_acts_const $E9_Q8A 1 1
-zero_fill $E9_Q8R 512
+write_pattern_const $E9_Q8W 4096 0x01; puts "  Q8W done"
+fill_q8_scales_const $E9_Q8S 1 0x0100; puts "  Q8S done"
+fill_q8_acts_const $E9_Q8A 1 1;        puts "  Q8A done"
+zero_fill $E9_Q8R 512;                 puts "  Q8R done"
 
-write_pattern_const $E9_CPU 64 0x5A
-zero_fill $E9_CPUR 64
+write_pattern_const $E9_CPU 64 0x5A;   puts "  CPU src done"
+zero_fill $E9_CPUR 64;                 puts "  CPU res done"
 
-fill_q5_weight $E9_Q5W2 0             ;# q5=0 → all-0s
-fill_q5_norms   $E9_Q5W2
-fill_q5_acts    $E9_Q5A2 1
-zero_fill $E9_Q5R2 32
+fill_q5_weight $E9_Q5W2 0;             puts "  Q5W2 done"
+fill_q5_norms   $E9_Q5W2;              puts "  norms2 done"
+fill_q5_acts    $E9_Q5A2 1;            puts "  acts2 done"
+zero_fill $E9_Q5R2 32;                 puts "  res2 done"
 
 write_desc $E9_D0 $E9_D1 $E9_Q5W0 $E9_Q5A0 $E9_Q5R0 1792 1
 write_desc $E9_D1 $E9_D2 $E9_Q8W  $E9_Q8A  $E9_Q8R  128  0 1
 write_desc_cpu $E9_D2 $E9_D3 $E9_CPU  $E9_CPUR 64
 write_desc $E9_D3 0      $E9_Q5W2 $E9_Q5A2 $E9_Q5R2 1792 1
 
+# Pre-chain descriptor verification
+puts "  Pre-chain E9 descriptors:"
+for {set i 0} {$i < 8} {incr i} { set v [read32 [expr $E9_D0 + $i*4]]; puts "    D0[$i]=[format 0x%08x $v]" }
+for {set i 0} {$i < 8} {incr i} { set v [read32 [expr $E9_D1 + $i*4]]; puts "    D1[$i]=[format 0x%08x $v]" }
+for {set i 0} {$i < 8} {incr i} { set v [read32 [expr $E9_D2 + $i*4]]; puts "    D2[$i]=[format 0x%08x $v]" }
+for {set i 0} {$i < 8} {incr i} { set v [read32 [expr $E9_D3 + $i*4]]; puts "    D3[$i]=[format 0x%08x $v]" }
+after 100
+
 if {[run_chain $E9_D0 4]} {
     set s9_0 [verify_q5_result $E9_Q5R0 4 229376 E9a]
     set s9_1 [verify_q8_result $E9_Q8R  64 64     E9b]
-    # note: verify_q8_result already printed PASS; E9 overall PASS uses s9_1
     set s9_cpu 1
     for {set j 0} {$j < 16} {incr j} {
         set got [read32 [expr $E9_CPUR + $j * 4]]
         if {$got != 0x5A5A5A5A} { puts "  FAIL(E9c): CPU_OP word $j got [format 0x%08x $got] expected 0x5A5A5A5A"; set s9_cpu 0 }
     }
-    set s9_3 [verify_q5_result $E9_Q5R2 4 0 E9d]
+    # E9_D3: nibble=0, qh=0xFFFFFFFF → q5=-16, d=1.0, norm=1.0, act=1
+    # Each element = 256 × (-16) × 1 = -4096, 896 elements = -3670016
+    set s9_3 [verify_q5_result $E9_Q5R2 4 -3670016 E9d]
     if {$s9_0 && $s9_1 && $s9_cpu && $s9_3} { puts "  Test E9: PASS"; incr pass_count } else { incr fail_count }
 } else { puts "  Test E9: TIMEOUT"; incr fail_count }
 

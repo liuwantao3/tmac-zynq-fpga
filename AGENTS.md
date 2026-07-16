@@ -52,11 +52,11 @@ Qwen2-0.5B FPGA accelerator targeting Zynq 7010. Multi-core Verilog RTL: INT16×
 
 12. **Bitstream rebuild (2026-07-12):** Vivado build completed (route_design: 1:39, total: ~8 min). WNS=-0.360 ns (4 failing endpoints). BRAM18: 33→10 (Q5_0 clean-slate rewrite eliminated 14, Q8 smem/act LUTRAM saved 9). Slice LUTs: 9,898→9,066. LUT as Memory: 97→177. Slice Regs: 12,781→14,052. DSP48E1: 22→23. All 5 `test_fpga_cores` HW tests PASS. Comprehensive HW tests: Tests 1-8 PASS, Tests 9a (Q8 multi-group) and 10 (Q8 multi-tile) FAIL (pre-existing from Q5_0 clean-slate rewrite on 2026-07-07 — those paths weren't re-tested after rewrite).
 
-    **Debug session (2026-07-12): Test 9a and 10 diagnosis on hardware.** Found both were test-data layout bugs, not RTL issues:
+    **Debug session (2026-07-12): Test 9a and 10 diagnosis on hardware.** Found Test 9a was a test-data layout bug; Test 10 had TWO bugs:
 
     - **Test 9a fix (verified PASS on HW):** `write_pattern_const $Q9_WEIGHT_ADDR 4096 0x01` → `[expr $Q9_NUM_GROUPS * 4096]`. Multi-group FSM reads group 1 weights from `weight_addr + 4096` — only 4096 bytes were written, so group 1's weight load read scale data instead (which happened to follow the weight region in DDR). Fixed by writing `num_groups × 4096` bytes for multi-group tests. Result: all 64 rows = 128.
-    - **Test 10 DDR address collision fix:** `Q10_ACT_ADDR=0x00109000` collided with tile 0 scales at `Q10_WEIGHT_ADDR+4096=0x00109000`. `Q10_RES_ADDR=0x0010A000` collided with tile 1 scales at `weight_addr+tile_stride+4096=0x0010A100`. Fixed: act→`0x0010C000`, result→`0x0010B000`.
-    - **Test 10 still FAILS after fix:** Tile 1 is correct (all 64 rows = 64). Tile 0 shows alternating banks: even banks (0,2,4,6) = `0xfff7fbc0` (-525,376 S24.8), odd banks (1,3,5,7) = 0. Root cause unknown — static analysis of RTL shows correct wmem loading, act loading, accumulator clearing, and read paths. No RTL changes made; root cause not yet identified.
+    - **Test 10 bug 1 (DDR address collision, harmless):** `Q10_ACT_ADDR=0x00109000` collided with tile 0 scales at `Q10_WEIGHT_ADDR+4096=0x00109000`. Fixed: act→`0x0010C000`, result→`0x0010B000`.
+    - **Test 10 bug 2 (RTL, root cause):** `col_group` was not reset in the Q8 FETCH_DESC dispatch path (`hp_fsm_top.v:689`). After Test 9a's multi-group iteration left `col_group=1`, Test 10's tile 0 loaded weights/scales/acts from wrong DDR offsets (`weight_addr + col_group*4096` instead of `weight_addr`). Same bug class as CPU_OP col_group issue (Key Decision #10). Fix: added `col_group <= 0` in Q8 dispatch. Verified PASS on HW: all 128 rows = 64.
 
     **Extended HW test suite (11 tests, 2026-07-11):** Designed and verified 10 new edge-case tests covering:
     - E1: Q8 negative weights (0xFF → -64/row) **PASS**
@@ -72,6 +72,8 @@ Qwen2-0.5B FPGA accelerator targeting Zynq 7010. Multi-core Verilog RTL: INT16×
     - E6a: Standalone CPU_OP passthrough (col_group reset needed) **PASS**
 
     Debug aids added: pre-chain descriptor dumps with address layout comments, post-chain result + source data dumps, W0/W2 block data comparison. Bugs found during development: descriptor overlap (D2 only 16 bytes after D1 instead of 32), `write_pattern_const` TCL proc accepts byte value (not word).
+
+13. **Q8 col_group stale in FETCH_DESC dispatch — Test 10 RTL fix (2026-07-16):** `col_group` was not reset in the Q8 FETCH_DESC dispatch path (`hp_fsm_top.v:689`). After a multi-group descriptor left `col_group=1`, the next descriptor in the chain (even a single-group one) loaded weights/scales/acts from wrong DDR offsets. Caused Test 10 tile 0 to fail with alternating bank corruption. Fix: `col_group <= 0` added to Q8 dispatch. Same class as CPU_OP col_group bug (Key Decision #10). All 10 comprehensive HW tests now PASS.
 
 ## Architecture Summary
 
@@ -323,7 +325,7 @@ All 4 Q5_0 HP FSM tests now PASS (previously all 4 FAILED with X in acc). No mor
     
     **Result:** Q8 core BRAM drops from 17→8 (wmem only). Total system BRAM ~10 (Q8 8 + Q5_0 2). LUTRAM increases ~128 (smem) + 16 (act) = +144 LUTRAM (3.3% of 4,400 capacity, well within budget). All 123 core simulation tests PASS: Q8 6/6, Q4K 4/4, Q6_K 97/97, HP FSM 7/7, HP FSM Q5_0 9/9. INT16 smoke pre-existing fail (unrelated wmem addressing). Q5_0 standalone testbench pre-existing compile error (old port interface, not updated for per-block rewrite).
 
-## Current Status (2026-07-12) — CPU_OP interrupt protocol
+## Current Status (2026-07-16) — All 10 comprehensive HW tests PASS
 
 | Resource | Used | Available | % | Notes |
 |----------|------|-----------|---|-------|
@@ -338,25 +340,23 @@ All 4 Q5_0 HP FSM tests now PASS (previously all 4 FAILED with X in acc). No mor
 
 **Bitstream sources:** `axihp_read_master.v` + `axihp_write_master.v` + `matmul_q8_core.v` + `matmul_q5_0_core.v` + `hp_fsm_top.v`
 
-**Hardware tests (2026-07-12):**
-- `test_fpga_cores.elf`: 5/5 PASS (Q8 all-1s, Q8 all(-1)s, Q5 val=1/0/-1)
-- Comprehensive Tests 1-8: PASS (DMA, Q8 single-group)
-- Tests 9a (Q8 multi-group) and 10 (Q8 multi-tile): FAIL (pre-existing since Q5_0 rewrite)
-- **Test 9a fix (2026-07-12):** `write_pattern_const $Q9_WEIGHT_ADDR 4096 0x01` → `[expr $Q9_NUM_GROUPS * 4096]` — multi-group FSM reads group 1 weights from `weight_addr + 4096`, was only 4096 bytes written so group 1 loaded scale data as weights. Scales moved to after all weight data.
-- **Test 10 fix (2026-07-12):** `Q10_ACT_ADDR=0x00109000` collided with tile 0 scales at `Q10_WEIGHT_ADDR+4096=0x00109000`. Result at `0x0010A000` collided with tile 1 scales at `weight_addr+tile_stride+4096=0x0010A100`. Fixed: act→`0x0010C000`, result→`0x0010B000`. Both are test-data layout bugs, no RTL changes needed.
-- **Test 9a verified PASS on HW** (all 64 rows = 128) after fix.
-- **Test 10 still FAILS** after address fix: tile 1 correct (64/row), tile 0 shows alternating banks — even = `0xfff7fbc0` (-525,376), odd = 0. Root cause unknown (see analysis below).
-- CPU_OP interrupt test: pending
+**Hardware tests (2026-07-16): ALL 10 TESTS PASS**
+| Test | Description | Result |
+|------|------------|--------|
+| 1 | Basic 64-byte DMA | PASS |
+| 2 | Minimum 8-byte DMA | PASS |
+| 3 | 128-byte 2-burst DMA | PASS |
+| 4 | 256-byte 4-burst DMA | PASS |
+| 5 | Chain of 2 descriptors | PASS |
+| 6 | Chain of 3 descriptors | PASS |
+| 7 | Re-start from DONE | PASS |
+| 8 | Q8 compute (all-1s, 64×64) | PASS (all 64 rows = 64) |
+| 9a | Q8 multi-group 64×128 (2 groups) | PASS (all 64 rows = 128) |
+| 10 | Q8 multi-tile 2×64 rows | PASS (all 128 rows = 64) |
 
-**q8_act_we stuck-at-1 bug found (2026-07-12):** `q8_act_we` is set to 1 in `COPY_ACT_TO_CORE` (line 1110) but never explicitly cleared in `COMPUTE`, `COMPUTE_W`, `READ_RES`, or `READ_RES_ACC` states. Causes `act_bram[63]` to be continuously overwritten during compute. However, the write value is the correct activation 63 (all 1s), so this does not explain the Tile 0 failure. **Still recommended to fix** (add `q8_act_we <= 0` to COMPUTE).
+**Root cause of Test 10 tile 0 failure:** `col_group` not reset in Q8 FETCH_DESC dispatch (`hp_fsm_top.v:689`). After Test 9a's multi-group iteration left `col_group=1`, Test 10's tile 0 loaded weights from `weight_addr + 1×4096` (scale data), scales from `weight_addr + 4096 + 256` (tile 1 weight data), and acts from `act_addr + 128` (uninitialized DDR). Fixed by adding `col_group <= 0` in the Q8 dispatch. Same bug class as CPU_OP col_group issue (Key Decision #10, 2026-07-11).
 
-**Test 10 tile 0 failure analysis (2026-07-12, incomplete):**
-- Data layout verified correct: weights=all-1s at `0x00108000`, scales=`0x0100` at `0x00108000+tile_stride`, acts=all-1s at `0x0010C000`, FSM REG_DEBUG=0x38000000 (state=DONE)
-- Tile 1 produces correct 64/row for all 64 rows, proving compute pipeline, accumulator, activation path, and result readback work correctly
-- Tile 0 alternating bank pattern (even= -525,376, odd=0) suggests possible CLEAR_ACC issue, stale wmem/smem data, or a timing hazard specific to the first tile's initialization
-- No RTL changes were made — same 2026-07-12 bitstream
-- Static analysis of multi-tile transition (hp_fsm_top.v lines 1261-1272) shows correct reset of `wt_byte_idx`, `sc_remaining`, `act_remaining`, `col_group`, and proper sequencing of LOAD_WEIGHT→LOAD_SCALES→LOAD_ACT→COPY_ACT_TO_CORE→COMPUTE for each tile
-- **Needed:** HW re-run with FSM register dumps at each tile transition (REG_DEBUG, REG_Q8_DEBUG), weight/scale/act data verification for tile 0 DDR region, and CLEAR_ACC firing check
+**q8_act_we stuck-at-1 bug (cosmetic):** `q8_act_we` set in `COPY_ACT_TO_CORE` never cleared in `COMPUTE`/`COMPUTE_W`/`READ_RES`. Overwrites `act_bram[63]` during compute. Harmless with uniform activations but should be fixed.
 
 **Simulation (iVerilog):** All 18 HP FSM tests PASS (8 comprehensive + 10 Q5_0 dispatch, includes backward compat verification).
 

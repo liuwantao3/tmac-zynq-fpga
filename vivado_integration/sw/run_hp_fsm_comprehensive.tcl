@@ -469,13 +469,13 @@ set Q9_DESC_ADDR    0x00100280
 set Q9_NUM_GROUPS 2
 set Q9_EXPECTED [expr 64 * $Q9_NUM_GROUPS]
 
-# Weight: all INT8 = 1 (same 4096 bytes as Test 8)
-write_pattern_const $Q9_WEIGHT_ADDR 4096 0x01
+# Weight: all INT8 = 1 (num_groups × 4096 bytes — group 1 loads from weight_addr + 4096)
+write_pattern_const $Q9_WEIGHT_ADDR [expr $Q9_NUM_GROUPS * 4096] 0x01
 
-# Scales: ${Q9_NUM_GROUPS} groups × 256 bytes, all UQ8.8 1.0 = 0x0100
+# Scales: after ALL weight data, all UQ8.8 1.0 = 0x0100
 set sc_pair [expr {0x0100 | (0x0100 << 16)}]
 for {set g 0} {$g < $Q9_NUM_GROUPS} {incr g} {
-    set grp_scale_addr [expr $Q9_WEIGHT_ADDR + 4096 + $g * 256]
+    set grp_scale_addr [expr $Q9_WEIGHT_ADDR + $Q9_NUM_GROUPS * 4096 + $g * 256]
     for {set j 0} {$j < 64} {incr j} {
         write32 [expr $grp_scale_addr + $j * 4] $sc_pair
     }
@@ -544,8 +544,8 @@ puts "\n--- Test 10: Q8 multi-tile 2 tiles (all-1s) ---"
 
 set Q10_DESC_ADDR    0x001002A0
 set Q10_WEIGHT_ADDR  0x00108000
-set Q10_ACT_ADDR     0x00109000
-set Q10_RES_ADDR     0x0010A000
+set Q10_ACT_ADDR     0x0010C000
+set Q10_RES_ADDR     0x0010B000
 set Q10_NUM_TILES    2
 set Q10_GROUPS       1
 set Q10_TILE_STRIDE  [expr 4096 + $Q10_GROUPS * 256]
@@ -578,8 +578,42 @@ zero_fill $Q10_RES_ADDR 1024
 # Descriptor: tensor_type=0, 1 group, 2 tiles, act_total_bytes=128
 write_desc $Q10_DESC_ADDR 0 $Q10_WEIGHT_ADDR $Q10_ACT_ADDR $Q10_RES_ADDR 128 0 $Q10_GROUPS $Q10_NUM_TILES
 
+# --- Debug: dump descriptor and tile data before chain ---
+puts "  Descriptor at [format 0x%08x $Q10_DESC_ADDR]:"
+puts "    word0 (next_addr) = [format 0x%08x [read32 $Q10_DESC_ADDR]]"
+puts "    word1 (weight)    = [format 0x%08x [read32 [expr $Q10_DESC_ADDR + 4]]]"
+puts "    word2 (act)       = [format 0x%08x [read32 [expr $Q10_DESC_ADDR + 8]]]"
+puts "    word3 (result)    = [format 0x%08x [read32 [expr $Q10_DESC_ADDR + 12]]]"
+puts "    word4 (type)      = [format 0x%08x [read32 [expr $Q10_DESC_ADDR + 16]]]"
+puts "    word5 (grp+tiles) = [format 0x%08x [read32 [expr $Q10_DESC_ADDR + 20]]]"
+puts "    word6 (bytes)     = [format 0x%08x [read32 [expr $Q10_DESC_ADDR + 24]]]"
+puts "  Tile 0 weights[0:3]: [read32 $Q10_WEIGHT_ADDR] [read32 [expr $Q10_WEIGHT_ADDR+4]] [read32 [expr $Q10_WEIGHT_ADDR+8]] [read32 [expr $Q10_WEIGHT_ADDR+12]]"
+puts "  Tile 0 scales[0:3]: [read32 [expr $Q10_WEIGHT_ADDR+4096]] [read32 [expr $Q10_WEIGHT_ADDR+4100]] [read32 [expr $Q10_WEIGHT_ADDR+4104]] [read32 [expr $Q10_WEIGHT_ADDR+4108]]"
+puts "  Activations[0:3]:   [read32 $Q10_ACT_ADDR] [read32 [expr $Q10_ACT_ADDR+4]] [read32 [expr $Q10_ACT_ADDR+8]] [read32 [expr $Q10_ACT_ADDR+12]]"
+
 if {[run_chain $Q10_DESC_ADDR 1]} {
     set ok 1
+
+    # --- Debug: dump FSM registers ---
+    set dbg [gp0_read $REG_DEBUG]
+    set q8_dbg [gp0_read $REG_Q8_DEBUG]
+    set act_info [gp0_read $REG_ACT_INFO]
+    set desc_info [gp0_read $REG_DESC_INFO]
+    puts "  FSM: REG_DEBUG=[format 0x%08x $dbg] REG_Q8_DEBUG=[format 0x%08x $q8_dbg]"
+    puts "  FSM: REG_ACT_INFO=[format 0x%08x $act_info] REG_DESC_INFO=[format 0x%08x $desc_info]"
+
+    # --- Debug: dump first 8 result rows from both tiles ---
+    for {set t 0} {$t < 2} {incr t} {
+        set base [expr $Q10_RES_ADDR + $t * 512]
+        puts "  Tile $t result dump (rows 0-7):"
+        for {set j 0} {$j < 8} {incr j} {
+            set addr [expr $base + $j * 8]
+            set lo [read32 $addr]
+            set hi [read32 [expr $addr + 4]]
+            puts "    row [expr $t*64+$j]: lo=[format 0x%08x $lo] hi=[format 0x%08x $hi]"
+        }
+    }
+
     # Verify tile 0 (rows 0-63)
     for {set j 0} {$j < 64} {incr j} {
         set addr [expr $Q10_RES_ADDR + $j * 8]

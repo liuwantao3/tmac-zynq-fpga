@@ -140,7 +140,8 @@ set status [gp0_read 0x14]
 set debug  [gp0_read 0x28]
 set q8dbg  [gp0_read 0x3C]
 set clk    [gp0_read 0x2C]
-puts "  STATUS=0x[format %04X $status] DEBUG=0x[format %08X $debug] Q8DBG=0x[format %08X $q8dbg] CLK=[format %08X $clk]"
+puts "  STATUS=0x[format %04X $status] DEBUG=0x[format %08X $debug] Q8DBG=0x[format %08X $q8dbg] CLK=[format %08X $clk]
+  ACT_INFO=[gp0_read 0x34] DESC_INFO=[gp0_read 0x38]"
 
 # ===== Read results (at words [9], [10], [11]) =====
 set ntotal  [read32 [expr $OUTPUT_BUF + 36]]

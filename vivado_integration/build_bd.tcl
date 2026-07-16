@@ -8,6 +8,7 @@ set ver_dir  "$origin/verilog"
 
 file mkdir $proj_dir
 create_project -force matmul_bd $proj_dir -part xc7z010clg400-1
+set_param general.maxThreads 12
 
 # Add RTL sources
 add_files -fileset sources_1 [list \
@@ -165,7 +166,7 @@ update_compile_order -fileset sources_1
 set_property STEPS.SYNTH_DESIGN.ARGS.FLATTEN_HIERARCHY full [get_runs synth_1]
 set_property STEPS.SYNTH_DESIGN.ARGS.FSM_EXTRACTION one_hot [get_runs synth_1]
 set_property STEPS.SYNTH_DESIGN.ARGS.RETIMING true [get_runs synth_1]
-launch_runs synth_1 -jobs 8
+launch_runs synth_1 -jobs 12
 wait_on_run synth_1
 
 # Checkpoint
@@ -173,7 +174,7 @@ open_run synth_1
 write_checkpoint -force "$proj_dir/post_synth.dcp"
 
 # Implementation + bitstream
-launch_runs impl_1 -to_step write_bitstream -jobs 8
+launch_runs impl_1 -to_step write_bitstream -jobs 12
 wait_on_run impl_1
 
 open_run impl_1
