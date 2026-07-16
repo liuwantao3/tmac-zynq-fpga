@@ -108,7 +108,9 @@ module hp_fsm_top (
     (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 M_AXI_HP RREADY" *)
     output wire         m_axi_rready,
     (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 M_AXI_HP RLAST" *)
-    input  wire         m_axi_rlast
+    input  wire         m_axi_rlast,
+    // Interrupt output (CPU_OP descriptor)
+    output wire         interrupt
 );
 
     // ===== Registers =====
@@ -137,7 +139,18 @@ module hp_fsm_top (
     reg        q5_wi_arm;           // armed after clr_acc deasserts, captures wi on next blk_entry
     reg        q5_clr_acc_d;        // delayed clr_acc for edge detection
     reg        q5_blk_valid_r;      // delayed blk_valid for edge detection
-    reg  [3:0] reg_q8_num_groups;  // 0x10[3:0]: number of column groups (0=single)
+    reg [3:0] reg_q8_num_groups;  // 0x10[3:0]: number of column groups (0=single)
+    // Interrupt / chain control registers (CPU_OP protocol)
+    reg [31:0] reg_chain_ctrl;    // 0x04: [0]=resume, [2]=cpu_op_pending, [3]=intr_enable
+    reg [31:0] reg_gie;           // 0x08: [0]=global interrupt enable
+    reg [31:0] reg_isr;           // 0x0C: [0]=cpu_op_irq (W1C)
+    reg        desc_irq;          // internal: CPU_OP interrupt request pulse
+    reg        axil_we_chain_ctrl;   // AXI write flag for reg_chain_ctrl
+    reg [31:0] axil_wdata_chain_ctrl;  // AXI write data for reg_chain_ctrl
+    // FSM→chain_ctrl flags (consolidated in ISR block to avoid multi-driver)
+    reg        fsm_chain_set2;    // set reg_chain_ctrl[2] (CPU_OP pending)
+    reg        fsm_chain_clr2;    // clear reg_chain_ctrl[2]
+    reg        fsm_chain_clr0;    // clear reg_chain_ctrl[0] (resume)
     // Snapshot trigger: combinatorial from AXI4-Lite write decode
     wire q5_snap_trig = aw_got && w_got && !bvalid_r && awaddr_r[15:0] == 16'h64;
 
@@ -469,6 +482,7 @@ module hp_fsm_top (
     localparam Q5_BLOCK_COMPUTE = 5'd24;
     localparam Q5_BLOCK_COMPUTE_W = 5'd25;
     localparam Q5_READ_RES      = 5'd26;
+    localparam CPU_OP_WAIT      = 5'd27;   // interrupt-based CPU_OP wait state
 
     // Multi-group flag: non-zero when q8_num_groups > 1 (from descriptor, fallback to GP0 reg)
     wire multi_group = (q8_num_groups > 1);
@@ -575,6 +589,10 @@ module hp_fsm_top (
             q8_tile_counter <= 0;
             q8_tile_stride  <= 0;
             compute_type    <= 0;
+            desc_irq        <= 0;
+            fsm_chain_set2  <= 0;
+            fsm_chain_clr2  <= 0;
+            fsm_chain_clr0  <= 0;
         end else begin
             reg_clk_cnt <= reg_clk_cnt + 1;
             reg_clk_cnt_slow <= reg_clk_cnt_slow + (|reg_clk_cnt[9:0] ? 0 : 1);
@@ -590,6 +608,10 @@ module hp_fsm_top (
             q5_norm_we <= 0;
             q5_blk_valid <= 0;
             q5_act_we <= 0;
+            desc_irq       <= 0;
+            fsm_chain_set2 <= 0;
+            fsm_chain_clr2 <= 0;
+            fsm_chain_clr0 <= 0;
 
             case (state)
                 IDLE: begin
@@ -640,9 +662,17 @@ module hp_fsm_top (
                         // Branch by descriptor type
                         // Use desc_buf directly (tensor_type register lags by 1 cycle)
                         if ({desc_buf[17], desc_buf[16]} == 15) begin
-                            // CPU_OP: passthrough activation to DDR
+                            // CPU_OP: interrupt protocol or passthrough
                             col_group <= 0;
-                            state <= LOAD_ACT;
+                            if (reg_chain_ctrl[3]) begin
+                                // Interrupt mode: signal CPU, wait for resume
+                                fsm_chain_set2 <= 1;
+                                desc_irq <= 1;
+                                state <= CPU_OP_WAIT;
+                            end else begin
+                                // Passthrough mode: act→DDR copy (backward compat)
+                                state <= LOAD_ACT;
+                            end
                         end else if ({desc_buf[17], desc_buf[16]} == 1) begin
                             // Q5_0 compute path (per-block, tile iteration)
                             compute_type <= 1;
@@ -655,7 +685,8 @@ module hp_fsm_top (
                             compute_type <= 0;
                             q8_num_tiles <= ({desc_buf[23], desc_buf[22]} == 0) ? 16'd1 : {desc_buf[23], desc_buf[22]};
                             q8_tile_counter <= 0;
-                            q8_tile_stride <= 4096 + ((desc_buf[20][3:0] != 0) ? desc_buf[20][3:0] : reg_q8_num_groups) * 256;
+                            q8_tile_stride <= ({((desc_buf[20][3:0] != 0) ? desc_buf[20][3:0] : reg_q8_num_groups), 12'd0}) + ((desc_buf[20][3:0] != 0) ? desc_buf[20][3:0] : reg_q8_num_groups) * 16'd256;
+                            col_group     <= 0;
                             wt_byte_idx   <= 0;
                             wt_remaining  <= 4096;
                             state <= LOAD_WEIGHT;
@@ -726,14 +757,16 @@ module hp_fsm_top (
                 end
 
                 // === Load Q8 weights: 4096 bytes from DDR to core wmem ===
+                // Multi-group: each group loads its own 4096-byte weight block.
+                // Address = weight_addr + col_group*4096 + (4096 - wt_remaining).
                 LOAD_WEIGHT: begin
                     if (wt_remaining > 64) begin
-                        rd_addr <= weight_addr + (4096 - wt_remaining);
+                        rd_addr <= weight_addr + (col_group * 16'd4096) + (16'd4096 - wt_remaining);
                         rd_start <= 1;
                         rd_len <= 8'd15;
                         state <= LOAD_WEIGHT_W;
                     end else if (wt_remaining > 0) begin
-                        rd_addr <= weight_addr + (4096 - wt_remaining);
+                        rd_addr <= weight_addr + (col_group * 16'd4096) + (16'd4096 - wt_remaining);
                         rd_start <= 1;
                         rd_len <= (wt_remaining >> 2) - 1;
                         state <= LOAD_WEIGHT_W;
@@ -766,7 +799,6 @@ module hp_fsm_top (
                             wt_remaining <= 0;
                             sc_remaining <= 256;
                             sc_byte_idx  <= 0;
-                            col_group    <= 0;
                             state        <= LOAD_SCALES;
                         end
                     end else if (&timeout_cnt) begin
@@ -783,12 +815,12 @@ module hp_fsm_top (
                 // address = weight_addr + 4096 + (256 - sc_remaining) before each burst.
                 LOAD_SCALES: begin
                     if (sc_remaining > 64) begin
-                        rd_addr <= weight_addr + 4096 + col_group * 256 + (256 - sc_remaining);
+                        rd_addr <= weight_addr + ({q8_num_groups, 12'd0}) + col_group * 16'd256 + (16'd256 - sc_remaining);
                         rd_start <= 1;
                         rd_len <= 8'd15;
                         state <= LOAD_SCALES_W;
                     end else if (sc_remaining > 0) begin
-                        rd_addr <= weight_addr + 4096 + col_group * 256 + (256 - sc_remaining);
+                        rd_addr <= weight_addr + ({q8_num_groups, 12'd0}) + col_group * 16'd256 + (16'd256 - sc_remaining);
                         rd_start <= 1;
                         rd_len <= (sc_remaining >> 2) - 1;
                         state <= LOAD_SCALES_W;
@@ -1140,12 +1172,11 @@ module hp_fsm_top (
                             state <= COPY_ACC_TO_BUF;
                         end else begin
                             col_group <= col_group + 1;
-                            sc_remaining <= 256;
-                            sc_byte_idx <= 0;
+                            wt_byte_idx <= 0;
+                            wt_remaining <= 4096;
                             act_byte_idx <= 0;
                             act_remaining <= act_total_bytes;
-                            sc_din_lo <= 0;
-                            state <= LOAD_SCALES;
+                            state <= LOAD_WEIGHT;
                         end
                     end else begin
                         q8_res_addr <= q8_res_idx + 1;
@@ -1280,6 +1311,24 @@ module hp_fsm_top (
                         state <= FETCH_DESC;
                     end
                 end
+
+                // === CPU_OP Interrupt Wait State ===
+                // After loading CPU_OP descriptor, signal CPU via interrupt and
+                // pause until CPU writes CHAIN_CTRL[0]=1.
+                CPU_OP_WAIT: begin
+                    if (reg_chain_ctrl[0]) begin
+                        fsm_chain_clr0 <= 1;
+                        fsm_chain_clr2 <= 1;
+                        desc_irq <= 0;
+                        reg_desc_head <= reg_desc_head + 1;
+                        if (next_addr != 0) begin
+                            desc_addr <= next_addr;
+                            state <= FETCH_DESC;
+                        end else begin
+                            state <= DONE;
+                        end
+                    end
+                end
             endcase
 
             // DEBUG: expose state and status continuously
@@ -1320,6 +1369,40 @@ module hp_fsm_top (
         end
     end
 
+    // ===== ISR and Interrupt Generation =====
+    reg axil_isr_w1c;
+    reg reg_isr_w1c_d;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            reg_isr         <= 0;
+            axil_isr_w1c    <= 0;
+            reg_isr_w1c_d   <= 0;
+            reg_chain_ctrl  <= 0;
+        end else begin
+            reg_isr_w1c_d   <= axil_isr_w1c;
+            // Clear ISR[0] on rising edge of axil_isr_w1c (from AXI write to 0x0C)
+            if (axil_isr_w1c && !reg_isr_w1c_d) begin
+                reg_isr[0] <= 0;
+                axil_isr_w1c <= 0;  // consume the flag
+            end
+            // Set ISR bit on desc_irq
+            if (desc_irq && reg_gie[0])
+                reg_isr[0] <= 1;
+            // AXI write takes priority
+            if (axil_we_chain_ctrl) begin
+                reg_chain_ctrl <= axil_wdata_chain_ctrl;
+            end else begin
+                // FSM chain_ctrl updates (only when no AXI write)
+                if (fsm_chain_set2) reg_chain_ctrl[2] <= 1;
+                if (fsm_chain_clr2) reg_chain_ctrl[2] <= 0;
+                if (fsm_chain_clr0) reg_chain_ctrl[0] <= 0;
+            end
+        end
+    end
+
+    assign interrupt = reg_gie[0] && reg_isr[0];
+
     // ===== AXI4-Lite write (pulsed-ready, matches proven hp_loopback_top.v) =====
     reg awready_r, wready_r, bvalid_r;
     reg [1:0] bresp_r;
@@ -1336,7 +1419,9 @@ module hp_fsm_top (
         if (!rst_n) begin
             awready_r <= 0; wready_r <= 0; bvalid_r <= 0; bresp_r <= 0;
             awaddr_r <= 0; wdata_r <= 0; aw_got <= 0; w_got <= 0;
-            reg_start <= 0; reg_desc_base <= 0; reg_desc_tail <= 0; reg_q8_num_groups <= 0;
+            reg_start <= 0; reg_gie <= 0;
+            reg_desc_base <= 0; reg_desc_tail <= 0; reg_q8_num_groups <= 0;
+            axil_we_chain_ctrl <= 0; axil_wdata_chain_ctrl <= 0;
         end else begin
             awready_r <= 0; wready_r <= 0;
 
@@ -1355,12 +1440,17 @@ module hp_fsm_top (
                 bvalid_r <= 1; bresp_r <= 0;
       case (awaddr_r[15:0])
            0:       reg_start     <= wdata_r[0];
+           16'h4:   begin axil_we_chain_ctrl <= 1; axil_wdata_chain_ctrl <= wdata_r; end
+           16'h8:   reg_gie       <= wdata_r;
+           16'hC:   axil_isr_w1c  <= 1;  // W1C: write any value to clear ISR[0]
            16'h10:  reg_q8_num_groups <= wdata_r[3:0];
            16'h18:  reg_desc_base <= wdata_r;
            16'h1C:  reg_desc_tail <= wdata_r;
            16'h4C:  reg_q5_dbg_trig <= wdata_r;  // [15:10]=trig_blk, [0]=arm
        endcase
                 aw_got <= 0; w_got <= 0;
+            end else begin
+                axil_we_chain_ctrl <= 0;  // default clear if no write this cycle
             end
             if (bvalid_r && s_axil_bready) bvalid_r <= 0;
         end
@@ -1382,20 +1472,23 @@ module hp_fsm_top (
                     if (s_axil_arvalid) begin
                         s_axil_arready <= 0;
                         rstate <= R_DATA;
-                     case (s_axil_araddr)
-                         0:       s_axil_rdata <= {28'h0, reg_start};
+                      case (s_axil_araddr)
+                          0:       s_axil_rdata <= {28'h0, reg_start};
+                           16'h4:   s_axil_rdata <= reg_chain_ctrl;
+                           16'h8:   s_axil_rdata <= reg_gie;
+                           16'hC:   s_axil_rdata <= reg_isr;
                           16'h10:  s_axil_rdata <= {28'h0, reg_q8_num_groups};
-                         16'h14:  s_axil_rdata <= reg_status;
-                         16'h18:  s_axil_rdata <= reg_desc_base;
-                         16'h1C:  s_axil_rdata <= reg_desc_tail;
-                         16'h20:  s_axil_rdata <= reg_desc_head;
-                         16'h28:  s_axil_rdata <= reg_debug;
-                         16'h2C:  s_axil_rdata <= reg_clk_cnt;
-                         16'h30:  s_axil_rdata <= reg_clk_cnt_slow;
-                         16'h34:  s_axil_rdata <= reg_act_info;
-                         16'h38:  s_axil_rdata <= reg_desc_info;
-                  16'h3C:  s_axil_rdata <= reg_q8_debug;
-                   16'h40:  s_axil_rdata <= reg_q5_debug;
+                          16'h14:  s_axil_rdata <= reg_status;
+                          16'h18:  s_axil_rdata <= reg_desc_base;
+                          16'h1C:  s_axil_rdata <= reg_desc_tail;
+                          16'h20:  s_axil_rdata <= reg_desc_head;
+                          16'h28:  s_axil_rdata <= reg_debug;
+                          16'h2C:  s_axil_rdata <= reg_clk_cnt;
+                          16'h30:  s_axil_rdata <= reg_clk_cnt_slow;
+                          16'h34:  s_axil_rdata <= reg_act_info;
+                          16'h38:  s_axil_rdata <= reg_desc_info;
+                   16'h3C:  s_axil_rdata <= reg_q8_debug;
+                    16'h40:  s_axil_rdata <= reg_q5_debug;
                    16'h44:  s_axil_rdata <= reg_q5_dbg_cap0;
                    16'h48:  s_axil_rdata <= reg_q5_dbg_cap1;
                     16'h4C:  s_axil_rdata <= {q5_core0_d_pre[15:0],       // [31:16] live d_pre
