@@ -44,7 +44,7 @@ if command -v gmake >/dev/null 2>&1; then
 fi
 echo "=== [1/3] Building U-Boot ==="
 cd "$WORKDIR/u-boot-xlnx"
-${MAKE:-make} zynq_zc702_defconfig
+${MAKE:-make} xilinx_zynq_virt_defconfig
 ${MAKE:-make} -j"$CORES"
 cp u-boot "$BOOT_DIR/u-boot.elf"
 echo "  → u-boot.elf copied to $BOOT_DIR/"
