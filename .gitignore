@@ -126,3 +126,7 @@ docker/licenses/xilinx.lic
 gguf-tools-main/gguf-tools
 gguf-tools-main/*.o
 linux/boot/*.elf
+linux/boot/uImage
+linux/boot/devicetree.dtb
+linux/boot/uramdisk.image.gz
+linux/boot/matmul_bd.xsa
