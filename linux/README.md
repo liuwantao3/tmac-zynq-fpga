@@ -1,5 +1,12 @@
 # FPGA Accelerator Linux-on-SD Boot
 
+> **Scripts available:** `clone_repos.sh` clones all three repos in parallel,
+> `build_all.sh` builds U-Boot + kernel + rootfs. Run from the repo root:
+> ```bash
+> bash linux/clone_repos.sh                    # clone repos to /tmp/arm-build
+> bash linux/build_all.sh                      # build everything
+> ```
+
 ## Hardware
 
 - **Board**: MicroPhase Z7-Lite (Zynq 7010, xc7z010clg400-1)
