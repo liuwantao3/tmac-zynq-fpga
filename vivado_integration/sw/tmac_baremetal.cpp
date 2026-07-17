@@ -84,7 +84,123 @@ static Tensor* get_tensor(const char* name) {
     return 0;
 }
 
-// Dequantize one element from a tensor
+// ===== Debug Register Dump =====
+static void dump_fpga_regs(void) {
+    uart_puts("  REGS:");
+    uart_puthex(reg_read32(REG_DEBUG));
+    uart_putc(' ');
+    uart_puthex(reg_read32(REG_Q8_DEBUG));
+    uart_putc(' ');
+    uart_puthex(reg_read32(REG_Q5_DEBUG));
+    uart_putc('\n');
+}
+
+static void dump_chain_status(int ndesc) {
+    uart_puts("  HEAD="); uart_putdec(reg_read32(REG_DESC_HEAD));
+    uart_puts("/"); uart_putdec(ndesc);
+    uart_puts(" STAT="); uart_puthex(reg_read32(REG_STATUS));
+    uart_puts(" CLK="); uart_puthex(reg_read32(REG_CLK_CNT));
+    uart_puts("\n");
+}
+
+// ===== Result Reader: 48-bit S24.8 from DDR to float =====
+// Reads a 48-bit signed accumulator (zero-extended to 64 bits in DDR)
+// and converts to float accounting for x_scale and row_inv.
+static inline float read_acc_result(uint32_t* res32, int idx,
+    float x_scale, const float* row_inv)
+{
+    uint32_t lo = res32[idx * 2];
+    uint32_t hi = res32[idx * 2 + 1];
+    uint64_t raw = (uint64_t)lo | ((uint64_t)hi << 32);
+    if (raw & ((uint64_t)1 << 47)) raw |= 0xFFFF000000000000ULL;
+    int32_t acc = (int32_t)(int64_t)raw;
+    float inv = row_inv ? row_inv[idx] : 1.0f;
+    if (inv < 1e-10f) inv = 1.0f;
+    return (float)acc * x_scale / inv;
+}
+
+// ===== Descriptor Chain Runner =====
+// Starts a chain of ndesc descriptors at chain_base and waits for completion.
+// If a CPU_OP descriptor is encountered with intr_enable=1, the FSM enters
+// CPU_OP_WAIT state. This runner polls ISR and calls the handler.
+// Returns 0 on success, -1 on timeout.
+//
+// cpu_op_handler: called when a CPU_OP interrupt fires.
+//   head = descriptor index that triggered (0-based).
+//   ctx = user context (e.g., layer state, tensors).
+//   Must perform the CPU operation and write results to the descriptor's
+//   result_addr, then clear ISR and write CHAIN_CTRL resume.
+//   Return 0 to continue chain, -1 to abort.
+typedef int (*cpu_op_handler_t)(int head, void* ctx);
+static cpu_op_handler_t g_cpu_op_handler = 0;
+static void* g_cpu_op_ctx = 0;
+
+static int chain_run(uint32_t chain_base, int ndesc) {
+    reg_write32(REG_DESC_BASE, chain_base);
+    reg_write32(REG_DESC_TAIL, 1);
+    __asm__ volatile("dsb" ::: "memory");
+    reg_write32(REG_START, 1);
+
+    uint32_t timeout = CHAIN_TIMEOUT;
+    while (timeout--) {
+        uint32_t status = reg_read32(REG_STATUS);
+        if (!(status & 0x8000)) return 0; // chain complete
+
+        // Check for CPU_OP interrupt
+        if (g_cpu_op_handler) {
+            uint32_t isr = reg_read32(REG_ISR);
+            if (isr & 1) {
+                uint32_t head = reg_read32(REG_DESC_HEAD);
+                if (g_cpu_op_handler((int)head, g_cpu_op_ctx) != 0) {
+                    uart_puts("CPU_OP abort at head=");
+                    uart_putdec((int)head);
+                    uart_puts("\n");
+                    return -1;
+                }
+            }
+        }
+
+        // Small spin loop — ~10 cycles per iteration at 100 MHz
+        for (volatile int i = 0; i < 10; i++);
+    }
+
+    // Timeout — dump all debug registers
+    uart_puts("\nCHAIN TIMEOUT after ");
+    uart_putdec(ndesc);
+    uart_puts(" descriptors\n");
+    dump_fpga_regs();
+    dump_chain_status(ndesc);
+    return -1;
+}
+
+// ===== Chain Builder Helpers =====
+static void chain_add_descriptor(Descriptor* d, uint32_t next, uint32_t weight,
+    uint32_t act, uint32_t result, uint16_t type, uint8_t groups,
+    uint16_t tiles, uint32_t act_bytes)
+{
+    desc_write(d, next, weight, act, result, type, groups, tiles, act_bytes);
+}
+
+// Build and run a mini-chain of FPGA-only matmuls (no CPU_OP descriptors).
+// All matmuls in the chain must share the same activation (act_addr).
+// Weights must already be pre-processed to their respective weight_addrs.
+// Results are written to consecutive result buffers.
+static int chain_run_fpga_matmuls(const uint32_t* weight_addrs,
+    const uint32_t* result_addrs, int nmatmuls, uint16_t type,
+    uint8_t groups, uint16_t tiles, uint32_t act_addr, uint32_t act_bytes)
+{
+    Descriptor* chain = (Descriptor*)(uintptr_t)DESC_CHAIN_BASE;
+
+    for (int i = 0; i < nmatmuls; i++) {
+        uint32_t next = (i + 1 < nmatmuls) ? DESC_CHAIN_BASE + (i + 1) * 32 : 0;
+        desc_write(&chain[i], next, weight_addrs[i], act_addr,
+            result_addrs[i], type, groups, tiles, act_bytes);
+    }
+
+    return chain_run(DESC_CHAIN_BASE, nmatmuls);
+}
+
+// ===== Dequantize one element from a tensor =====
 static float dequant(const Tensor* t, uint64_t idx) {
     uint8_t* d = t->data;
     if (t->type == TENSOR_F32) return ((float*)d)[idx];
@@ -281,16 +397,11 @@ static void q8_compute_row_inv(const Tensor* A, int row0, float* row_inv) {
 }
 
 // Run Q8_0 matmul via FPGA HP descriptor for one 64-row tile
-static void fpga_q8_tile(const uint8_t* fpga_wt, const int16_t* x_q,
-                         float* y, int row0, float x_scale,
-                         const float* row_inv, int nrows)
+// Returns 0 on success, -1 on timeout.
+static int fpga_q8_tile(const uint8_t* fpga_wt, const int16_t* x_q,
+                        float* y, int row0, float x_scale,
+                        const float* row_inv, int nrows)
 {
-    // Format: one descriptor per tile
-    // weight_addr points to pre-processed weight data + scales (Q8_TILE_STRIDE bytes)
-    // act_addr points to INT16 activations (1792 bytes = 896×2)
-    // result_addr points to 64×8 = 512 bytes output
-
-    uint32_t desc_addr = DESC_CHAIN_BASE;
     uint32_t wt_addr = FPGA_WEIGHT_REFMT;
     uint32_t act_addr = FPGA_ACT_BUF;
     uint32_t res_addr = FPGA_RES_BUF;
@@ -301,44 +412,24 @@ static void fpga_q8_tile(const uint8_t* fpga_wt, const int16_t* x_q,
     // 2. Write activations
     memcpy((void*)(uintptr_t)act_addr, x_q, Q8_TILE_COLS * 2);
 
-    // 3. Build descriptor (32 bytes, little-endian)
-    Descriptor* d = (Descriptor*)(uintptr_t)desc_addr;
-    d->next_addr = 0;
-    d->weight_addr = wt_addr;
-    d->act_addr = act_addr;
-    d->result_addr = res_addr;
-    d->tensor_type = DESC_Q8;
-    d->num_groups = Q8_NUM_GROUPS;
-    d->act_total_bytes[0] = (Q8_TILE_COLS * 2) & 0xFF;
-    d->act_total_bytes[1] = ((Q8_TILE_COLS * 2) >> 8) & 0xFF;
-    d->act_total_bytes[2] = ((Q8_TILE_COLS * 2) >> 16) & 0xFF;
+    // 3. Build single-descriptor chain
+    Descriptor* d = (Descriptor*)(uintptr_t)DESC_CHAIN_BASE;
+    desc_write(d, 0, wt_addr, act_addr, res_addr, DESC_Q8,
+               Q8_NUM_GROUPS, 1, Q8_TILE_COLS * 2);
 
-    // 4. Set up and start descriptor chain
-    reg_write32(REG_DESC_BASE, desc_addr);
-    __asm__ volatile("dsb" ::: "memory");
-    reg_write32(REG_START, 1);
-
-    // 5. Poll for completion (reg_desc_head increments, or wait for busy=0)
-    uint32_t timeout = 10000000; // ~100ms at 100MHz
-    while (timeout--) {
-        uint32_t status = reg_read32(REG_STATUS);
-        if (!(status & 0x8000)) break; // busy bit [15] = 0
+    // 4. Run
+    if (chain_run(DESC_CHAIN_BASE, 1) != 0) {
+        uart_puts("  Q8 tile FAIL (timeout)\n");
+        return -1;
     }
-    if (timeout == 0) uart_puts("WARN: Q8 FPGA timeout\n");
 
-    // Read 48-bit signed accumulator from two 32-bit DDR words (zero-extended to 64b)
-    // 6. Read results from result buffer (48-bit signed in 64-bit words, zero-extended)
+    // 5. Read results
     uint32_t* res32 = (uint32_t*)(uintptr_t)res_addr;
     for (int i = 0; i < nrows; i++) {
-        uint32_t lo = res32[i * 2];
-        uint32_t hi = res32[i * 2 + 1];
-        uint64_t raw = (uint64_t)lo | ((uint64_t)hi << 32);
-        if (raw & ((uint64_t)1 << 47)) raw |= 0xFFFF000000000000ULL; // sign-extend 48→64
-        int32_t acc = (int32_t)(int64_t)raw;
-        float inv = row_inv ? row_inv[i] : 1.0f;
-        if (inv < 1e-10f) inv = 1.0f;
-        y[row0 + i] += (float)acc * x_scale / inv;
+        float val = read_acc_result(res32, i, x_scale, row_inv);
+        y[row0 + i] += val;
     }
+    return 0;
 }
 
 // ---- Q5_0 FPGA Path via HP descriptor chain ----
@@ -355,52 +446,40 @@ static void fpga_q8_tile(const uint8_t* fpga_wt, const int16_t* x_q,
 // Norm (4 × UQ8.8 LE uint16) at tile offset 2688 (8 bytes).
 // Result: 4 rows × 8 bytes each = 32 bytes
 
-static void fpga_q5_0_tile(const Tensor* A, int row0, const int16_t* x_q,
-                           float* y, float x_scale)
+// Pre-process one Q5_0 tile from GGUF format to FPGA 48-byte block format.
+// Writes to wt_addr (must be Q5_TILE_TOTAL bytes available).
+// Returns nrows actually processed.
+static int q5_preprocess_tile(const Tensor* A, int row0, uint32_t wt_addr, float* ri_out)
 {
-    uint32_t desc_addr = DESC_CHAIN_BASE;
-    uint32_t wt_addr = FPGA_WEIGHT_REFMT;
-    uint32_t act_addr = FPGA_ACT_BUF;
-    uint32_t res_addr = FPGA_RES_BUF;
-
     int cols = (int)A->cols;
-    int stride_blocks = cols / 32;  // 28 for 896
+    int stride_blocks = cols / 32;
     int nrows = Q5_TILE_ROWS;
     if (row0 + nrows > (int)A->rows) nrows = (int)A->rows - row0;
 
-    // 1. Generate 56 FPGA blocks (48 bytes each) from GGUF 22-byte blocks
-    // Interleave: blocks 0-27 use tile rows (0,2); blocks 28-55 use tile rows (1,3)
+    // Generate 56 FPGA blocks (48 bytes each)
     for (int bi = 0; bi < Q5_TILE_BLOCKS; bi++) {
-        int group = bi / 28;                    // 0 or 1 (within-tile row group)
-        int blk_in_row = bi % 28;               // block index within row (0..27)
-        int core0_model_row = row0 + group;      // core0 row for this FPGA block
-        int core1_model_row = row0 + 2 + group;  // core1 row for this FPGA block
-
+        int group = bi / 28;
+        int blk_in_row = bi % 28;
+        int core0_row = row0 + group;
+        int core1_row = row0 + 2 + group;
         uint8_t* fpga_blk = (uint8_t*)(uintptr_t)(wt_addr + bi * Q5_BLOCK_SIZE);
 
-        // Core0's GGUF block
-        if (core0_model_row < (int)A->rows) {
-            uint64_t src_off = ((uint64_t)core0_model_row * stride_blocks + blk_in_row) * 22;
-            memcpy(fpga_blk, A->data + src_off, 22);
+        if (core0_row < (int)A->rows) {
+            uint64_t off = ((uint64_t)core0_row * stride_blocks + blk_in_row) * 22;
+            memcpy(fpga_blk, A->data + off, 22);
         } else {
             memset(fpga_blk, 0, 22);
         }
-
-        // Core1's GGUF block
-        if (core1_model_row < (int)A->rows) {
-            uint64_t src_off = ((uint64_t)core1_model_row * stride_blocks + blk_in_row) * 22;
-            memcpy(fpga_blk + 22, A->data + src_off, 22);
+        if (core1_row < (int)A->rows) {
+            uint64_t off = ((uint64_t)core1_row * stride_blocks + blk_in_row) * 22;
+            memcpy(fpga_blk + 22, A->data + off, 22);
         } else {
             memset(fpga_blk + 22, 0, 22);
         }
-
-        // Zero padding
         memset(fpga_blk + 44, 0, 4);
     }
 
-    // Compute row_norm (UQ8.8) for each of the 4 rows
-    // norm_val = 32767 / max_abs, stored as uint16 LE (UQ8.8 format)
-    float ri[4];
+    // Compute row_norm
     for (int r = 0; r < nrows; r++) {
         float max_abs = 0.0f;
         int row = row0 + r;
@@ -418,60 +497,69 @@ static void fpga_q5_0_tile(const Tensor* A, int row0, const int16_t* x_q,
                 if (ab > max_abs) max_abs = ab;
             }
         }
-        // For out-of-range rows, use 1.0 norm (weights are zeroed, contributes nothing)
-        max_abs = (max_abs < 1e-10f) ? 1.0f : max_abs;
-        ri[r] = 32767.0f / max_abs;
+        ri_out[r] = (max_abs < 1e-10f) ? 1.0f : 32767.0f / max_abs;
     }
 
-    // Write norm values at tile offset 2688 (4 × UQ8.8 LE uint16)
+    // Write norm values at tile offset 2688
     for (int r = 0; r < 4; r++) {
-        uint16_t uq = (uint16_t)(ri[r < nrows ? r : 0] * 256.0f + 0.5f);
+        float ri = ri_out[r < nrows ? r : 0];
+        uint16_t uq = (uint16_t)(ri * 256.0f + 0.5f);
         uint8_t* dst = (uint8_t*)(uintptr_t)(wt_addr + Q5_TILE_NORM_OFFSET + r * 2);
         dst[0] = uq & 0xFF;
         dst[1] = (uq >> 8) & 0xFF;
     }
+    return nrows;
+}
 
-    // 2. Write activations
+// FPGA Q5_0 tile: pre-process, build descriptor, run, read results.
+static int fpga_q5_0_tile(const Tensor* A, int row0, const int16_t* x_q,
+                          float* y, float x_scale)
+{
+    uint32_t wt_addr = FPGA_WEIGHT_REFMT;
+    uint32_t act_addr = FPGA_ACT_BUF;
+    uint32_t res_addr = FPGA_RES_BUF;
+
+    float ri[4];
+    int nrows = q5_preprocess_tile(A, row0, wt_addr, ri);
+    int cols = (int)A->cols;
+
+    // Write activations
     memcpy((void*)(uintptr_t)act_addr, x_q, cols * 2);
 
-    // 3. Build descriptor
-    Descriptor* d = (Descriptor*)(uintptr_t)desc_addr;
-    d->next_addr = 0;
-    d->weight_addr = wt_addr;
-    d->act_addr = act_addr;
-    d->result_addr = res_addr;
-    d->tensor_type = DESC_Q5_0;
-    d->num_groups = 0;
-    int act_bytes = cols * 2;
-    d->act_total_bytes[0] = act_bytes & 0xFF;
-    d->act_total_bytes[1] = (act_bytes >> 8) & 0xFF;
-    d->act_total_bytes[2] = (act_bytes >> 16) & 0xFF;
+    // Build single-descriptor chain
+    Descriptor* d = (Descriptor*)(uintptr_t)DESC_CHAIN_BASE;
+    desc_write(d, 0, wt_addr, act_addr, res_addr, DESC_Q5_0, 0, 1, cols * 2);
 
-    // 4. Start
-    reg_write32(REG_DESC_BASE, desc_addr);
-    __asm__ volatile("dsb" ::: "memory");
-    reg_write32(REG_START, 1);
-
-    // 5. Poll
-    uint32_t timeout = 10000000;
-    while (timeout--) {
-        uint32_t status = reg_read32(REG_STATUS);
-        if (!(status & 0x8000)) break;
+    if (chain_run(DESC_CHAIN_BASE, 1) != 0) {
+        uart_puts("  Q5 tile FAIL (timeout)\n");
+        return -1;
     }
-    if (timeout == 0) uart_puts("WARN: Q5_0 FPGA timeout\n");
 
-    // 6. Read results (48-bit signed in 64-bit words, zero-extended)
+    // Read results
     uint32_t* res32 = (uint32_t*)(uintptr_t)res_addr;
     for (int i = 0; i < nrows; i++) {
-        uint32_t lo = res32[i * 2];
-        uint32_t hi = res32[i * 2 + 1];
-        uint64_t raw = (uint64_t)lo | ((uint64_t)hi << 32);
-        if (raw & ((uint64_t)1 << 47)) raw |= 0xFFFF000000000000ULL;
-        int32_t acc = (int32_t)(int64_t)raw;
-        float inv = ri[i];
-        if (inv < 1e-10f) inv = 1.0f;
-        y[row0 + i] += (float)acc * x_scale / inv;
+        float val = read_acc_result(res32, i, x_scale, ri);
+        y[row0 + i] += val;
     }
+    return 0;
+}
+
+// ---- Quantize float activations to INT16 ----
+// Returns x_scale used for quantization.
+static float quantize_act(const float* x, int16_t* x_q, int n) {
+    float max_abs = 0.0f;
+    for (int j = 0; j < n; j++) {
+        float a = fabsf(x[j]);
+        if (a > max_abs) max_abs = a;
+    }
+    float scale = (max_abs < 1e-10f) ? 1.0f : max_abs / 32767.0f;
+    for (int j = 0; j < n; j++) {
+        float v = x[j] / scale;
+        if (v >= 32767.0f) x_q[j] = 32767;
+        else if (v <= -32768.0f) x_q[j] = -32768;
+        else x_q[j] = (int16_t)(v + (v >= 0 ? 0.5f : -0.5f));
+    }
+    return scale;
 }
 
 // ---- Top-level matmul dispatch ----
@@ -479,34 +567,18 @@ static void fpga_q5_0_tile(const Tensor* A, int row0, const int16_t* x_q,
 // For Q4_K, Q6_K, F32, F16: CPU fallback
 static void matmul(const Tensor* A, const float* x, float* y, int rows, int cols) {
     // Quantize activations to INT16
-    float x_scale = 0.0f;
-    for (int j = 0; j < cols; j++) {
-        float a = fabsf(x[j]);
-        if (a > x_scale) x_scale = a;
-    }
-    x_scale = (x_scale < 1e-10f) ? 1.0f : x_scale / 32767.0f;
-
-    // Allocate x_q on stack (896 × 2 = 1792 bytes)
-    int16_t x_q[896];
-
-    for (int j = 0; j < cols; j++) {
-        float v = x[j] / x_scale;
-        if (v >= 32767.0f) x_q[j] = 32767;
-        else if (v <= -32768.0f) x_q[j] = -32768;
-        else x_q[j] = (int16_t)(v + (v >= 0 ? 0.5f : -0.5f));
-    }
-
+    int16_t x_q[1024]; // max INTER_DIM = 4864 — needs stack, but we limit to Q5 tiles
+    if (cols > 1024) { uart_puts("matmul: cols>1024, switch to CPU\n");
+        cpu_matmul(A, x, y, rows, cols); return; }
+    float x_scale = quantize_act(x, x_q, cols);
     memset(y, 0, rows * sizeof(float));
 
     if (A->type == TENSOR_Q8_0) {
-        // FPGA Q8_0 path: 64-row tiles
         int tile_rows = Q8_TILE_ROWS;
         float row_inv_buf[64];
 
         for (int r0 = 0; r0 < rows; r0 += tile_rows) {
             int nr = min_int(tile_rows, rows - r0);
-
-            // Pre-process tile weights
             q8_preprocess_tile(A, r0, (uint8_t*)(uintptr_t)FPGA_WEIGHT_REFMT);
 
             // Compute row_inv for this tile
@@ -517,24 +589,20 @@ static void matmul(const Tensor* A, const float* x, float* y, int rows, int cols
                     float v = fabsf(dequant(A, (uint64_t)row * cols + j));
                     if (v > max_abs) max_abs = v;
                 }
-                max_abs = (max_abs < 1e-10f) ? 1.0f : max_abs;
-                row_inv_buf[i] = 32767.0f / max_abs;
+                row_inv_buf[i] = (max_abs < 1e-10f) ? 1.0f : 32767.0f / max_abs;
             }
             for (int i = nr; i < tile_rows; i++) row_inv_buf[i] = 1.0f;
 
-            // Run FPGA tile
-            fpga_q8_tile((uint8_t*)(uintptr_t)FPGA_WEIGHT_REFMT,
-                        x_q, y, r0, x_scale, row_inv_buf, nr);
+            if (fpga_q8_tile((uint8_t*)(uintptr_t)FPGA_WEIGHT_REFMT,
+                            x_q, y, r0, x_scale, row_inv_buf, nr) != 0) return;
         }
     }
     else if (A->type == TENSOR_Q5_0) {
-        // FPGA Q5_0 path: 4-row tiles
         for (int r0 = 0; r0 < rows; r0 += Q5_TILE_ROWS) {
-            fpga_q5_0_tile(A, r0, x_q, y, x_scale);
+            if (fpga_q5_0_tile(A, r0, x_q, y, x_scale) != 0) return;
         }
     }
     else {
-        // CPU fallback for Q4_K, Q6_K, F32, F16
         cpu_matmul(A, x, y, rows, cols);
     }
 }
@@ -821,6 +889,16 @@ extern "C" int main(void) {
     memset(&g_state, 0, sizeof(g_state));
     reg_write32(REG_Q8_NUM_GROUPS, 14);
     uart_puts("FPGA Q8_NUM_GROUPS=14\n");
+
+    // Initialize CPU_OP interrupt protocol
+    // Set chain_ctrl[3]=1 (intr_enable) for interrupt mode, clear resume/pending
+    reg_write32(REG_CHAIN_CTRL, CHAIN_CTRL_INTR_ENABLE);
+    reg_write32(REG_GIE, 1);  // global interrupt enable
+    reg_write32(REG_ISR, 1);  // clear any stale ISR bit
+    g_cpu_op_handler = 0;     // no handler installed yet (polling mode OK)
+    g_cpu_op_ctx = &g_state;
+
+    uart_puts("CPU_OP intr protocol active (chain_ctrl=0x08)\n");
 
     // Load model from DDR
     if (load_tmac(MODEL_BASE) != 0) {

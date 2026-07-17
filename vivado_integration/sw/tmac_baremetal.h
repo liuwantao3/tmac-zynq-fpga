@@ -26,16 +26,52 @@
 // ===== DDR Memory Map =====
 // Model loaded at MODEL_BASE by bootloader/script
 // Program lives at 0x00100000 (from link.ld)
-#define MODEL_BASE         0x00200000UL
-#define OUTPUT_BUF         0x1F000000UL   // Output results
-#define DESC_CHAIN_BASE    0x1F001000UL   // Descriptor area
-#define FPGA_ACT_BUF       0x1F002000UL   // Activation buffer
-#define FPGA_RES_BUF       0x1F003000UL   // Result buffer
-#define FPGA_WEIGHT_REFMT  0x1F004000UL   // Weight reformat buffer
+#define MODEL_BASE           0x00200000UL
+#define OUTPUT_BUF           0x1F000000UL   // Output tokens
+#define DESC_CHAIN_BASE      0x1F001000UL   // Descriptor chain (512 bytes = 16×32)
+#define FPGA_ACT_BUF         0x1F002000UL   // Activation scratch (8KB)
+#define FPGA_RES_BUF         0x1F003000UL   // Result scratch (8KB)
+#define FPGA_WEIGHT_REFMT    0x1F004000UL   // Weight reformat (128KB)
+#define SCRATCH_F32          0x1F010000UL   // Float scratch for CPU ops (64KB)
 
-// Register map (matches regs.h and hp_fsm_top.v)
+// Chain intermediate buffers (INT16 activations) within FPGA_ACT_BUF
+#define BUF_ACT              FPGA_ACT_BUF           // Input activation for current op
+#define BUF_NORM_OUT         (FPGA_ACT_BUF + 0x800) // Norm output (2KB)
+#define BUF_Q                (FPGA_ACT_BUF + 0x1000) // Q (2KB)
+#define BUF_K                (FPGA_ACT_BUF + 0x1800) // K (2KB, but K_DIM=128)
+#define BUF_V                (FPGA_ACT_BUF + 0x2000) // V (2KB)
+#define BUF_CONTEXT          (FPGA_ACT_BUF + 0x2800) // Context (2KB)
+#define BUF_ATTN_OUT         (FPGA_ACT_BUF + 0x3000) // Attn output (2KB)
+#define BUF_FFN_NORM_OUT     (FPGA_ACT_BUF + 0x3800) // FFN norm output (2KB)
+#define BUF_GATE             (FPGA_ACT_BUF + 0x4000) // Gate (4KB)
+#define BUF_UP               (FPGA_ACT_BUF + 0x5000) // Up (4KB)
+#define BUF_SWIGLU_OUT       (FPGA_ACT_BUF + 0x6000) // SwiGLU output (4KB)
+#define BUF_FFN_OUT          (FPGA_ACT_BUF + 0x7000) // FFN output (2KB)
+
+// CPU_OP descriptor indices within the layer chain
+#define CHAIN_IDX_ATTN_NORM       0
+#define CHAIN_IDX_Q_MATMUL        1
+#define CHAIN_IDX_K_MATMUL        2
+#define CHAIN_IDX_V_MATMUL        3
+#define CHAIN_IDX_BIAS_ROPE_ATTN  4
+#define CHAIN_IDX_ATTN_OUT_MATMUL 5
+#define CHAIN_IDX_RESIDUAL_NORM   6
+#define CHAIN_IDX_GATE_MATMUL     7
+#define CHAIN_IDX_UP_MATMUL       8
+#define CHAIN_IDX_SWIGLU          9
+#define CHAIN_IDX_RESIDUAL        10
+#define CHAIN_MAX_DESC            11
+
+// Chain timeout (in status polls)
+#define CHAIN_TIMEOUT      10000000
+#define CHAIN_POLL_US      10
+
+// Register map (matches hp_fsm_top.v)
 #define IP_BASE            0x43C00000UL
 #define REG_START          0x00
+#define REG_CHAIN_CTRL     0x04
+#define REG_GIE            0x08
+#define REG_ISR            0x0C
 #define REG_Q8_NUM_GROUPS  0x10
 #define REG_STATUS         0x14
 #define REG_DESC_BASE      0x18
@@ -44,6 +80,14 @@
 #define REG_DEBUG          0x28
 #define REG_CLK_CNT        0x2C
 #define REG_CLK_CNT_SLOW   0x30
+#define REG_Q8_DEBUG       0x3C
+#define REG_Q5_DEBUG       0x40
+#define REG_Q5_DBG_CAP0    0x44
+
+// CHAIN_CTRL bits
+#define CHAIN_CTRL_RESUME        (1<<0)
+#define CHAIN_CTRL_CPU_OP_PENDING (1<<2)
+#define CHAIN_CTRL_INTR_ENABLE   (1<<3)
 
 // Descriptor format (32 bytes, packed)
 typedef struct __attribute__((packed)) {
@@ -53,17 +97,34 @@ typedef struct __attribute__((packed)) {
     uint32_t result_addr;        // 0x0C
     uint16_t tensor_type;        // 0x10: 0=Q8, 1=Q5_0, 15=CPU_OP
     uint16_t reserved0;          // 0x12
-    uint8_t  num_groups : 4;     // 0x14 low nibble
-    uint8_t  reserved1 : 4;      // 0x14 high nibble
-    uint8_t  reserved2[3];       // 0x15-0x17
+    uint8_t  num_groups;         // 0x14: [3:0]=Q8 column groups
+    uint8_t  reserved1;          // 0x15
+    uint16_t num_tiles;          // 0x16-0x17 (LE)
     uint8_t  act_total_bytes[3]; // 0x18-0x1A (24-bit LE)
     uint8_t  reserved3[5];       // 0x1B-0x1F
 } Descriptor;
 
-// Tensor type values for descriptor
+// Descriptor constants
 #define DESC_Q8     0
 #define DESC_Q5_0   1
 #define DESC_CPU_OP 15
+
+// Helper: write descriptor fields
+static inline void desc_write(Descriptor* d, uint32_t next, uint32_t weight,
+    uint32_t act, uint32_t result, uint16_t type, uint8_t groups,
+    uint16_t tiles, uint32_t act_bytes)
+{
+    d->next_addr = next;
+    d->weight_addr = weight;
+    d->act_addr = act;
+    d->result_addr = result;
+    d->tensor_type = type;
+    d->num_groups = groups;
+    d->num_tiles = tiles;
+    d->act_total_bytes[0] = act_bytes & 0xFF;
+    d->act_total_bytes[1] = (act_bytes >> 8) & 0xFF;
+    d->act_total_bytes[2] = (act_bytes >> 16) & 0xFF;
+}
 
 // Q8_0 tile constants
 #define Q8_TILE_ROWS    64
