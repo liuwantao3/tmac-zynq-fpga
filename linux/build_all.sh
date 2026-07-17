@@ -44,17 +44,82 @@ if command -v gmake >/dev/null 2>&1; then
 fi
 echo "=== [1/3] Building U-Boot ==="
 cd "$WORKDIR/u-boot-xlnx"
-# macOS SDK wraps memcpy/memmove as macros, conflicting with U-Boot ARM asm/string.h
-# Workaround: disable EFI capsule tools (not needed for SD card boot)
+
+# ── Reset to clean state (idempotent for re-runs) ──
+git checkout -- . 2>/dev/null || true
+
+# ── Patch macOS SDK conflicts (Python is more reliable than sed) ──
+python3 << 'PYEOF'
+import re
+
+# 1. Undefine macOS secure string macros before ARM asm/string.h
+P = "arch/arm/include/asm/string.h"
+with open(P) as f: s = f.read()
+guard = """#ifdef __APPLE__
+#undef memcpy
+#undef memmove
+#undef memset
+#undef memcmp
+#undef strcpy
+#undef strncpy
+#undef strcat
+#undef strncat
+#undef strlcpy
+#undef strlcat
+#endif
+"""
+with open(P,'w') as f: f.write(re.sub(r'(?=^extern void \* memcpy)', guard, s, count=1, flags=re.M))
+
+# 2. Undef strlcat + guard strchrnul (conflicts with macOS SDK)
+P = "include/linux/string.h"
+with open(P) as f: lines = f.readlines()
+out = []
+for ln in lines:
+    if '#ifndef __HAVE_ARCH_STRLCAT' in ln:
+        out.append('#ifdef __APPLE__\n#undef strlcat\n#endif\n')
+    if ln.rstrip() == 'const char *strchrnul(const char *s, int c);':
+        out.append('#ifndef __APPLE__\n' + ln + '#endif\n'); continue
+    out.append(ln)
+with open(P,'w') as f: f.writelines(out)
+
+# 3. sbrk signature differs on macOS
+P = "include/malloc.h"
+with open(P) as f: s = f.read()
+s = s.replace('extern Void_t*     sbrk(ptrdiff_t);',
+              '#ifndef __APPLE__\nextern Void_t*     sbrk(ptrdiff_t);\n#else\n#include <unistd.h>\n#endif')
+with open(P,'w') as f: f.write(s)
+
+# 4. Skip mkeficapsule (EFI headers incompatible with Apple clang/SDK)
+P = "tools/Makefile"
+with open(P) as f: lines = f.readlines()
+out = [l for l in lines if 'mkeficapsule' not in l or 'hostprogs' not in l]
+with open(P,'w') as f: f.writelines(out)
+
+# 5. macOS dd requires cbs for conv=block; use cp instead
+P = "scripts/Makefile.spl"
+with open(P) as f: s = f.read()
+# Heredoc is quoted so $ is literal in Python string
+s = s.replace('\t@dd if=$< of=$@ conv=block,sync bs=4 2>/dev/null;', '\t@cp $< $@')
+s = s.replace('INPUTS-$(CONFIG_ARCH_ZYNQ)\t\t+= $(obj)/boot.bin',
+              '# INPUTS-$(CONFIG_ARCH_ZYNQ)\t\t+= $(obj)/boot.bin')
+with open(P,'w') as f: f.write(s)
+
+# 6. Disable EFI in defconfig
+P = "configs/xilinx_zynq_virt_defconfig"
+with open(P) as f: content = f.read()
+if 'CONFIG_EFI_LOADER=n' not in content:
+    content += '\n# CONFIG_EFI_LOADER is not set\n'
+with open(P,'w') as f: f.write(content)
+PYEOF
+echo "  patches applied"
+
+# ── Build ──
+export CROSS_COMPILE=arm-linux-gnueabihf-
+export HOSTCC=clang
 export HOSTCFLAGS="-I$(brew --prefix openssl 2>/dev/null || echo /opt/homebrew/opt/openssl@3)/include"
 export HOSTLDFLAGS="-L$(brew --prefix openssl 2>/dev/null || echo /opt/homebrew/opt/openssl@3)/lib"
 ${MAKE:-make} xilinx_zynq_virt_defconfig
-# Disable EFI capsule update support to skip mkeficapsule (macOS SDK conflict)
-${MAKE:-make} olddefconfig
-echo "CONFIG_EFI_CAPSULE_ON_DISK=n" >> .config
-echo "CONFIG_EFI_CAPSULE_AUTHENTICATE=n" >> .config
-echo "CONFIG_EFI_HAVE_CAPSULE_SUPPORT=n" >> .config
-${MAKE:-make} -j"$CORES"
+${MAKE:-make} -j"$CORES" u-boot spl/u-boot-spl.bin
 cp u-boot "$BOOT_DIR/u-boot.elf"
 echo "  → u-boot.elf copied to $BOOT_DIR/"
 echo ""
@@ -63,6 +128,9 @@ echo ""
 echo "=== [2/3] Building Linux Kernel ==="
 cd "$WORKDIR/linux-xlnx"
 ${MAKE:-make} ARCH=arm xilinx_zynq_defconfig
+# macOS lacks elf.h; disable build-time table sort (not needed for boot)
+echo 'CONFIG_BUILDTIME_TABLE_SORT=n' >> .config
+${MAKE:-make} ARCH=arm olddefconfig
 ${MAKE:-make} -j"$CORES" ARCH=arm UIMAGE_LOADADDR=0x8000 uImage
 ${MAKE:-make} ARCH=arm dtbs
 cp arch/arm/boot/uImage "$BOOT_DIR/"
