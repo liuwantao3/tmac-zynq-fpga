@@ -84,6 +84,18 @@ static Tensor* get_tensor(const char* name) {
     return 0;
 }
 
+// ===== Progress Monitor (write to DDR for XSDB readback) =====
+// g_progress[0]: step counter, g_progress[1]: layer, g_progress[2]: matmul id
+// Memory at 0x1F000800 must NOT overlap with output buffer (0x1F000000-0x1F0007FF).
+// Exception handler also writes to 0x1F000800, so we use 0x1F000900 for progress.
+static volatile uint32_t* g_prog = 0;
+#define PROG_BASE 0x1F000900UL
+#define prog_init() do { g_prog = (volatile uint32_t*)(uintptr_t)PROG_BASE; g_prog[0]=0; g_prog[1]=0; g_prog[2]=0; g_prog[3]=0; } while(0)
+#define prog_inc() do { if(g_prog){g_prog[0]++;} } while(0)
+#define prog_set_layer(l) do { if(g_prog){g_prog[1]=(uint32_t)(l);} } while(0)
+#define prog_set_matmul(m) do { if(g_prog){g_prog[2]=(uint32_t)(m);} } while(0)
+#define prog_set_token(t) do { if(g_prog){g_prog[3]=(uint32_t)(t);} } while(0)
+
 // ===== Debug Register Dump =====
 static void dump_fpga_regs(void) {
     uart_puts("  REGS:");
@@ -656,6 +668,8 @@ static int fmt_name(char* buf, int maxlen, int layer, const char* suffix) {
 // FORWARD LAYER
 // ====================================================================
 static void forward_layer(float* hidden, int layer, int pos) {
+    prog_set_layer(layer);
+    prog_inc();
     char name[128];
     Tensor* t;
     // Use SCRATCH_F32 instead of stack to avoid ~64KB stack overflow
@@ -823,6 +837,7 @@ static int run_inference(const int* prompt_tokens, int n_prompt) {
     // Process prompt tokens (prefill phase)
     uart_puts("Processing prompt...\n");
     for (int t = 0; t < n_prompt; t++) {
+        prog_set_token(t);
         process_embedding(g_state.hidden, prompt_tokens[t]);
         for (int layer = 0; layer < NUM_LAYERS; layer++)
             forward_layer(g_state.hidden, layer, t);
@@ -840,6 +855,7 @@ static int run_inference(const int* prompt_tokens, int n_prompt) {
 
     // Generate more tokens
     for (int gen = 0; gen < 10; gen++) {
+        prog_set_token(n_prompt + gen);
         int pos = n_prompt + gen;
         if (pos >= MAX_SEQ_LEN) break;
 
@@ -880,6 +896,8 @@ extern "C" int main(void) {
     memset(&g_state, 0, sizeof(g_state));
     reg_write32(REG_Q8_NUM_GROUPS, 14);
     uart_puts("FPGA Q8_NUM_GROUPS=14\n");
+
+    prog_init();
 
     // Initialize CPU_OP interrupt protocol
     // Set chain_ctrl[3]=1 (intr_enable) for interrupt mode, clear resume/pending

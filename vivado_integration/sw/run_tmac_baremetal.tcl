@@ -86,26 +86,42 @@ after 200
 puts "  ELF loaded"
 
 # ===== Run =====
-puts "Running (120s timeout)..."
+puts "Running (900s timeout)..."
 con
-after 120000
+after 900000
 catch {targets -set -filter {name =~ "*Cortex-A9*#0*"}}; after 100
 stop; after 200
 
 # ===== Check FPGA registers =====
 puts "\n--- FPGA State ---"
-set dbg [gp0_read 0x28]
-set q8d [gp0_read 0x3C]
-set q5d [gp0_read 0x40]
-set chain [gp0_read 0x04]
-set gie [gp0_read 0x08]
-set isr [gp0_read 0x0C]
-puts "  REG_DEBUG=0x[format %08x $dbg]"
-puts "  REG_Q8_DEBUG=0x[format %08x $q8d]"
-puts "  REG_Q5_DEBUG=0x[format %08x $q5d]"
-puts "  CHAIN_CTRL=0x[format %08x $chain] GIE=0x[format %02x $gie] ISR=0x[format %02x $isr]"
+puts "  REG_DEBUG=0x[format %08x [gp0_read 0x28]]"
+puts "  REG_Q8_DEBUG=0x[format %08x [gp0_read 0x3C]]"
+puts "  REG_Q5_DEBUG=0x[format %08x [gp0_read 0x40]]"
+puts "  CHAIN_CTRL=0x[format %08x [gp0_read 0x04]] GIE=0x[format %02x [gp0_read 0x08]] ISR=0x[format %02x [gp0_read 0x0C]]"
 puts "  STATUS=0x[format %04x [gp0_read 0x14]]"
 puts "  CLK_CNT=0x[format %08x [gp0_read 0x2C]]"
+
+# ===== Check exception info =====
+puts "\n--- Exception Check ---"
+set fault_magic [read32 0x1F000800]
+set fault_names {0x44414254 DABT 0x50414254 PABT 0x554E4446 UNDF}
+puts "  FAULT_MAGIC=0x[format %08x $fault_magic]"
+set found 0
+foreach {magic name} $fault_names {
+    if {$fault_magic == $magic} { puts "  => $name exception occurred!"; set found 1 }
+}
+if {!$found} { puts "  => No exception detected" }
+puts "  FAULT_LR  =0x[format %08x [read32 0x1F000810]]"
+puts "  FAULT_ADDR=0x[format %08x [read32 0x1F000814]]"
+puts "  FAULT_STAT=0x[format %08x [read32 0x1F000818]]"
+
+# ===== Check progress =====
+puts "\n--- Progress Monitor ---"
+set p_cnt [read32 0x1F000900]
+set p_layer [read32 0x1F000904]
+set p_matmul [read32 0x1F000908]
+set p_token [read32 0x1F00090C]
+puts "  PROG_CNT=$p_cnt LAYER=$p_layer MATMUL=$p_matmul TOKEN=$p_token"
 
 # ===== Check output =====
 puts "\n--- Output Buffer (token IDs) ---"
