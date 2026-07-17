@@ -1,7 +1,11 @@
-# T-MAC Bare-Metal Inference Engine Test
-# Loads tmac_baremetal.elf with a dummy model + prompt
-# Power-cycle the board before running!
-# C:\Xilinx\Vivado\2023.1\bin\xsdb.bat vivado_integration/sw/run_tmac_baremetal.tcl
+proc read32 {addr} {
+    set r [mrd $addr 1]
+    if {[regexp {:\s+([0-9A-Fa-f]+)} $r full data]} { return [expr "0x$data"] }
+    return -1
+}
+proc write32 {addr val} { mwr -force $addr $val }
+proc gp0_read {reg} { return [read32 [expr 0x43C00000 + $reg]] }
+proc gp0_write {reg val} { write32 [expr 0x43C00000 + $reg] $val }
 
 set BITSTREAM  {D:/Users/u/tmac-zynq-fpga/vivado_integration/proj_bd/matmul_bd.runs/impl_1/system_wrapper.bit}
 set PS7_INIT   {D:/Users/u/tmac-zynq-fpga/vivado_integration/proj_bd/matmul_bd.gen/sources_1/bd/system/ip/system_ps7_0/ps7_init.tcl}
@@ -9,16 +13,6 @@ set ELF_PATH   {D:/Users/u/tmac-zynq-fpga/vivado_integration/sw/tmac_baremetal.e
 set MODEL_PATH {D:/Users/u/tmac-zynq-fpga/models/model.tmac}
 set MODEL_BASE 0x00200000
 set DESC_BASE  0x1F001000
-set GP0_BASE   0x43C00000
-
-proc read32 {addr} {
-    set r [mrd $addr 1]
-    if {[regexp {:\s+([0-9A-Fa-f]+)} $r full data]} { return [expr "0x$data"] }
-    return -1
-}
-proc write32 {addr val} { mwr -force $addr $val }
-proc gp0_read {reg} { global GP0_BASE; return [read32 [expr $GP0_BASE + $reg]] }
-proc gp0_write {reg val} { global GP0_BASE; write32 [expr $GP0_BASE + $reg] $val }
 
 puts "=============================================="
 puts "  T-MAC Bare-Metal Inference Test"
@@ -66,6 +60,13 @@ set clk_cnt [gp0_read 0x2C]
 puts "  CLK_CNT = [format 0x%08X $clk_cnt]"
 if {$clk_cnt == 0} { puts "  WARNING: CLK_CNT=0, PL may not be running" }
 
+# ===== Verify XSDB DDR access =====
+puts "Verifying DDR access..."
+write32 0x1F000800 0xCAFEBABE
+set v [read32 0x1F000800]
+puts "  Wrote 0xCAFEBABE to 0x1F000800, read back 0x[format %08x $v]"
+if {$v != 0xCAFEBABE} { puts "  WARNING: DDR access unreliable!" }
+
 # ===== Load model to DDR =====
 puts "Loading model from $MODEL_PATH..."
 dow -data $MODEL_PATH $MODEL_BASE
@@ -74,10 +75,23 @@ puts "  Model loaded"
 set n_bytes [file size $MODEL_PATH]
 puts "  Model size: $n_bytes bytes"
 
-# ===== Write prompt buffer: 1 token (BOS-like token 151643) =====
+# ===== Verify model header =====
+set magic [read32 $MODEL_BASE]
+puts "  Model magic=0x[format %08x $magic] (expect 0x43414D54=TMAC)"
+set nten [read32 [expr $MODEL_BASE + 4]]
+puts "  n_tensors=$nten"
+
+# ===== Write prompt buffer: 1 token =====
 puts "Writing prompt buffer..."
-write32 $DESC_BASE 1               ;# n_prompt = 1
+write32 $DESC_BASE 1
 write32 [expr $DESC_BASE + 4] 151646  ;# Qwen2 BOS token
+
+# ===== Clear progress/exception buffers =====
+write32 0x1F000800 0
+write32 0x1F000900 0
+write32 0x1F000904 0
+write32 0x1F000908 0
+write32 0x1F00090C 0
 
 # ===== Load ELF =====
 puts "Loading ELF..."
@@ -104,35 +118,32 @@ puts "  CLK_CNT=0x[format %08x [gp0_read 0x2C]]"
 # ===== Check exception info =====
 puts "\n--- Exception Check ---"
 set fault_magic [read32 0x1F000800]
-set fault_names {0x44414254 DABT 0x50414254 PABT 0x554E4446 UNDF}
 puts "  FAULT_MAGIC=0x[format %08x $fault_magic]"
-set found 0
-foreach {magic name} $fault_names {
-    if {$fault_magic == $magic} { puts "  => $name exception occurred!"; set found 1 }
-}
-if {!$found} { puts "  => No exception detected" }
+if {$fault_magic == 0x44414254} { puts "  => DATA ABORT!" }
+if {$fault_magic == 0x50414254} { puts "  => PREFETCH ABORT!" }
+if {$fault_magic == 0x554E4446} { puts "  => UNDEFINED INSTRUCTION!" }
+if {$fault_magic == 0} { puts "  => No exception" }
 puts "  FAULT_LR  =0x[format %08x [read32 0x1F000810]]"
 puts "  FAULT_ADDR=0x[format %08x [read32 0x1F000814]]"
 puts "  FAULT_STAT=0x[format %08x [read32 0x1F000818]]"
 
 # ===== Check progress =====
 puts "\n--- Progress Monitor ---"
-set p_cnt [read32 0x1F000900]
-set p_layer [read32 0x1F000904]
-set p_matmul [read32 0x1F000908]
-set p_token [read32 0x1F00090C]
-puts "  PROG_CNT=$p_cnt LAYER=$p_layer MATMUL=$p_matmul TOKEN=$p_token"
+puts "  PROG_CNT=[read32 0x1F000900]"
+puts "  PROG_LAYER=[read32 0x1F000904]"
+puts "  PROG_MATMUL=[read32 0x1F000908]"
+puts "  PROG_TOKEN=[read32 0x1F00090C]"
 
 # ===== Check output =====
-puts "\n--- Output Buffer (token IDs) ---"
+puts "\n--- Output Buffer ---"
 set n_out [read32 0x1F000000]
 puts "  n_output=$n_out"
 if {$n_out > 0 && $n_out < 100} {
     for {set i 0} {$i < $n_out} {incr i} {
         puts "  token $i: [read32 [expr 0x1F000004 + $i*4]]"
     }
-} else {
-    puts "  (no valid output — program may have hit model load error)"
+} elseif {$n_out == 0} {
+    puts "  (program did not write output)"
 }
 
 puts ""

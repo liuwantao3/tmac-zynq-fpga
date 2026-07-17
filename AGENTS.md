@@ -903,3 +903,70 @@ Three bugs in the multi-group Q8 iteration were found and fixed during iVerilog 
 - `vivado_integration/proj_bd/matmul_bd.runs/impl_1/system_wrapper.bit`: Synthesized bitstream (reordered PS7 config)
 - `D:/Users/u/workspace/tmac/Debug/tmac.elf`: Vitis ELF loaded by XSDB
 - `docs/debug_log.md`: Full debug history
+
+## Linux-on-SD Card Boot (Buildroot)
+
+JTAG-based testing has proven unreliable (SLCR lock, 7-min model load, no caches). The project is moving to a Linux-on-SD flow. Build steps split across two machines:
+
+### Windows machine (Vivado)
+
+Provides pre-built hardware files in `linux/boot/`:
+- `system_wrapper.bit` — already built (2026-07-12)
+- `matmul_bd.xsa` — hardware handoff file (2026-07-12)
+- `boot.bif` — boot image description (FSBL + bitstream + U-Boot)
+- `zynq-microzed.dts` — device tree source
+
+To generate BOOT.BIN after the Mac provides U-Boot and FSBL:
+```
+bootgen -image linux/boot/boot.bif -o linux/boot/BOOT.BIN -w
+```
+
+### Mac machine (ARM cross-compiler)
+
+Builds U-Boot + kernel + rootfs + test program:
+
+```bash
+# Toolchain
+brew install arm-linux-gnueabihf-binutils arm-linux-gnueabihf-gcc
+
+# U-Boot
+git clone https://github.com/Xilinx/u-boot-xlnx
+make -C u-boot-xlnx CROSS_COMPILE=arm-linux-gnueabihf- zynq_microzed_config
+make -C u-boot-xlnx CROSS_COMPILE=arm-linux-gnueabihf- -j4
+
+# Kernel
+git clone https://github.com/Xilinx/linux-xlnx
+make -C linux-xlnx ARCH=arm xilinx_zynq_defconfig
+make -C linux-xlnx ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- -j4 UIMAGE_LOADADDR=0x8000 uImage
+make -C linux-xlnx ARCH=arm dtbs
+
+# Buildroot (kernel + rootfs in one pass)
+git clone https://github.com/buildroot/buildroot
+cd buildroot
+make qemu_arm_vexpress_defconfig
+# Configure: Target → ARM (little endian) → Cortex-A9/NEON/VFPv3
+#            Toolchain → Enable VFP extension
+make -j4
+# Output: output/images/rootfs.cpio.uboot
+
+# Test program
+arm-linux-gnueabihf-gcc -O2 -o tmac linux/tmac_linux.c -lm
+```
+
+### SD card layout
+
+```
+Partition 1 (FAT32, ~64MB): BOOT.BIN, uImage, devicetree.dtb, uramdisk.image.gz
+Partition 2 (ext4, rest):   model.tmac, tmac
+```
+
+### Key differences from bare-metal
+
+| Feature | JTAG bare-metal | Linux SD |
+|---------|----------------|----------|
+| CPU caches | OFF (slow DDR) | ON (full perf) |
+| Model loading | 7 min over JTAG | ~2s from SD |
+| Debug output | Via DDR buffer | Console printf |
+| Math lib | Custom expf/sinf | glibc math.h |
+| FPGA access | Direct pointer | /dev/mem mmap |
+| Interrupts | Polling only | UIO or kernel driver |
