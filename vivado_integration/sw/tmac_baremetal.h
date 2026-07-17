@@ -48,6 +48,13 @@
 #define BUF_SWIGLU_OUT       (FPGA_ACT_BUF + 0x6000) // SwiGLU output (4KB)
 #define BUF_FFN_OUT          (FPGA_ACT_BUF + 0x7000) // FFN output (2KB)
 
+// Float scratch offsets for forward_layer (replace stack arrays to avoid overflow)
+// Gate/Up are largest (4864 floats each = 19KB); other buffers reuse middle region
+#define SCR_GATE        0x0000  // [4864] 19KB
+#define SCR_UP          0x4C00  // [4864] 19KB, starts at 0x4C00
+#define SCR_TEMP        0x9800  // [2048] 8KB — reused for hidden, norm, q, context, etc.
+// Total scratch: 0x9800 + 0x2000 = 0xB800 = 46KB, fits in 64KB SCRATCH_F32
+
 // CPU_OP descriptor indices within the layer chain
 #define CHAIN_IDX_ATTN_NORM       0
 #define CHAIN_IDX_Q_MATMUL        1

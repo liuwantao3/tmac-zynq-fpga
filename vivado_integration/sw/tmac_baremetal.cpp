@@ -368,66 +368,69 @@ static void q8_preprocess_tile(const Tensor* A, int row0, uint8_t* fpga_wt) {
         }
     }
 
-    // Write per-column scales (all 1.0 = 0x0100 UQ8.8) at offset Q8_TILE_WEIGHT_BYTES.
-    // The C post-processing in fpga_q8_tile handles the real dequantization via
-    // row_inv and x_scale; smem scales in the FPGA are no-ops for now.
+    // Write per-column scales (UQ8.8) extracted from Q8_0 block f16 d values.
+    // Scale buffer layout per group (256 bytes = 128 × 16-bit):
+    //   For bank wi_i (0..7), row_group g (0..7), column_half k5 (0..1):
+    //     sc_addr = (g << 4) | (wi_i << 1) | k5
+    //     offset_in_group = sc_addr * 2
+    //   Read by FPGA as: smem[wi_i][{g, k5}] = UQ8.8 scale for row=(r0+g*8+wi_i), col_half=k5
     uint8_t* scale_out = fpga_wt + Q8_TILE_WEIGHT_BYTES;
     for (int g = 0; g < Q8_NUM_GROUPS; g++) {
-        for (int c = 0; c < Q8_GROUP_COLS; c++) {
-            scale_out[g * Q8_GROUP_SCALE_BYTES + c * 2 + 0] = 0x00;
-            scale_out[g * Q8_GROUP_SCALE_BYTES + c * 2 + 1] = 0x01; // 0x0100 LE = 1.0
+        int col0 = g * Q8_GROUP_COLS;
+        uint8_t* gs = scale_out + g * Q8_GROUP_SCALE_BYTES;
+        memset(gs, 0, Q8_GROUP_SCALE_BYTES); // default to zero
+        for (int r = 0; r < Q8_TILE_ROWS; r++) {
+            int row = row0 + r;
+            if (row >= (int)A->rows) continue;
+            int wi_i = r & 7;
+            int row_g = r >> 3;
+            for (int half = 0; half < 2; half++) {
+                uint64_t flat = (uint64_t)row * cols + col0 + half * 32;
+                uint64_t block_idx = flat / 32;
+                uint64_t bo = block_idx * 34;
+                uint16_t d_f16 = (uint16_t)A->data[bo] | ((uint16_t)A->data[bo+1] << 8);
+                float d_float = f16_to_f32(d_f16);
+                uint32_t uq = (uint32_t)(d_float * 256.0f + 0.5f);
+                if (uq > 65535) uq = 65535;
+                int sc_addr = (row_g << 4) | (wi_i << 1) | half;
+                gs[sc_addr * 2 + 0] = uq & 0xFF;
+                gs[sc_addr * 2 + 1] = (uq >> 8) & 0xFF;
+            }
         }
-    }
-}
-
-// Row_inv computation for Q8_0 tile: 32767/max_abs for each of 64 rows
-static void q8_compute_row_inv(const Tensor* A, int row0, float* row_inv) {
-    const int cols = (int)A->cols;
-    for (int r = 0; r < Q8_TILE_ROWS && (row0 + r) < (int)A->rows; r++) {
-        int row = row0 + r;
-        float max_abs = 0.0f;
-        for (int j = 0; j < cols; j++) {
-            float v = dequant(A, (uint64_t)row * cols + j);
-            float a = fabsf(v);
-            if (a > max_abs) max_abs = a;
-        }
-        if (max_abs < 1e-10f) max_abs = 1.0f;
-        row_inv[r] = 32767.0f / max_abs;
     }
 }
 
 // Run Q8_0 matmul via FPGA HP descriptor for one 64-row tile
 // Returns 0 on success, -1 on timeout.
 static int fpga_q8_tile(const uint8_t* fpga_wt, const int16_t* x_q,
-                        float* y, int row0, float x_scale,
-                        const float* row_inv, int nrows)
+                        float* y, int row0, float x_scale, int nrows)
 {
     uint32_t wt_addr = FPGA_WEIGHT_REFMT;
     uint32_t act_addr = FPGA_ACT_BUF;
     uint32_t res_addr = FPGA_RES_BUF;
 
-    // 1. Write weight data + scales to scratch
     memcpy((void*)(uintptr_t)wt_addr, fpga_wt, Q8_TILE_STRIDE);
-
-    // 2. Write activations
     memcpy((void*)(uintptr_t)act_addr, x_q, Q8_TILE_COLS * 2);
 
-    // 3. Build single-descriptor chain
     Descriptor* d = (Descriptor*)(uintptr_t)DESC_CHAIN_BASE;
     desc_write(d, 0, wt_addr, act_addr, res_addr, DESC_Q8,
                Q8_NUM_GROUPS, 1, Q8_TILE_COLS * 2);
 
-    // 4. Run
     if (chain_run(DESC_CHAIN_BASE, 1) != 0) {
         uart_puts("  Q8 tile FAIL (timeout)\n");
         return -1;
     }
 
-    // 5. Read results
+    // FPGA now has real Q8_0 block scales in smem, so no row_inv needed.
+    // Result: acc = sum(int8_W * d_Q8 * x_q), then y += x_scale * acc.
     uint32_t* res32 = (uint32_t*)(uintptr_t)res_addr;
     for (int i = 0; i < nrows; i++) {
-        float val = read_acc_result(res32, i, x_scale, row_inv);
-        y[row0 + i] += val;
+        uint32_t lo = res32[i * 2];
+        uint32_t hi = res32[i * 2 + 1];
+        uint64_t raw = (uint64_t)lo | ((uint64_t)hi << 32);
+        if (raw & ((uint64_t)1 << 47)) raw |= 0xFFFF000000000000ULL;
+        int32_t acc = (int32_t)(int64_t)raw;
+        y[row0 + i] += (float)acc * x_scale;
     }
     return 0;
 }
@@ -575,26 +578,11 @@ static void matmul(const Tensor* A, const float* x, float* y, int rows, int cols
 
     if (A->type == TENSOR_Q8_0) {
         int tile_rows = Q8_TILE_ROWS;
-        float row_inv_buf[64];
-
         for (int r0 = 0; r0 < rows; r0 += tile_rows) {
             int nr = min_int(tile_rows, rows - r0);
             q8_preprocess_tile(A, r0, (uint8_t*)(uintptr_t)FPGA_WEIGHT_REFMT);
-
-            // Compute row_inv for this tile
-            for (int i = 0; i < nr; i++) {
-                int row = r0 + i;
-                float max_abs = 0.0f;
-                for (int j = 0; j < cols; j++) {
-                    float v = fabsf(dequant(A, (uint64_t)row * cols + j));
-                    if (v > max_abs) max_abs = v;
-                }
-                row_inv_buf[i] = (max_abs < 1e-10f) ? 1.0f : 32767.0f / max_abs;
-            }
-            for (int i = nr; i < tile_rows; i++) row_inv_buf[i] = 1.0f;
-
             if (fpga_q8_tile((uint8_t*)(uintptr_t)FPGA_WEIGHT_REFMT,
-                            x_q, y, r0, x_scale, row_inv_buf, nr) != 0) return;
+                            x_q, y, r0, x_scale, nr) != 0) return;
         }
     }
     else if (A->type == TENSOR_Q5_0) {
@@ -670,33 +658,36 @@ static int fmt_name(char* buf, int maxlen, int layer, const char* suffix) {
 static void forward_layer(float* hidden, int layer, int pos) {
     char name[128];
     Tensor* t;
-    float original_hidden[HIDDEN_DIM];
-    memcpy(original_hidden, hidden, HIDDEN_DIM * sizeof(float));
+    // Use SCRATCH_F32 instead of stack to avoid ~64KB stack overflow
+    float* scratch = (float*)(uintptr_t)SCRATCH_F32;
+    float* const temp     = scratch + 0x9800/4; // SCR_TEMP at offset 0x9800
+    float* const gate     = scratch + 0x0000/4; // SCR_GATE
+    float* const up       = scratch + 0x4C00/4; // SCR_UP
+    float* norm_out = temp;   // alias temp area
+    float* q_vec    = temp;
+    float* k_new    = temp;
+    float* v_new    = temp + 896; // after k_new (128 floats)
+    float* context  = temp;
+    float* attn_out = temp;
+    float* ffn_out  = temp;
+    float* ffn_norm_out = temp;
+    float original_hidden[HIDDEN_DIM]; // 3584 bytes — small enough for stack
 
-    float attn_norm_out[HIDDEN_DIM];
-    float q_vec[HIDDEN_DIM];
-    float k_new[K_DIM];
-    float v_new[V_DIM];
-    float context[HIDDEN_DIM];
-    float attn_out[HIDDEN_DIM];
-    float ffn_norm_out[HIDDEN_DIM];
-    float gate[INTER_DIM];
-    float up[INTER_DIM];
-    float ffn_out[HIDDEN_DIM];
+    memcpy(original_hidden, hidden, HIDDEN_DIM * sizeof(float));
 
     // Attention norm
     {
         fmt_name(name, 128, layer, "attn_norm.weight");
         t = get_tensor(name);
-        if (t) rms_norm(attn_norm_out, original_hidden, HIDDEN_DIM, t);
-        else { memcpy(attn_norm_out, original_hidden, HIDDEN_DIM * sizeof(float)); }
+        if (t) rms_norm(norm_out, original_hidden, HIDDEN_DIM, t);
+        else { memcpy(norm_out, original_hidden, HIDDEN_DIM * sizeof(float)); }
     }
 
     // Q
     {
         fmt_name(name, 128, layer, "attn_q.weight");
         t = get_tensor(name);
-        if (t) matmul(t, attn_norm_out, q_vec, HIDDEN_DIM, HIDDEN_DIM);
+        if (t) matmul(t, norm_out, q_vec, HIDDEN_DIM, HIDDEN_DIM);
         fmt_name(name, 128, layer, "attn_q.bias");
         t = get_tensor(name);
         if (t) { float* b = (float*)t->data; for (int i = 0; i < HIDDEN_DIM; i++) q_vec[i] += b[i]; }
@@ -706,7 +697,7 @@ static void forward_layer(float* hidden, int layer, int pos) {
     {
         fmt_name(name, 128, layer, "attn_k.weight");
         t = get_tensor(name);
-        if (t) matmul(t, attn_norm_out, k_new, K_DIM, HIDDEN_DIM);
+        if (t) matmul(t, norm_out, k_new, K_DIM, HIDDEN_DIM);
         fmt_name(name, 128, layer, "attn_k.bias");
         t = get_tensor(name);
         if (t) { float* b = (float*)t->data; for (int i = 0; i < K_DIM; i++) k_new[i] += b[i]; }
@@ -716,7 +707,7 @@ static void forward_layer(float* hidden, int layer, int pos) {
     {
         fmt_name(name, 128, layer, "attn_v.weight");
         t = get_tensor(name);
-        if (t) matmul(t, attn_norm_out, v_new, V_DIM, HIDDEN_DIM);
+        if (t) matmul(t, norm_out, v_new, V_DIM, HIDDEN_DIM);
         fmt_name(name, 128, layer, "attn_v.bias");
         t = get_tensor(name);
         if (t) { float* b = (float*)t->data; for (int i = 0; i < V_DIM; i++) v_new[i] += b[i]; }
@@ -729,7 +720,7 @@ static void forward_layer(float* hidden, int layer, int pos) {
     for (int i = 0; i < K_DIM; i++) g_state.k_cache[layer][pos][i] = k_new[i];
     for (int i = 0; i < V_DIM; i++) g_state.v_cache[layer][pos][i] = v_new[i];
 
-    // Attention
+    // Attention (uses temp as context output)
     attention_forward(context, q_vec, layer, pos);
 
     // Attention output projection
@@ -767,7 +758,7 @@ static void forward_layer(float* hidden, int layer, int pos) {
     silu_forward(gate, gate, INTER_DIM);
     for (int i = 0; i < INTER_DIM; i++) gate[i] *= up[i];
 
-    // FFN down
+    // FFN down (CPU fallback — Q6_K/Q4_K not in FPGA FSM)
     {
         fmt_name(name, 128, layer, "ffn_down.weight");
         t = get_tensor(name);

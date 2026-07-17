@@ -6,6 +6,7 @@
 set BITSTREAM  {D:/Users/u/tmac-zynq-fpga/vivado_integration/proj_bd/matmul_bd.runs/impl_1/system_wrapper.bit}
 set PS7_INIT   {D:/Users/u/tmac-zynq-fpga/vivado_integration/proj_bd/matmul_bd.gen/sources_1/bd/system/ip/system_ps7_0/ps7_init.tcl}
 set ELF_PATH   {D:/Users/u/tmac-zynq-fpga/vivado_integration/sw/tmac_baremetal.elf}
+set MODEL_PATH {D:/Users/u/tmac-zynq-fpga/models/model.tmac}
 set MODEL_BASE 0x00200000
 set DESC_BASE  0x1F001000
 set GP0_BASE   0x43C00000
@@ -65,17 +66,18 @@ set clk_cnt [gp0_read 0x2C]
 puts "  CLK_CNT = [format 0x%08X $clk_cnt]"
 if {$clk_cnt == 0} { puts "  WARNING: CLK_CNT=0, PL may not be running" }
 
-# ===== Write minimal model header at MODEL_BASE =====
-# TMAC magic "TMAC" + 0 tensors + 0 bytes total
-puts "Writing minimal model header..."
-write32 $MODEL_BASE 0x43414D54     ;# "TMAC"
-write32 [expr $MODEL_BASE + 4] 0x00000000  ;# n_tensors = 0 (low 32)
-write32 [expr $MODEL_BASE + 8] 0x00000000  ;# n_tensors = 0 (high 32)
+# ===== Load model to DDR =====
+puts "Loading model from $MODEL_PATH..."
+dow -data $MODEL_PATH $MODEL_BASE
+after 200
+puts "  Model loaded"
+set n_bytes [file size $MODEL_PATH]
+puts "  Model size: $n_bytes bytes"
 
-# ===== Write prompt buffer: 1 token (token ID 42) =====
+# ===== Write prompt buffer: 1 token (BOS-like token 151643) =====
 puts "Writing prompt buffer..."
 write32 $DESC_BASE 1               ;# n_prompt = 1
-write32 [expr $DESC_BASE + 4] 42  ;# token ID
+write32 [expr $DESC_BASE + 4] 151646  ;# Qwen2 BOS token
 
 # ===== Load ELF =====
 puts "Loading ELF..."
@@ -84,9 +86,9 @@ after 200
 puts "  ELF loaded"
 
 # ===== Run =====
-puts "Running (5s timeout)..."
+puts "Running (120s timeout)..."
 con
-after 5000
+after 120000
 catch {targets -set -filter {name =~ "*Cortex-A9*#0*"}}; after 100
 stop; after 200
 
