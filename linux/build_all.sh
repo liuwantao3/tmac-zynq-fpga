@@ -17,13 +17,20 @@ echo "  boot_dir:  $BOOT_DIR"
 echo "  cores:     $CORES"
 echo ""
 
-which arm-linux-gnueabihf-gcc >/dev/null 2>&1 || {
-    echo "ERROR: arm-linux-gnueabihf-gcc not found in PATH."
-    echo "Install ARM GCC from: https://developer.arm.com/downloads/-/arm-gnu-toolchain-downloads"
-    echo "Or set CROSS_COMPILE manually and rerun."
-    exit 1
-}
-GCC_VER=$(arm-linux-gnueabihf-gcc --version | head -1)
+# ── Auto-setup toolchain ──
+if ! which arm-linux-gnueabihf-gcc >/dev/null 2>&1; then
+    TOOLS="/tmp/arm-toolchain/bin"
+    if [[ -x "$TOOLS/arm-linux-gnueabihf-gcc" ]]; then
+        export PATH="$TOOLS:$PATH"
+        echo "  toolchain: clang-based at $TOOLS"
+    else
+        echo "ERROR: arm-linux-gnueabihf-gcc not found in PATH."
+        echo "Run: bash linux/setup_toolchain.sh   (clang-based, no downloads needed)"
+        echo "Or install ARM GCC from: https://developer.arm.com/downloads/-/arm-gnu-toolchain-downloads"
+        exit 1
+    fi
+fi
+GCC_VER=$(arm-linux-gnueabihf-gcc --version 2>&1 | head -1)
 echo "  compiler:  $GCC_VER"
 echo ""
 
@@ -31,11 +38,14 @@ export CROSS_COMPILE=arm-linux-gnueabihf-
 TOOLCHAIN_DIR=$(dirname "$(which arm-linux-gnueabihf-gcc)")
 export PATH="$TOOLCHAIN_DIR:$PATH"
 
-# ── 1. U-Boot ──
+# Use GNU Make 4.x (macOS ships 3.81 which is too old for U-Boot/kernel)
+if command -v gmake >/dev/null 2>&1; then
+    export MAKE=gmake
+fi
 echo "=== [1/3] Building U-Boot ==="
 cd "$WORKDIR/u-boot-xlnx"
-make zynq_zc702_defconfig
-make -j"$CORES"
+${MAKE:-make} zynq_zc702_defconfig
+${MAKE:-make} -j"$CORES"
 cp u-boot "$BOOT_DIR/u-boot.elf"
 echo "  → u-boot.elf copied to $BOOT_DIR/"
 echo ""
@@ -43,9 +53,9 @@ echo ""
 # ── 2. Linux Kernel ──
 echo "=== [2/3] Building Linux Kernel ==="
 cd "$WORKDIR/linux-xlnx"
-make ARCH=arm xilinx_zynq_defconfig
-make -j"$CORES" ARCH=arm UIMAGE_LOADADDR=0x8000 uImage
-make ARCH=arm dtbs
+${MAKE:-make} ARCH=arm xilinx_zynq_defconfig
+${MAKE:-make} -j"$CORES" ARCH=arm UIMAGE_LOADADDR=0x8000 uImage
+${MAKE:-make} ARCH=arm dtbs
 cp arch/arm/boot/uImage "$BOOT_DIR/"
 cp arch/arm/boot/dts/zynq-zc702.dtb "$BOOT_DIR/devicetree.dtb"
 echo "  → uImage, devicetree.dtb copied to $BOOT_DIR/"
@@ -54,15 +64,15 @@ echo ""
 # ── 3. Buildroot (rootfs) ──
 echo "=== [3/3] Building Buildroot rootfs ==="
 cd "$WORKDIR/buildroot"
-make qemu_arm_vexpress_defconfig
+${MAKE:-make} qemu_arm_vexpress_defconfig
 
 # Enable NEON/VFPv3 for Cortex-A9
 cat >> .config << 'BRCFG'
 BR2_ARM_ENABLE_VFP=y
 BR2_ARM_ENABLE_NEON=y
 BRCFG
-make olddefconfig
-make -j"$CORES"
+${MAKE:-make} olddefconfig
+${MAKE:-make} -j"$CORES"
 
 cp output/images/rootfs.cpio.uboot "$BOOT_DIR/uramdisk.image.gz"
 echo "  → uramdisk.image.gz copied to $BOOT_DIR/"
