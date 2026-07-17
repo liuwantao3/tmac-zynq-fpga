@@ -44,6 +44,8 @@ if command -v gmake >/dev/null 2>&1; then
 fi
 echo "=== [1/3] Building U-Boot ==="
 cd "$WORKDIR/u-boot-xlnx"
+export HOSTCFLAGS="-I$(brew --prefix openssl 2>/dev/null || echo /opt/homebrew/opt/openssl@3)/include"
+export HOSTLDFLAGS="-L$(brew --prefix openssl 2>/dev/null || echo /opt/homebrew/opt/openssl@3)/lib"
 ${MAKE:-make} xilinx_zynq_virt_defconfig
 ${MAKE:-make} -j"$CORES"
 cp u-boot "$BOOT_DIR/u-boot.elf"
