@@ -7,7 +7,7 @@ SIZE = $(LLVM_DIR)/llvm-size.exe
 
 CFLAGS  = --target=armv7a-none-eabi -mcpu=cortex-a9 -O2 -g -nostdlib -ffreestanding -ffast-math
 CXXFLAGS = --target=armv7a-none-eabi -mcpu=cortex-a9 -O1 -g -nostdlib -ffreestanding -ffast-math -fno-exceptions -fno-rtti
-LDFLAGS = -T link.ld -Map=tmac.map
+LDFLAGS = -T link.ld
 
 OBJS_COMMON = startup.o
 
