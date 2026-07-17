@@ -125,3 +125,4 @@ docker/licenses/xilinx.lic
 # Third-party gguf-tools build artifacts
 gguf-tools-main/gguf-tools
 gguf-tools-main/*.o
+linux/boot/*.elf
