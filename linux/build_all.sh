@@ -127,10 +127,15 @@ echo ""
 # ── 2. Linux Kernel ──
 echo "=== [2/3] Building Linux Kernel ==="
 cd "$WORKDIR/linux-xlnx"
+
+# Create minimal elf.h for macOS (no system-level ELF support)
+[ -f /tmp/arm-toolchain/elf.h ] || {
+    echo "ERROR: /tmp/arm-toolchain/elf.h not found. Run: bash linux/setup_toolchain.sh"
+    exit 1
+}
+export HOSTCFLAGS="-I/tmp/arm-toolchain"
+
 ${MAKE:-make} ARCH=arm xilinx_zynq_defconfig
-# macOS lacks elf.h; disable build-time table sort (not needed for boot)
-echo 'CONFIG_BUILDTIME_TABLE_SORT=n' >> .config
-${MAKE:-make} ARCH=arm olddefconfig
 ${MAKE:-make} -j"$CORES" ARCH=arm UIMAGE_LOADADDR=0x8000 uImage
 ${MAKE:-make} ARCH=arm dtbs
 cp arch/arm/boot/uImage "$BOOT_DIR/"

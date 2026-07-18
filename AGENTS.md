@@ -903,70 +903,54 @@ Three bugs in the multi-group Q8 iteration were found and fixed during iVerilog 
 - `vivado_integration/proj_bd/matmul_bd.runs/impl_1/system_wrapper.bit`: Synthesized bitstream (reordered PS7 config)
 - `D:/Users/u/workspace/tmac/Debug/tmac.elf`: Vitis ELF loaded by XSDB
 - `docs/debug_log.md`: Full debug history
+- `linux/README.md`: Linux-on-SD boot build guide + Windows SD card creation steps
+- `linux/tmac_linux.c`: Linux userspace FPGA test program (uses /dev/mem mmap)
+- `linux/boot/boot.bif`: Bootgen config (FSBL + bitstream + U-Boot)
+- `linux/boot/system_wrapper.bit`: FPGA bitstream for Linux boot
+- `linux/setup_toolchain.sh`: Creates clang-based ARM cross-compiler wrappers for macOS
+- `linux/build_all.sh`: Full build script for U-Boot + kernel + initramfs (Lima VM)
+- `linux/clone_repos.sh`: Clones u-boot-xlnx + linux-xlnx + buildroot in parallel
 
-## Linux-on-SD Card Boot (Buildroot)
+## Linux-on-SD Card Boot ✅ BUILT (2026-07-18)
 
-JTAG-based testing has proven unreliable (SLCR lock, 7-min model load, no caches). The project is moving to a Linux-on-SD flow. Build steps split across two machines:
+U-Boot + Linux kernel + BusyBox initramfs + FPGA test program built in
+a Lima ARM64 Ubuntu VM on macOS. No macOS cross-compilation hacks needed.
 
-### Windows machine (Vivado)
+**Build output at `~/arm-build/`:**
 
-Provides pre-built hardware files in `linux/boot/`:
-- `system_wrapper.bit` — already built (2026-07-12)
-- `matmul_bd.xsa` — hardware handoff file (2026-07-12)
-- `boot.bif` — boot image description (FSBL + bitstream + U-Boot)
-- `zynq-microzed.dts` — device tree source
+| File | Size | Description |
+|------|------|-------------|
+| `u-boot.elf` | 6.7 MB | U-Boot xilinx-v2022.1 (xilinx_zynq_virt) |
+| `uImage` | 4.6 MB | Linux 6.6.0-xilinx (CONFIG_DEVMEM=y) |
+| `devicetree.dtb` | 17 KB | zynq-zc702 (prebuilt in kernel tree) |
+| `uramdisk.image.gz` | 1.3 MB | BusyBox initramfs (79 tools + tmac) |
+| `tmac` | 483 KB | Static ARM32 (mmaps FPGA at 0x43C00000) |
 
-To generate BOOT.BIN after the Mac provides U-Boot and FSBL:
+**Tools in initramfs:** devmem, hexdump, xxd, devmem, md5sum, vi, grep, awk,
+ifconfig, ping, wget, fdisk, mkfs.ext2, blkid, tar, modprobe, + BusyBox shell.
+
+**Kernel:** CONFIG_DEVMEM=y — FPGA registers accessible via `/dev/mem`.
+Use `iomem=relaxed` bootarg if STRICT_DEVMEM blocks 0x43C00000 range.
+
+**To reproduce:** See `linux/README.md` for full build instructions.
+The Lima VM approach eliminates all macOS SDK conflicts — builds take
+~5 min for U-Boot + kernel, no patches needed.
+
+### Windows (Vivado) — SD Card Creation
+
+**Pre-built files** in `linux/boot/`:
+- `system_wrapper.bit` — FPGA bitstream (prebuilt)
+- `matmul_bd.xsa` — hardware handoff
+- `boot.bif` — bootgen config (FSBL + bitstream + U-Boot)
+
+**Windows steps** (see `linux/README.md` for details):
+1. Build `fsbl.elf` in Vivado SDK from `matmul_bd.xsa`
+2. Copy `u-boot.elf`, `uImage`, `devicetree.dtb`, `uramdisk.image.gz` from macOS build
+3. Run `bootgen -image boot.bif -o BOOT.BIN -w`
+4. Format SD: FAT32 partition (BOOT.BIN + uImage + dtb + initramfs), ext4 partition (model.tmac + tmac)
+5. **Power-cycle** board, insert SD, set SD boot mode, connect UART (115200 baud)
+
+**U-Boot bootargs** for FPGA access:
 ```
-bootgen -image linux/boot/boot.bif -o linux/boot/BOOT.BIN -w
+setenv bootargs "console=ttyPS0,115200 root=/dev/ram0 rw iomem=relaxed"
 ```
-
-### Mac machine (ARM cross-compiler)
-
-Builds U-Boot + kernel + rootfs + test program:
-
-```bash
-# Toolchain
-brew install arm-linux-gnueabihf-binutils arm-linux-gnueabihf-gcc
-
-# U-Boot
-git clone https://github.com/Xilinx/u-boot-xlnx
-make -C u-boot-xlnx CROSS_COMPILE=arm-linux-gnueabihf- zynq_microzed_config
-make -C u-boot-xlnx CROSS_COMPILE=arm-linux-gnueabihf- -j4
-
-# Kernel
-git clone https://github.com/Xilinx/linux-xlnx
-make -C linux-xlnx ARCH=arm xilinx_zynq_defconfig
-make -C linux-xlnx ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- -j4 UIMAGE_LOADADDR=0x8000 uImage
-make -C linux-xlnx ARCH=arm dtbs
-
-# Buildroot (kernel + rootfs in one pass)
-git clone https://github.com/buildroot/buildroot
-cd buildroot
-make qemu_arm_vexpress_defconfig
-# Configure: Target → ARM (little endian) → Cortex-A9/NEON/VFPv3
-#            Toolchain → Enable VFP extension
-make -j4
-# Output: output/images/rootfs.cpio.uboot
-
-# Test program
-arm-linux-gnueabihf-gcc -O2 -o tmac linux/tmac_linux.c -lm
-```
-
-### SD card layout
-
-```
-Partition 1 (FAT32, ~64MB): BOOT.BIN, uImage, devicetree.dtb, uramdisk.image.gz
-Partition 2 (ext4, rest):   model.tmac, tmac
-```
-
-### Key differences from bare-metal
-
-| Feature | JTAG bare-metal | Linux SD |
-|---------|----------------|----------|
-| CPU caches | OFF (slow DDR) | ON (full perf) |
-| Model loading | 7 min over JTAG | ~2s from SD |
-| Debug output | Via DDR buffer | Console printf |
-| Math lib | Custom expf/sinf | glibc math.h |
-| FPGA access | Direct pointer | /dev/mem mmap |
-| Interrupts | Polling only | UIO or kernel driver |
