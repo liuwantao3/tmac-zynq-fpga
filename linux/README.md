@@ -6,7 +6,8 @@
 
 | File | Size | Source |
 |------|------|--------|
-| `u-boot.elf` | 6.7 MB | U-Boot xilinx-v2022.1 (xilinx_zynq_virt) |
+| `u-boot.img` | 1.2 MB | U-Boot image (loaded by SPL from SD) |
+| `u-boot-spl.bin` | 121 KB | SPL (loaded by FSBL, runs from OCM) |
 | `uImage` | 4.6 MB | Linux 6.6.0-xilinx (xilinx_zynq_defconfig) |
 | `devicetree.dtb` | 17 KB | zynq-zc702.dts (built from kernel tree) |
 | `uramdisk.image.gz` | 1.3 MB | BusyBox initramfs (79 applets + tmac) |
@@ -92,7 +93,8 @@ linux/boot/
 ├── matmul_bd.xsa          ← already in repo (hardware handoff)
 ├── boot.bif               ← already in repo (bootgen config)
 ├── fsbl.elf               ← build in Vivado SDK (see below)
-├── u-boot.elf             ← copy from ~/arm-build/
+├── u-boot-spl.bin         ← copy from ~/arm-build/
+├── u-boot.img             ← copy from ~/arm-build/
 ├── uImage                 ← copy from ~/arm-build/
 ├── devicetree.dtb          ← copy from ~/arm-build/
 └── uramdisk.image.gz       ← copy from ~/arm-build/
@@ -123,7 +125,7 @@ the_ROM_image:
 {
     [bootloader] fsbl.elf
     system_wrapper.bit
-    u-boot.elf
+    u-boot-spl.bin
 }
 ```
 
@@ -141,6 +143,7 @@ On Windows (using a tool like Rufus or diskpart for FAT32, and a Linux VM for ex
 ```
 Partition 1 (FAT32):
     BOOT.BIN
+    u-boot.img
     uImage
     devicetree.dtb
     uramdisk.image.gz

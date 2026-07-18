@@ -126,6 +126,8 @@ docker/licenses/xilinx.lic
 gguf-tools-main/gguf-tools
 gguf-tools-main/*.o
 linux/boot/*.elf
+linux/boot/*.bin
+linux/boot/*.img
 linux/boot/uImage
 linux/boot/devicetree.dtb
 linux/boot/uramdisk.image.gz

@@ -920,7 +920,8 @@ a Lima ARM64 Ubuntu VM on macOS. No macOS cross-compilation hacks needed.
 
 | File | Size | Description |
 |------|------|-------------|
-| `u-boot.elf` | 6.7 MB | U-Boot xilinx-v2022.1 (xilinx_zynq_virt) |
+| `u-boot.img` | 1.2 MB | U-Boot image (loaded by SPL from SD FAT32) |
+| `u-boot-spl.bin` | 121 KB | SPL (in BOOT.BIN, runs from OCM) |
 | `uImage` | 4.6 MB | Linux 6.6.0-xilinx (CONFIG_DEVMEM=y) |
 | `devicetree.dtb` | 17 KB | zynq-zc702 (prebuilt in kernel tree) |
 | `uramdisk.image.gz` | 1.3 MB | BusyBox initramfs (79 tools + tmac) |
@@ -945,7 +946,7 @@ The Lima VM approach eliminates all macOS SDK conflicts — builds take
 
 **Windows steps** (see `linux/README.md` for details):
 1. Build `fsbl.elf` in Vivado SDK from `matmul_bd.xsa`
-2. Copy `u-boot.elf`, `uImage`, `devicetree.dtb`, `uramdisk.image.gz` from macOS build
+2. Copy `u-boot-spl.bin`, `u-boot.img`, `uImage`, `devicetree.dtb`, `uramdisk.image.gz` from macOS build
 3. Run `bootgen -image boot.bif -o BOOT.BIN -w`
 4. Format SD: FAT32 partition (BOOT.BIN + uImage + dtb + initramfs), ext4 partition (model.tmac + tmac)
 5. **Power-cycle** board, insert SD, set SD boot mode, connect UART (115200 baud)
