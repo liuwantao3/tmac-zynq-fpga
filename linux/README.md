@@ -62,7 +62,7 @@ make ARCH=arm xilinx_zynq_defconfig
 ./scripts/config --enable SERIAL_ARM_DCC_CONSOLE
 ./scripts/config --enable DEBUG_LL
 ./scripts/config --enable EARLY_PRINTK
-./scripts/config --set-str CMDLINE "earlycon=dcc console=ttyDCC0 root=/dev/ram0 rw iomem=relaxed"
+./scripts/config --set-str CMDLINE "earlycon=dcc console=hvc0 root=/dev/ram0 rw iomem=relaxed"
 make -j$(nproc) ARCH=arm UIMAGE_LOADADDR=0x8000 uImage dtbs
 cp arch/arm/boot/uImage ~/tmac-zynq-fpga/linux/boot/
 cp arch/arm/boot/dts/zynq-zc702.dtb ~/tmac-zynq-fpga/linux/boot/devicetree.dtb
@@ -212,7 +212,7 @@ Partition 1 (FAT32):
 U-Boot> fatload mmc 0 0x3000000 uImage
 U-Boot> fatload mmc 0 0x2A00000 devicetree.dtb
 U-Boot> fatload mmc 0 0x2000000 uramdisk.image.gz
-U-Boot> setenv bootargs "earlycon=dcc console=ttyDCC0 root=/dev/ram0 rw iomem=relaxed"
+U-Boot> setenv bootargs "earlycon=dcc console=hvc0 root=/dev/ram0 rw iomem=relaxed"
 U-Boot> bootm 0x3000000 0x2000000 0x2A00000
 ```
 
@@ -238,9 +238,9 @@ Console via DCC: `readjtaguart -start` before `con`.
 |---------|------|-------------------|
 | Hardware | CH340 USB-UART (broken) | JTAG (Digilent HS-2, already connected) |
 | Speed | 115200 baud (~11 KB/s) | ~200-500 KB/s |
-| Console | `ttyPS0` | `ttyDCC0` |
+| Console | `ttyPS0` | `hvc0` |
 | U-Boot config | default | `CONFIG_ARM_DCC=y` |
-| Kernel bootargs | `console=ttyPS0,115200` | `earlycon=dcc console=ttyDCC0` |
+| Kernel bootargs | `console=ttyPS0,115200` | `earlycon=dcc console=hvc0` |
 | Capture | Serial terminal (PuTTY) | `readjtaguart -start` in XSDB |
 
 The physical CH340 RX pin is dead. PS7 UART TX works but nobody can hear it.
