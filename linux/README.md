@@ -1,94 +1,133 @@
 # FPGA Accelerator Linux-on-SD Boot
 
-**Built and tested in Lima ARM VM (Ubuntu 24.04 aarch64) on macOS.**
+**Two-machine split:** Windows (Vivado) → bitstream + FSBL + BOOT.BIN. Mac (Lima VM) → U-Boot + kernel + initramfs.
 
-## Build Results (2026-07-18)
+Hardware: MicroPhase Z7-Lite (xc7z010clg400-1), UART0 MIO14/15 CH340 broken — DCC console via JTAG.
 
-| File | Size | Source |
-|------|------|--------|
-| `u-boot.img` | 1.2 MB | U-Boot image (loaded by SPL from SD) |
-| `u-boot-spl.bin` | 121 KB | SPL (loaded by FSBL, runs from OCM) |
-| `uImage` | 4.6 MB | Linux 6.6.0-xilinx (xilinx_zynq_defconfig) |
-| `devicetree.dtb` | 17 KB | zynq-zc702.dts (built from kernel tree) |
-| `uramdisk.image.gz` | 1.3 MB | BusyBox initramfs (79 applets + tmac) |
-| `tmac` | 483 KB | Static ARM32, compiled from tmac_linux.c |
+## Quickstart: macOS Build
 
-All 5 files at `~/arm-build/` on macOS. Copy to Windows for SD card creation.
-
-## Hardware
-
-- **Board**: MicroPhase Z7-Lite (Zynq 7010, xc7z010clg400-1)
-- **DDR3**: 512 MB at 0x00100000–0x20000000
-- **PL clock**: 100 MHz (FCLK_CLK0)
-- **FPGA IP**: hp_fsm_top at AXI4-Lite 0x43C00000 (GP0)
-- **UART**: UART0 at 0xE0000000, MIO 14/15, 115200 baud
-- **SD**: SD0 at 0xE0100000, MIO 40-45
-- **/dev/mem**: CONFIG_DEVMEM=y enabled in kernel
-
-## Build Environment (Reproducible)
-
-Built in Lima ARM Ubuntu VM on Apple Silicon Mac:
+### One-time: Lima VM setup
 
 ```bash
-# 1. Start VM (one-time setup)
 brew install lima
 limactl start --name=linux-build --cpus=8 --memory=16 template://ubuntu
 limactl shell linux-build
+sudo apt update && sudo apt install -y \
+    gcc-arm-linux-gnueabihf build-essential flex bison bc libelf-dev libssl-dev \
+    busybox-static cpio git
+```
 
-# 2. Inside VM — install tools
-sudo apt update && sudo apt install -y gcc-arm-linux-gnueabihf \
-    build-essential flex bison bc libelf-dev libssl-dev git
+### Clone repo (includes FPGA bitstream + XSA from Windows)
 
-# 3. Clone repos
-cd ~ && git clone --depth=1 --branch xilinx-v2022.1 \
+```bash
+git clone <your-repo-url> ~/tmac-zynq-fpga
+cd ~/tmac-zynq-fpga
+```
+
+### 1. Build U-Boot (with DCC console)
+
+```bash
+cd ~
+git clone --depth=1 --branch xilinx-v2022.1 \
     https://github.com/Xilinx/u-boot-xlnx.git
-git clone --depth=1 --branch xilinx-v2024.1 \
-    https://github.com/Xilinx/linux-xlnx.git
-
-# 4. Build U-Boot
 cd ~/u-boot-xlnx
 export CROSS_COMPILE=arm-linux-gnueabihf-
+
+# Enable DCC console (ARM JTAG Debug Communication Channel)
+cat >> configs/xilinx_zynq_virt_defconfig << 'EOF'
+CONFIG_ARM_DCC=y
+CONFIG_SERIAL_ARM_DCC=y
+CONFIG_BAUDRATE=115200
+EOF
+make xilinx_zynq_virt_defconfig
+# Fix SPL build for Zynq 7010
 sed -i 's|@dd if=$$< of=$$@ conv=block,sync bs=4 2>/dev/null;|@cp $$< $$@|' scripts/Makefile.spl
-make xilinx_zynq_virt_defconfig && make -j8
+make -j$(nproc)
+cp u-boot u-boot.elf
+cp u-boot-spl.bin u-boot-spl.bin
+```
 
-# 5. Build Linux kernel
+### 2. Build Linux kernel (with DCC earlycon)
+
+```bash
+cd ~
+git clone --depth=1 --branch xilinx-v2024.1 \
+    https://github.com/Xilinx/linux-xlnx.git
 cd ~/linux-xlnx
-make ARCH=arm xilinx_zynq_defconfig
-make -j8 ARCH=arm UIMAGE_LOADADDR=0x8000 uImage dtbs
+export CROSS_COMPILE=arm-linux-gnueabihf-
 
-# 6. Build initramfs (BusyBox + tmac)
-sudo apt install -y busybox-static cpio
+make ARCH=arm xilinx_zynq_defconfig
+# Enable DCC early console
+./scripts/config --enable SERIAL_ARM_DCC
+./scripts/config --enable SERIAL_ARM_DCC_CONSOLE
+./scripts/config --enable DEBUG_LL
+./scripts/config --enable EARLY_PRINTK
+./scripts/config --set-str CMDLINE "earlycon=dcc console=ttyDCC0 root=/dev/ram0 rw iomem=relaxed"
+make -j$(nproc) ARCH=arm UIMAGE_LOADADDR=0x8000 uImage dtbs
+cp arch/arm/boot/uImage ~/tmac-zynq-fpga/linux/boot/
+cp arch/arm/boot/dts/zynq-zc702.dtb ~/tmac-zynq-fpga/linux/boot/devicetree.dtb
+```
+
+### 3. Build initramfs with tmac
+
+```bash
+cd ~/tmac-zynq-fpga/linux
+# Build tmac-static ARM binary
+arm-linux-gnueabihf-gcc -static -O2 -o tmac tmac_linux.c -lm
+cp tmac boot/
+
+# Create initramfs
 mkdir -p /tmp/initramfs/{bin,dev,proc,sys,root,tmp,etc}
 cp /bin/busybox /tmp/initramfs/bin/
 cd /tmp/initramfs
 for cmd in sh mount umount ls cat echo mknod sleep dmesg cp mv rm \
-    grep sed awk hexdump md5sum devmem ps kill top free vi tar \
-    fdisk mkfs.ext2 mountpoint blkid ifconfig ping wget dmesg \
-    modprobe sync reboot poweroff halt; do
+    grep sed awk hexdump md5sum devmem ps kill top free vi \
+    fdisk mkfs.ext2 blkid ifconfig ping wget modprobe sync \
+    reboot poweroff halt; do
     ln -sf /bin/busybox bin/$cmd
 done
-cp ~/tmac bin/
-# ... create init script (see build_all.sh for full initramfs recipe) ...
-find . | cpio -o -H newc | gzip > /tmp/initramfs.cpio.gz
+cp ~/tmac-zynq-fpga/linux/boot/tmac bin/
+
+cat > init << 'INIT'
+#!/bin/sh
+mount -t proc none /proc
+mount -t sysfs none /sys
+mount -t devtmpfs none /dev
+echo "=== FPGA Linux Boot — Zynq 7010 (DCC console) ==="
+echo "DCC: JTAG debug channel — connect XSDB and run:"
+echo "  xsdb> readjtaguart -start"
+echo ""
+# Mount SD ext4 partition if present
+mount /dev/mmcblk0p2 /root 2>/dev/null && echo "SD ext4 mounted at /root"
+echo "Ready. Run /root/tmac for FPGA test."
+exec /bin/sh
+INIT
+chmod +x init
+find . | cpio -o -H newc | gzip > ~/tmac-zynq-fpga/linux/boot/uramdisk.image.gz
 ```
+
+### 4. Deploy U-Boot files
+
+```bash
+cp ~/u-boot-xlnx/u-boot.elf ~/tmac-zynq-fpga/linux/boot/
+cp ~/u-boot-xlnx/u-boot-spl.bin ~/tmac-zynq-fpga/linux/boot/
+```
+
+### 5. Build BOOT.BIN (must be done on Windows with Vivado)
+
+See "Windows: BOOT.BIN + SD Card" section below.
 
 ---
 
-## On Windows: Create BOOT.BIN and SD Card
+## Windows: BOOT.BIN + SD Card
 
-### Prerequisites
+**Prerequisites:** Vivado 2023.1 (provides `bootgen` and FSBL build).
 
-- **Vivado 2023.1** installed (provides `bootgen` and builds `fsbl.elf`)
-- The 5 boot files from macOS (copy to `D:\Users\u\tmac-zynq-fpga\linux\boot\`)
-- **model.tmac** (~374 MB) — GGUF-converted model weights
-- SD card (≥ 2 GB recommended)
-
-### Step 1: Copy Files to Windows
-
-Copy from macOS `~/arm-build/` to Windows `D:\Users\u\tmac-zynq-fpga\linux\boot\`:
+### Step 1: Ensure boot files
 
 ```
 linux/boot/
+<<<<<<< HEAD
 ├── system_wrapper.bit     ← already in repo (FPGA bitstream from Vivado)
 ├── matmul_bd.xsa          ← already in repo (hardware handoff)
 ├── boot.bif               ← already in repo (bootgen config)
@@ -98,19 +137,27 @@ linux/boot/
 ├── uImage                 ← copy from ~/arm-build/
 ├── devicetree.dtb          ← copy from ~/arm-build/
 └── uramdisk.image.gz       ← copy from ~/arm-build/
+=======
+├── system_wrapper.bit   ← committed (from repo, built in Vivado on Windows)
+├── matmul_bd.xsa        ← committed (hardware handoff)
+├── boot.bif             ← committed (bootgen config)
+├── u-boot.elf           ← copy from Mac build
+├── u-boot-spl.bin       ← copy from Mac build
+├── uImage               ← copy from Mac build
+├── devicetree.dtb        ← copy from Mac build
+├── uramdisk.image.gz     ← copy from Mac build
+└── tmac                 ← copy from Mac build
+>>>>>>> 8607191 (DCC console integration + cleanup + Mac rebuild guide)
 ```
 
-### Step 2: Build FSBL in Vivado
+### Step 2: Build FSBL
 
-In Vivado 2023.1:
-1. Open hardware handoff: `File → Export → Export Hardware` from `matmul_bd.xsa`
-2. Use the XSCT console:
 ```tcl
-# In Vivado XSCT console:
+# In Vivado 2023.1 Tcl Console or XSCT:
 hsi::open_hw_design linux/boot/matmul_bd.xsa
 hsi::generate_app -hw linux/boot/matmul_bd.xsa -os standalone -proc ps7_cortexa9_0 -app zynq_fsbl
+# Copy fsbl.elf from generated SDK project to linux/boot/
 ```
-3. Copy the generated `fsbl.elf` to `linux/boot/`
 
 ### Step 3: Create BOOT.BIN
 
@@ -123,23 +170,22 @@ bootgen -image boot.bif -o BOOT.BIN -w
 ```
 the_ROM_image:
 {
-    [bootloader] fsbl.elf
+    [bootloader] u-boot-spl.bin
     system_wrapper.bit
     u-boot-spl.bin
 }
 ```
 
-### Step 4: Prepare SD Card
-
-Format with two partitions:
+### Step 4: Format SD Card
 
 | Partition | Type | Size | Contents |
 |-----------|------|------|----------|
 | 1 | FAT32 | 64 MB | BOOT.BIN, uImage, devicetree.dtb, uramdisk.image.gz |
-| 2 | ext4 | Rest | model.tmac, tmac |
+| 2 | ext4 | Rest | model.tmac (~374 MB), tmac |
 
-On Windows (using a tool like Rufus or diskpart for FAT32, and a Linux VM for ext4):
+### Step 5: Boot
 
+<<<<<<< HEAD
 ```
 Partition 1 (FAT32):
     BOOT.BIN
@@ -147,79 +193,55 @@ Partition 1 (FAT32):
     uImage
     devicetree.dtb
     uramdisk.image.gz
+=======
+1. Power-cycle the board (required — PLL re-init hangs on warm reset)
+2. Insert SD, set boot mode DIP to SD
+3. Connect JTAG, open XSDB, capture DCC console:
+   ```tcl
+   xsdb> connect
+   xsdb> readjtaguart -start
+   ```
+4. Power on — U-Boot boots from SD, loads Linux, runs initramfs
+5. All console output appears via JTAG DCC (captured by `readjtaguart`)
+6. To stop capture: `xsdb> readjtaguart -stop`
+>>>>>>> 8607191 (DCC console integration + cleanup + Mac rebuild guide)
 
-Partition 2 (ext4):
-    model.tmac          (~374 MB — copy from models/)
-    tmac                (483 KB — FPGA test program)
-```
-
-### Step 5: Boot the Board
-
-1. **Power-cycle** the MicroPhase Z7-Lite (required — PLL re-init hangs on warm reset)
-2. Insert SD card
-3. Set boot mode DIP switches to SD card boot
-4. **Connect UART** (115200 baud, 8N1) to monitor boot
-5. Power on
-
-### U-Boot Environment (auto-boot)
-
-U-Boot loads `uImage` + `devicetree.dtb` from FAT32 partition 1 and boots.
-Kernel auto-mounts the initramfs and runs the init script.
-
-The initramfs init script:
-1. Mounts `/proc`, `/sys`, `/dev`
-2. Mounts SD ext4 partition to `/root`
-3. The `tmac` binary runs from `/root/tmac`
-4. Drops to BusyBox shell after tmac exits
-
-**UART console** at 115200 baud. You'll see:
-```
-U-Boot 2022.01 ... (loading uImage)
-Starting kernel ...
-=== FPGA Linux Boot — Zynq 7010 ===
-Ready. Commands:
-  /root/tmac           — run FPGA test
-  devmem 0x43C00014    — read REG_STATUS
-  hexdump -C /dev/mem -s 0x43C00000 -n 64  — dump registers
-```
-
-### Debug: Manual U-Boot Boot
-
-If auto-boot fails, stop at U-Boot prompt (press any key) and boot manually:
+### U-Boot Manual Boot (if auto-boot fails)
 
 ```
 U-Boot> fatload mmc 0 0x3000000 uImage
 U-Boot> fatload mmc 0 0x2A00000 devicetree.dtb
 U-Boot> fatload mmc 0 0x2000000 uramdisk.image.gz
+U-Boot> setenv bootargs "earlycon=dcc console=ttyDCC0 root=/dev/ram0 rw iomem=relaxed"
 U-Boot> bootm 0x3000000 0x2000000 0x2A00000
 ```
 
-### Debug: FPGA Register Access from Linux
+---
 
-Once booted into BusyBox shell:
+## JTAG Boot (no SD card, for testing)
 
-```bash
-# Read REG_STATUS (0x43C00014)
-devmem 0x43C00014
+Use `xsdb` to load everything over JTAG:
 
-# Read REG_DEBUG (0x43C00028) — FSM state + bus status
-devmem 0x43C00028
-
-# Dump all FPGA registers (64 bytes)
-hexdump -C /dev/mem -s 0x43C00000 -n 64
-
-# Run the full test program
-/root/tmac
+```tcl
+# From repo root:
+xsdb linux/boot/jtag_boot.tcl
 ```
 
-### Device Tree Note
+This loads bitstream → PS7 init → kernel/DTB/initrd/tmac to DDR → starts U-Boot.
+Console via DCC: `readjtaguart -start` before `con`.
 
-The current `zynq-zc702.dtb` does NOT include the FPGA IP node.
-Until a custom DTS with the `matmul@43c00000` node is added, the kernel
-may restrict /dev/mem access to that range. Workaround: add
-`iomem=relaxed` to the kernel command line (via U-Boot `bootargs`):
+---
 
-```
-U-Boot> setenv bootargs "console=ttyPS0,115200 root=/dev/ram0 rw iomem=relaxed"
-U-Boot> bootm 0x3000000 0x2000000 0x2A00000
-```
+## DCC Console vs UART
+
+| Feature | UART | DCC (recommended) |
+|---------|------|-------------------|
+| Hardware | CH340 USB-UART (broken) | JTAG (Digilent HS-2, already connected) |
+| Speed | 115200 baud (~11 KB/s) | ~200-500 KB/s |
+| Console | `ttyPS0` | `ttyDCC0` |
+| U-Boot config | default | `CONFIG_ARM_DCC=y` |
+| Kernel bootargs | `console=ttyPS0,115200` | `earlycon=dcc console=ttyDCC0` |
+| Capture | Serial terminal (PuTTY) | `readjtaguart -start` in XSDB |
+
+The physical CH340 RX pin is dead. PS7 UART TX works but nobody can hear it.
+DCC uses the same JTAG cable already used for FPGA programming and debug — no extra hardware.

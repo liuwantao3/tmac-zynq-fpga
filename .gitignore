@@ -107,12 +107,19 @@ vivado_integration/run_post_synth_sim.tcl
 vivado_integration/synth_core.tcl
 vivado_integration/write_bitstream_hook.tcl
 
-# ELF binaries in sw/
+# Build artifacts in sw/
 vivado_integration/sw/*.elf
 vivado_integration/sw/*.o
+vivado_integration/sw/*.bin
+
+# DCC capture output
+vivado_integration/sw/dcc_*.txt
 
 # XSDB console dumps
 xsdb_*.txt
+
+# Vivado jou logs
+vivado_integration/*.jou
 
 # IDE
 .idea/
@@ -125,10 +132,13 @@ docker/licenses/xilinx.lic
 # Third-party gguf-tools build artifacts
 gguf-tools-main/gguf-tools
 gguf-tools-main/*.o
+
+# Linux boot files (rebuilt on Mac by the user)
 linux/boot/*.elf
 linux/boot/*.bin
 linux/boot/*.img
 linux/boot/uImage
 linux/boot/devicetree.dtb
 linux/boot/uramdisk.image.gz
-linux/boot/matmul_bd.xsa
+linux/boot/u-boot-spl.bin
+linux/boot/BOOT.BIN

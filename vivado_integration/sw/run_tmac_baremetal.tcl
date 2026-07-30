@@ -99,12 +99,16 @@ dow $ELF_PATH
 after 200
 puts "  ELF loaded"
 
-# ===== Run =====
-puts "Running (900s timeout)..."
+# ===== Run with DCC capture =====
+set dcc_outfile [open "dcc_output.txt" w]
+puts "Running (900s timeout) with DCC capture..."
+readjtaguart -start -handle $dcc_outfile
 con
 after 900000
 catch {targets -set -filter {name =~ "*Cortex-A9*#0*"}}; after 100
 stop; after 200
+readjtaguart -stop
+close $dcc_outfile
 
 # ===== Check FPGA registers =====
 puts "\n--- FPGA State ---"
@@ -144,6 +148,17 @@ if {$n_out > 0 && $n_out < 100} {
     }
 } elseif {$n_out == 0} {
     puts "  (program did not write output)"
+}
+
+# ===== Print DCC output =====
+puts "\n--- DCC Console Output (last 80 lines) ---"
+set dcc_fp [open "dcc_output.txt" r]
+set dcc_lines [split [read $dcc_fp] "\n"]
+close $dcc_fp
+set n_lines [llength $dcc_lines]
+if {$n_lines > 80} { set start [expr $n_lines - 80] } else { set start 0 }
+for {set i $start} {$i < $n_lines} {incr i} {
+    puts "  [lindex $dcc_lines $i]"
 }
 
 puts ""

@@ -1,6 +1,6 @@
 the_ROM_image:
 {
-    [bootloader] fsbl.elf
+    [bootloader] u-boot-spl.bin
     system_wrapper.bit
     u-boot-spl.bin
 }

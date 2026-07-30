@@ -955,3 +955,7 @@ The Lima VM approach eliminates all macOS SDK conflicts — builds take
 ```
 setenv bootargs "console=ttyPS0,115200 root=/dev/ram0 rw iomem=relaxed"
 ```
+
+## Key Decisions (2026-07-30)
+
+14. **DCC integration for tmac_baremetal (2026-07-30):** UART0 debug output (`uart_puts`/`putc`/`puthex`/`putdec`) redirected to JTAG DCC. CH340 physically broken (PS7 TX works, FX reads pin is dead). Approach: modified `tmac_baremetal.h` to include `dcc_io.h` and replaced UART output function bodies with DCC wrappers. Added `dcc_putdec()` to `dcc_io.h`. Zero changes needed in `tmac_baremetal.cpp` (calls `uart_*` functions unchanged). `dcc_unlock()` added to `uart_init()`. ELF rebuilt with LLVM/clang (Vitis 2023.1 toolchain). `run_tmac_baremetal.tcl` updated to use `readjtaguart -start/-handle/-stop` for DCC output capture.

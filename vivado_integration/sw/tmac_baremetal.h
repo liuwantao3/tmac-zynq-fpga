@@ -2,6 +2,7 @@
 #define TMAC_BAREMETAL_H
 
 #include <stdint.h>
+#include "dcc_io.h"
 
 // ===== Model Constants (Qwen2-0.5B) =====
 #define HIDDEN_DIM     896
@@ -288,48 +289,23 @@ static inline void* memset(void* d, int c, unsigned int n) {
     return d;
 }
 
-// UART0 initialization (115200 baud, 8N1)
+// UART0 initialization (115200 baud, 8N1) + DCC unlock
 static inline void uart_init(void) {
+    dcc_unlock();
     volatile uint32_t* uart = (volatile uint32_t*)0xE0000000UL;
-    // Disable TX/RX, reset
     uart[0] = 0x00000000;
-    uart[0] = 0x00000001;  // reset
-    uart[0] = 0x00000000;  // clear reset
-    // Mode: normal mode, 8-bit, 1 stop, no parity, clock / 8 = 115200
-    // MR = (CHMODE=01) | (CHRL=00 for 8bit) | (NBSTOP=0 for 1stop) | (PAR=000) | (CLKS=100 for /8)
-    uart[1] = 0x00000020;  // MR: bits[6:4]=100 (div8), bits[1:0]=01 (normal)
-    // Baud: 50 MHz / (8 * 115200) = 54.2 => 54
-    uart[8] = 54;          // BRGR at offset 0x20
-    uart[9] = 0x00000000;  // BDIV at offset 0x24 (no divisor)
-    // Enable TX
-    uart[0] = 0x00000020;  // CR: TXEN=1 (bit 5), RXEN=0
+    uart[0] = 0x00000001;
+    uart[0] = 0x00000000;
+    uart[1] = 0x00000020;
+    uart[8] = 54;
+    uart[9] = 0x00000000;
+    uart[0] = 0x00000020;
 }
 
-// Simple putchar via UART0 (PS7 UART at 0xE0000000)
-static inline void uart_putc(char c) {
-    volatile uint32_t* uart = (volatile uint32_t*)0xE0000000UL;
-    if (c == '\n') uart_putc('\r');
-    // Skip wait if TXFIFO full (don't hang)
-    if (uart[5] & (1u << 4)) return;
-    uart[7] = c;
-}
-
-static inline void uart_puts(const char* s) {
-    while (*s) uart_putc(*s++);
-}
-
-static inline void uart_puthex(uint32_t val) {
-    static const char hex[] = "0123456789ABCDEF";
-    uart_putc('0'); uart_putc('x');
-    for (int i = 28; i >= 0; i -= 4) uart_putc(hex[(val >> i) & 0xF]);
-}
-
-static inline void uart_putdec(int val) {
-    if (val < 0) { uart_putc('-'); val = -val; }
-    char buf[12]; int i = 0;
-    if (val == 0) { uart_putc('0'); return; }
-    while (val) { buf[i++] = '0' + (val % 10); val /= 10; }
-    while (i) uart_putc(buf[--i]);
-}
+// DCC-based output (via JTAG, since CH340 UART is broken)
+static inline void uart_putc(char c) { dcc_putc(c); }
+static inline void uart_puts(const char* s) { dcc_puts(s); }
+static inline void uart_puthex(uint32_t val) { dcc_puthex(val); }
+static inline void uart_putdec(int val) { dcc_putdec(val); }
 
 #endif
