@@ -41,10 +41,16 @@ C:\Xilinx\Vivado\2023.1\tps\llvm\7.0\win64\bin\clang.exe --target=armv7a-none-ea
 ## XSDB JTAG Load
 
 ```powershell
-C:\Xilinx\Vivado\2023.1\bin\xsdb.bat D:\Users\u\tmac-zynq-fpga\vivado_integration\sw\load.tcl
+C:\Xilinx\Vivado\2023.1\bin\xsdb.bat D:\Users\u\tmac-zynq-fpga\vivado_integration\sw\run_hp_fsm_comprehensive.tcl
+C:\Xilinx\Vivado\2023.1\bin\xsdb.bat D:\Users\u\tmac-zynq-fpga\vivado_integration\sw\run_test_fpga_cores.tcl
+C:\Xilinx\Vivado\2023.1\bin\xsdb.bat D:\Users\u\tmac-zynq-fpga\vivado_integration\sw\run_tmac_baremetal.tcl
 ```
+
+See `sw/run_hp_fsm_extended*.tcl` for the extended edge-case suite (E1–E10).
+**Power-cycle the board before running ps7_init via XSDB** — PLL re-init hangs on
+a warm reset.
 
 ## Notes
 
-- `vivado-local-test` branch only — master branch is for C++ simulation
-- Git proxy: `http://127.0.0.1:10810`
+- Bare-metal ARM build: `C:\Xilinx\Vivado\2023.1\tps\llvm\7.0\win64\bin\clang.exe` — see `sw/Makefile`
+- The Vitis GUI flow is documented in `vitis_linux/README.md` (this board has no Ethernet and the CH340 UART is broken, so execution is verified via JTAG boot + DDR markers)

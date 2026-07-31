@@ -100,12 +100,7 @@ vivado_integration/ps7_init.html
 vivado_integration/ps7_init_gpl.c
 vivado_integration/ps7_init_gpl.h
 vivado_integration/vivado_pid*.zip
-vivado_integration/build_debug_hp.tcl
-vivado_integration/rebuild_fast.*
-vivado_integration/post_synth_sim.*
-vivado_integration/run_post_synth_sim.tcl
-vivado_integration/synth_core.tcl
-vivado_integration/write_bitstream_hook.tcl
+vivado_integration/*.backup.log
 
 # Build artifacts in sw/
 vivado_integration/sw/*.elf
@@ -114,6 +109,7 @@ vivado_integration/sw/*.bin
 
 # DCC capture output
 vivado_integration/sw/dcc_*.txt
+dcc_boot_output.txt
 
 # XSDB console dumps
 xsdb_*.txt
@@ -142,3 +138,7 @@ linux/boot/devicetree.dtb
 linux/boot/uramdisk.image.gz
 linux/boot/u-boot-spl.bin
 linux/boot/BOOT.BIN
+linux/boot/zImage
+
+# Vitis Linux workspace (regenerable via XSCT — see vitis_linux/README.md)
+vitis_linux/workspace/

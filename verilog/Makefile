@@ -11,7 +11,7 @@ VVP      = vvp
 FLAGS    = -Wall -g2012
 
 # ---- Q8_0 core test ----
-Q8_SRC  = matmul_q8_core.v dequant_lut.v systolic_8x8.v tb_matmul_q8.v
+Q8_SRC  = matmul_q8_core.v tb_matmul_q8.v
 Q8_TOP  = tb_matmul_q8
 
 sim_q8: $(Q8_SRC)
@@ -36,7 +36,7 @@ sim_q4k_min: $(Q4K_MIN_SRC)
 
 # ---- Co-simulation (Q8_0 only, requires /tmp/cosim_tiles.bin) ----
 COSIM_TOP = tb_cosim
-COSIM_SRC = tb_cosim.v matmul_q8_core.v dequant_lut.v systolic_8x8.v
+COSIM_SRC = tb_cosim.v matmul_q8_core.v
 
 sim_cosim: $(COSIM_SRC)
 	$(IVERILOG) $(FLAGS) -o $(COSIM_TOP).vvp $(COSIM_SRC)

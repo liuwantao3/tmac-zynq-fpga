@@ -138,7 +138,7 @@ Desc 10: matmul_q6k/q4k   → ffn_down   (act: swiglu_out)        (result: ffn_o
 Desc 11: CPU_OP           → residual                            (result: hidden)
 ```
 
-12 descriptors × 28 layers = 336 descriptors per token. Each CPU_OP triggers one interrupt.
+12 descriptors × 24 layers = 288 descriptors per token. Each CPU_OP triggers one interrupt. (`NUM_LAYERS = 24` in `sim/tmac_gguf.cpp:142`.)
 Adjacent CPU ops are batched into single descriptors (e.g. bias+rope+softmax = one CPU_OP).
 Post-logits (softmax for sampling) is handled outside the descriptor chain.
 
@@ -576,16 +576,11 @@ Savings: 3,512 LUTs (31%), 688 LUTRAM (92%), timing +0.314ns.
 $env:Path = "D:\Program Files\Git\bin;$env:Path"   # git
 
 # Verilog tests (iVerilog — d:\iVerilog\bin)
-make -C verilog all                     # Q8 + Q4K + Q5_0 + INT16 smoke
+make -C verilog all                     # Q8 + Q4K + INT16 + Q5_0 + Q6_K + HP FSM
 
-# Vivado xsim
-#   C:\Xilinx\Vivado\2023.1\bin\xsim.bat
-xsim tb_hw_fsm --runall                  # HP FSM descriptor-chain test
-
-# Vivado batch build
-#   C:\Xilinx\Vivado\2023.1\bin\vivado.bat
-#   (NOT D:\Xilinx — Vivado is installed at C:\Xilinx)
-vivado.bat -mode batch -source vivado_integration/build_bd.tcl
+# Vivado batch build (rebuild bitstream)
+#   C:\Xilinx\Vivado\2023.1\bin\vivado.bat  (NOT D:\Xilinx)
+#   Run from vivado_integration/:  Remove-Item -Recurse -Force proj_bd; vivado.bat -mode batch -source build_bd.tcl
 
 # JTAG load via XSDB (single session: program + init + run + capture)
 #   C:\Xilinx\Vivado\2023.1\bin\xsdb.bat
@@ -594,8 +589,16 @@ xsdb.bat vivado_integration\sw\run_hp_fsm_comprehensive.tcl
 # NOTE: Power-cycle the board before running ps7_init via XSDB!
 # ps7_pll_init hangs if PLLs are already configured from a prior session.
 
-# JTAG load via Vivado HW Manager (clears DAP sticky errors)
-Copy system_wrapper.bit from proj_bd/ to current dir, then run Vivado HW manager
+# Bare-metal tests on HW (bitstream -> ps7_init -> ELF at 0x00100000 -> DDR markers)
+xsdb.bat vivado_integration\sw\run_test_fpga_cores.tcl    # Q8/Q5_0 core tests (5/5 PASS)
+xsdb.bat vivado_integration\sw\run_tmac_baremetal.tcl    # full inference
+
+# Vitis Linux platform + app (headless XSCT — see vitis_linux/README.md)
+#   xsct.bat; then:
+#   platform create -name z7_linux -hw matmul_bd.xsa -proc ps7_cortexa9 -os linux -out workspace
+#   domain config -boot prebuilt; platform generate; app create ... -template "Linux Hello World"; app build
+# Boot Linux on HW from Vitis GUI XSCT console:
+source vitis_linux/scripts/boot_linux_jtag.tcl
 
 # C++ integration test
 g++ -std=c++14 -O2 -I sim -I gguf -I . sim/test_integration.cpp -lpthread -o /tmp/ti
@@ -628,24 +631,24 @@ python3 scripts/extract_tmac.py models/qwen2-0_5b-instruct-q4_k_m.gguf /tmp/mode
 - `verilog/matmul_q5_0_core.v` — Q5_0 block decode: 4×896 tile, 2× parallel cores, block-streaming pipeline (SETUP_D→COMPUTE×32→DRAIN), 1 DSP MAC/cycle, per-block wide register interface (blk_d/qh/qs), no hdr_packed LUTRAM, hierarchical result read
 - `verilog/matmul_q6_k_core.v` — Q6_K block decode: 32×256 tile, 32 blocks/tile, super_scale + per-sub-block scales
 - `verilog/matmul_int16_core.v` — General INT16×INT16 core: 512×128-bit wmem, 3-stage FSM
-- `verilog/dequant_lut.v` — Q8_0 dequant ROM (standalone, not instantiated)
-- `verilog/systolic_8x8.v` — 8×8 systolic array (standalone, not used)
 
 ### Verilog Testbenches
-- `verilog/tb_matmul_q8.v` — Q8 core tests
-- `verilog/tb_matmul_q4k.v` — Q4K core tests
+- `verilog/tb_matmul_q8.v` — Q8 core tests (6/6)
+- `verilog/tb_matmul_q4k.v` — Q4K core tests (4/4)
 - `verilog/tb_minimal_q4k.v` — Q4K smoke test
 - `verilog/tb_int16_smoke.v` — INT16 smoke test
 - `verilog/tb_cosim.v` — Q8_0 co-simulation
 - `verilog/tb_cosim_q4k.v` — Q4_K co-simulation
 - `verilog/tb_matmul_q5_0.v` — Q5_0 core tests (fabricated patterns)
-- `verilog/tb_matmul_q6_k.v` — Q6_K core tests (fabricated patterns)
+- `verilog/tb_matmul_q6_k.v` — Q6_K core tests (fabricated patterns, 97/97)
 - `verilog/tb_cosim_q5_0.v` — Q5_0 co-simulation (waits for tile dump)
 - `verilog/tb_cosim_q6_k.v` — Q6_K co-simulation (waits for tile dump)
-- `verilog/tb_hw_fsm_comprehensive.v` — HP FSM all 7 tests (HEAD-based wait_done)
-- `verilog/tb_hp_fsm_q5_0.v` — HP FSM Q5_0 dispatch test (9 tests: all-1s, chains, mixed CPU_OP, edge cases)
+- `verilog/tb_hw_fsm_comprehensive.v` — HP FSM all 10 tests (HEAD-based wait_done)
+- `verilog/tb_hp_fsm_q5_0.v` — HP FSM Q5_0 dispatch test (10 tests: all-1s, chains, mixed CPU_OP, edge cases)
+- `verilog/tb_phaseb.v` — PhaseB matmul_top descriptor-chain test (requires C++ tile dump)
 - `verilog/tb_q5_off_by_one.v` — Q5_0 off-by-one BRAM bug verification (non-uniform patterns)
-- `verilog/test_hp_loopback.v` — 32-bit HP loopback testbench (ARSIZE=2 proven)
+- `verilog/tb_read_master.v`, `verilog/tb_write_master.v` — AXI HP master loopback testbenches
+- `verilog/tb_ddr_check.v`, `verilog/tb_debug.v` — DDR model / debug helpers
 - `verilog/sim_ddr_axi_hp.v` — AXI HP DDR model for simulation
 
 ### C++ Simulation
@@ -664,10 +667,13 @@ python3 scripts/extract_tmac.py models/qwen2-0_5b-instruct-q4_k_m.gguf /tmp/mode
 - `scripts/test_integration.sh` — Test suite
 
 ### Documentation
+- `AGENTS.md` — Full architecture, register map, descriptor protocol, debug guide
+- `vivado_integration/API.md` — Hardware API: registers, descriptor format, DDR layouts
 - `verilog/DESIGN.md` — Architecture, timing
 - `docs/architecture.md` — Model, quantization formats
-- `docs/FPGA_PERFORMANCE_ANALYSIS.md` — Performance analysis
-- `docs/Q4_K_IMPLEMENTATION_PLAN.md` — Original plan (outdated)
+- `docs/Q4_K_IMPLEMENTATION_PLAN.md` — Original plan (outdated, kept as archive)
+- `linux/README.md` — Linux-on-SD build guide (U-Boot + kernel on Lima VM)
+- `vitis_linux/README.md` — Vitis 2023.1 Linux platform + app workflow
 
 ## Target Board: MicroPhase Z7-Lite
 
@@ -899,7 +905,7 @@ Three bugs in the multi-group Q8 iteration were found and fixed during iVerilog 
 - `verilog/axihp_read_master.v`: HP read master — ARSIZE=2 (4 bytes/beat), always captures RDATA[31:0], byte-stream output. DRAIN state per-beat. 32-bit mode.
 - `verilog/axihp_write_master.v`: HP write master — AWSIZE=2, splits 64-bit word into two 32-bit single-beat AXI writes. wready once per word. 5-state FSM.
 - `verilog/matmul_int16_core.v`: INT16 compute core (verified standalone)
-- `verilog/test_hp_loopback.v`: 32-bit mode simulation testbench — DDR model with 32-bit read/write granularity. Passes full loopback.
+- `verilog/test_hp_loopback.v`: 32-bit mode simulation testbench — DDR model with 32-bit read/write granularity. Passes full loopback. (removed in 2026-07-31 cleanup; superseded by `tb_read_master.v`/`tb_write_master.v`)
 - `vivado_integration/proj_bd/matmul_bd.runs/impl_1/system_wrapper.bit`: Synthesized bitstream (reordered PS7 config)
 - `D:/Users/u/workspace/tmac/Debug/tmac.elf`: Vitis ELF loaded by XSDB
 - `docs/debug_log.md`: Full debug history
@@ -956,6 +962,32 @@ The Lima VM approach eliminates all macOS SDK conflicts — builds take
 setenv bootargs "console=ttyPS0,115200 root=/dev/ram0 rw iomem=relaxed"
 ```
 
+## Vitis Linux Workspace (2026-07-31)
+
+Standard Vitis 2023.1 Linux project in `vitis_linux/`, GUI-operable, independent of
+the bare-metal effort. Because the board has no Ethernet and the CH340 UART is
+broken, the standard GUI **Run** flow (TCF agent over Ethernet + UART login) is
+impossible — execution is verified via JTAG boot + DDR markers instead.
+
+**Contents:**
+- `matmul_bd.xsa` — hardware handoff (bitstream + ps7_init)
+- `prebuilt/` — zImage, uImage, uramdisk.image.gz, devicetree.dtb, u-boot.elf, system_wrapper.bit, boot.bif, tmac
+- `workspace/z7_linux/` — platform (Linux domain on `ps7_cortexa9`, boot dir → `prebuilt/`, FSBL built, `z7_linux.xpfm` exported) — **gitignored, regenerable via XSCT**
+- `workspace/hello_linux/` — "Linux Hello World" app, enhanced to write DDR markers + read FPGA regs via `/dev/mem` — **gitignored, regenerable**
+- `scripts/boot_linux_jtag.tcl` — JTAG boot (bitstream → ps7_init → AFI → zImage/dtb/initramfs → kernel)
+
+**Key decisions:**
+- Linux domain **must** use `-proc ps7_cortexa9` (cluster), NOT `ps7_cortexa9_0` (fails for Linux domains)
+- `-boot <prebuilt dir>` + `isBuildFlow=false` skips PetaLinux/DTS generation (device-tree-xlnx not needed)
+- App template for Linux domain is **"Linux Hello World"** (bare-metal "Hello World" is invalid)
+- Open in GUI: `vitis.bat` → workspace `vitis_linux/workspace`; boot via XSCT console: `source vitis_linux/scripts/boot_linux_jtag.tcl` (power-cycle board first)
+
+Full workflow: `vitis_linux/README.md`.
+
 ## Key Decisions (2026-07-30)
 
 14. **DCC integration for tmac_baremetal (2026-07-30):** UART0 debug output (`uart_puts`/`putc`/`puthex`/`putdec`) redirected to JTAG DCC. CH340 physically broken (PS7 TX works, FX reads pin is dead). Approach: modified `tmac_baremetal.h` to include `dcc_io.h` and replaced UART output function bodies with DCC wrappers. Added `dcc_putdec()` to `dcc_io.h`. Zero changes needed in `tmac_baremetal.cpp` (calls `uart_*` functions unchanged). `dcc_unlock()` added to `uart_init()`. ELF rebuilt with LLVM/clang (Vitis 2023.1 toolchain). `run_tmac_baremetal.tcl` updated to use `readjtaguart -start/-handle/-stop` for DCC output capture.
+
+## Key Decisions (2026-07-31)
+
+15. **Project cleanup + vitis_linux commit:** Deleted all generated artifacts (`.vvp`/`.vcd`, `vivado*.log/.jou`, `proj_bd/`, `.Xil/`, `xsim.dir/`, `sw/*.elf/.o/.bin` — all regenerable). Removed one-off debug/scratch scripts (see git history). Deleted dead modules `verilog/dequant_lut.v` + `verilog/systolic_8x8.v` (never instantiated; removed from Makefile + test_integration.sh). Fixed `linux/README.md` merge-conflict markers that had been committed in 6fd08f5. Corrected layer count in AGENTS.md (28→24, matching `sim/tmac_gguf.cpp:142`). `vitis_linux/` committed (README + XSA + scripts + prebuilt) with `workspace/` gitignored. **Legacy dirs kept as archive:** `hls/`, `firmware/`, `descriptor-orchestrator/`, `sim/Transaction Tracer/`, `vivado/` — superseded by current Verilog RTL + bare-metal code, kept for reference only.

@@ -107,7 +107,7 @@ echo "========================================"
 echo "Phase 4: Verilog Q8_0 core testbench"
 echo "========================================"
 
-iverilog -Wall -g2012 -o tb_matmul_q8.vvp matmul_q8_core.v dequant_lut.v systolic_8x8.v tb_matmul_q8.v
+iverilog -Wall -g2012 -o tb_matmul_q8.vvp matmul_q8_core.v tb_matmul_q8.v
 if vvp tb_matmul_q8.vvp 2>&1 | grep -q "ALL 6 TESTS PASSED"; then
     green "  PASS: Q8_0 core testbench"
     PASS=$((PASS + 1))

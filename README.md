@@ -2,19 +2,21 @@
 
 Multi-core Verilog RTL accelerator for Qwen2-0.5B-Instruct inference on the
 MicroPhase Z7-Lite (xc7z010clg400-1). All 6 compute cores + HP descriptor-chain
-DMA engine **synthesized and verified on hardware**: 18 HW tests pass, 123 simulation
-tests pass.
+DMA engine **synthesized and verified on hardware**: 10 comprehensive HW tests
+PASS, 5/5 bare-metal FPGA-core tests PASS, 18 HP FSM simulation tests + core
+unit tests PASS.
 
 | Component | Status |
 |-----------|--------|
-| Verilog RTL (6 cores + HP FSM) | Synthesized, bitstream built |
-| HP FSM descriptor-chain DMA (AXI4-Lite + HP0) | 18 HW tests PASS |
-| Q8_0 core (64x896, 6-stage pipeline) | 6/6 sim + HW verified |
-| Q5_0 core (4x896, 2-core block-streaming) | 10/10 dispatch sim + HW verified |
-| Q4_K core (56x256 block decode) | 4/4 sim |
-| Q6_K core (32x256 block decode) | 97/97 sim |
-| INT16 core (64x64 general) | Sim only (pre-existing wmem bug) |
+| HP FSM descriptor-chain DMA (AXI4-Lite + HP0) | 10 comprehensive HW tests PASS |
+| Q8_0 core (64×896, 6-stage pipeline) | 6/6 sim + HW verified |
+| Q5_0 core (4×896, 2-core block-streaming) | 10/10 dispatch sim + HW verified |
+| Q4_K core (56×256 block decode) | 4/4 sim |
+| Q6_K core (32×256 block decode) | 97/97 sim |
+| INT16 core (64×64 general) | Sim only (pre-existing wmem bug) |
+| Bare-metal ARM port (`vivado_integration/sw/tmac_baremetal`) | `test_fpga_cores` 5/5 HW PASS |
 | C++ inference engine (`sim/tmac_gguf`) | FP32 < 0.0003 vs ground truth |
+| Vitis Linux workspace (`vitis_linux/`) | Platform + app built, JTAG boot script |
 
 ## Architecture
 
@@ -30,22 +32,26 @@ CPU (ARM Cortex-A9)
                                         └── CPU_OP passthrough
 ```
 
+The Q4_K, Q6_K, and INT16 cores are implemented in `matmul_top.v` (PhaseB
+quad-core top) and simulated standalone; the active hardware FSM
+(`hp_fsm_top.v`) currently dispatches Q8_0 and Q5_0.
+
 ### Quantization Types
 
 | tensor | shape | type | Verilog core |
 |--------|-------|------|-------------|
-| `token_embd` | 151936x896 | Q8_0 | `matmul_q8_core.v` |
-| `attn_v` | 128x896 | Q8_0 | `matmul_q8_core.v` |
-| `attn_q`, `attn_k`, `attn_output` | 896x896 | Q5_0 | `matmul_q5_0_core.v` |
-| `ffn_gate`, `ffn_up` | 4864x896 | Q5_0 | `matmul_q5_0_core.v` |
-| `ffn_down` (even layers) | 896x4864 | Q6_K | `matmul_q6_k_core.v` |
-| `ffn_down` (odd layers) | 896x4864 | Q4_K | `matmul_q4k_core.v` |
+| `token_embd` | 151936×896 | Q8_0 | `matmul_q8_core.v` |
+| `attn_v` | 128×896 | Q8_0 | `matmul_q8_core.v` |
+| `attn_q`, `attn_k`, `attn_output` | 896×896 | Q5_0 | `matmul_q5_0_core.v` |
+| `ffn_gate`, `ffn_up` | 4864×896 | Q5_0 | `matmul_q5_0_core.v` |
+| `ffn_down` (even layers) | 896×4864 | Q6_K | `matmul_q6_k_core.v` |
+| `ffn_down` (odd layers) | 896×4864 | Q4_K | `matmul_q4k_core.v` |
 
 ### Multi-Tile Descriptors
 
 One descriptor can process multiple tiles (eliminates thousands of redundant DDR
 reads). Set `num_tiles` at descriptor bytes [22:23]. One Q5_0 descriptor with
-`num_tiles=224` processes the full 896x896 `attn_q` in a single descriptor.
+`num_tiles=224` processes the full 896×896 `attn_q` in a single descriptor.
 
 ## Quick Start
 
@@ -62,6 +68,9 @@ echo "9707" | ./sim/tmac_gguf /tmp/model.tmac --fpga-q8 --fpga-q5-0 --fpga-q6-k 
 
 # Run Verilog simulation tests
 make -C verilog all
+
+# Run bare-metal tests on hardware (bitstream -> ps7_init -> ELF -> DDR markers)
+xsdb.bat vivado_integration\sw\run_test_fpga_cores.tcl
 ```
 
 ## Repository Structure
@@ -70,12 +79,10 @@ make -C verilog all
 ├── AGENTS.md                          ← Full architecture, register map, debug guide
 ├── vivado_integration/
 │   ├── API.md                         ← Hardware API: registers, descriptor format, DDR layout
-│   ├── build_bd.tcl                   ← Vivado batch build script
+│   ├── build_bd.tcl                   ← Vivado batch build script (bitstream)
+│   ├── ps7_init.tcl                   ← PS7 init (AFI-enabled ps7_post_config)
 │   ├── rtl/hp_fsm_top.v              ← Active top: HP descriptor-chain FSM + Q8 + Q5_0
-│   └── sw/
-│       ├── run_hp_fsm_comprehensive.tcl  ← 10 HW tests (Q8 + DMA)
-│       ├── run_hp_fsm_q5_0.tcl        ← 3 HW tests (Q5_0)
-│       └── regs.h                     ← Register map constants
+│   └── sw/                            ← Bare-metal: startup.s, tmac_baremetal.*, regs.h, run_*.tcl
 ├── verilog/
 │   ├── matmul_q8_core.v              ← Q8_0 6-stage pipeline core
 │   ├── matmul_q5_0_core.v            ← Q5_0 2-core block-streaming core
@@ -98,9 +105,12 @@ make -C verilog all
 │   ├── extract_tmac.py               ← GGUF → TMAC converter
 │   ├── test_integration.sh           ← Test suite runner
 │   └── verify_layers_fast.py         ← Layer verification
+├── linux/                            ← Linux-on-SD build guide + boot files (Lima VM)
+├── vitis_linux/                      ← Vitis 2023.1 Linux platform + app (GUI workflow)
 ├── models/                           ← Model files (gitignored)
 ├── docs/                             ← Architecture docs + historical debug logs
-├── firmware/                         ← ARM runtime (aspirational — implementation pending)
+├── hls/, firmware/, descriptor-orchestrator/, sim/Transaction Tracer/, vivado/
+│                                     ← Legacy/aspirational code, kept as archive
 └── gguf-tools-main/                  ← Third-party GGUF inspection tool
 ```
 
@@ -109,6 +119,9 @@ make -C verilog all
 | Offset | Name | Access | Description |
 |--------|------|--------|-------------|
 | 0x00 | REG_START | R/W | [0]: write 1 to start chain |
+| 0x04 | REG_CHAIN_CTRL | R/W | [0]=resume, [2]=cpu_op_pending, [3]=intr_enable |
+| 0x08 | REG_GIE | R/W | [0]: global interrupt enable |
+| 0x0C | REG_ISR | R/W | [0]: cpu_op_irq (W1C) |
 | 0x10 | REG_Q8_NUM_GROUPS | R/W | [3:0]: Q8 column groups (fallback) |
 | 0x14 | REG_STATUS | R | [8]=rd_done, [9]=wr_done, [15]=busy |
 | 0x18 | REG_DESC_BASE | R/W | Descriptor chain base DDR address |
@@ -116,6 +129,9 @@ make -C verilog all
 | 0x20 | REG_DESC_HEAD | R | Current descriptor index |
 | 0x28 | REG_DEBUG | R | FSM state + bus status bits |
 | 0x2C | REG_CLK_CNT | R | Free-running clock counter |
+| 0x30 | REG_CLK_CNT_SLOW | R | Clock counter ÷ 1024 |
+| 0x34 | REG_ACT_INFO | R | act_addr from last descriptor |
+| 0x38 | REG_DESC_INFO | R | {8'h0, act_total_bytes[23:0]} |
 | 0x3C | REG_Q8_DEBUG | R | Q8 core state + counters |
 
 ## Documentation
@@ -124,6 +140,8 @@ make -C verilog all
 - **[vivado_integration/API.md](vivado_integration/API.md)** — Hardware API reference: descriptors, DDR layouts, C++ usage
 - **[verilog/DESIGN.md](verilog/DESIGN.md)** — RTL architecture: pipelines, memory, testbenches
 - **[docs/architecture.md](docs/architecture.md)** — Model architecture, quantization formats
+- **[linux/README.md](linux/README.md)** — Linux-on-SD build guide (U-Boot + kernel on Lima VM)
+- **[vitis_linux/README.md](vitis_linux/README.md)** — Vitis 2023.1 Linux platform + app workflow
 
 ## References
 

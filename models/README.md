@@ -18,10 +18,12 @@ python3 scripts/extract_tmac.py
 ```
 
 ## Weight Count by Quantization
+Verified from the GGUF header (290 tensors total):
+
 | Type | Count | Tensors |
 |------|-------|---------|
-| Q5_0 | 132 | Most weight matrices |
-| Q6_K | 12 | `blk.*.ffn_down.weight` |
-| Q8_0 | 2 | `token_embd.weight`, `attn_v.weight` |
-| Q4_K | rest | Remaining weight matrices |
-| F32 | few | Norm/bias (`*.weight`, `*.bias`) |
+| Q5_0 | 132 | `attn_q/k/output.weight` (24 each), `ffn_gate/up.weight` (24 each), `attn_v.weight` (12 layers) |
+| Q8_0 | 13 | `token_embd.weight` + `attn_v.weight` (12 layers) |
+| Q6_K | 12 | `blk.*.ffn_down.weight` (even layers) |
+| Q4_K | 12 | `blk.*.ffn_down.weight` (odd layers) |
+| F32 | 121 | `attn_q/k/v.bias` (24 each), `attn_norm/ffn_norm.weight` (24 each), `output_norm.weight` |

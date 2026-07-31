@@ -127,17 +127,6 @@ See "Windows: BOOT.BIN + SD Card" section below.
 
 ```
 linux/boot/
-<<<<<<< HEAD
-├── system_wrapper.bit     ← already in repo (FPGA bitstream from Vivado)
-├── matmul_bd.xsa          ← already in repo (hardware handoff)
-├── boot.bif               ← already in repo (bootgen config)
-├── fsbl.elf               ← build in Vivado SDK (see below)
-├── u-boot-spl.bin         ← copy from ~/arm-build/
-├── u-boot.img             ← copy from ~/arm-build/
-├── uImage                 ← copy from ~/arm-build/
-├── devicetree.dtb          ← copy from ~/arm-build/
-└── uramdisk.image.gz       ← copy from ~/arm-build/
-=======
 ├── system_wrapper.bit   ← committed (from repo, built in Vivado on Windows)
 ├── matmul_bd.xsa        ← committed (hardware handoff)
 ├── boot.bif             ← committed (bootgen config)
@@ -147,7 +136,6 @@ linux/boot/
 ├── devicetree.dtb        ← copy from Mac build
 ├── uramdisk.image.gz     ← copy from Mac build
 └── tmac                 ← copy from Mac build
->>>>>>> 8607191 (DCC console integration + cleanup + Mac rebuild guide)
 ```
 
 ### Step 2: Build FSBL
@@ -185,15 +173,6 @@ the_ROM_image:
 
 ### Step 5: Boot
 
-<<<<<<< HEAD
-```
-Partition 1 (FAT32):
-    BOOT.BIN
-    u-boot.img
-    uImage
-    devicetree.dtb
-    uramdisk.image.gz
-=======
 1. Power-cycle the board (required — PLL re-init hangs on warm reset)
 2. Insert SD, set boot mode DIP to SD
 3. Connect JTAG, open XSDB, capture DCC console:
@@ -204,7 +183,6 @@ Partition 1 (FAT32):
 4. Power on — U-Boot boots from SD, loads Linux, runs initramfs
 5. All console output appears via JTAG DCC (captured by `readjtaguart`)
 6. To stop capture: `xsdb> readjtaguart -stop`
->>>>>>> 8607191 (DCC console integration + cleanup + Mac rebuild guide)
 
 ### U-Boot Manual Boot (if auto-boot fails)
 
@@ -220,15 +198,24 @@ U-Boot> bootm 0x3000000 0x2000000 0x2A00000
 
 ## JTAG Boot (no SD card, for testing)
 
-Use `xsdb` to load everything over JTAG:
+Direct JTAG boot (bitstream → PS7 init → AFI → kernel/DTB/initrd → Linux) is
+handled by the Vitis Linux workspace:
 
 ```tcl
-# From repo root:
-xsdb linux/boot/jtag_boot.tcl
+# From the Vitis GUI XSCT console (power-cycle the board first):
+source D:/Users/u/tmac-zynq-fpga/vitis_linux/scripts/boot_linux_jtag.tcl
 ```
 
-This loads bitstream → PS7 init → kernel/DTB/initrd/tmac to DDR → starts U-Boot.
-Console via DCC: `readjtaguart -start` before `con`.
+Or standalone:
+
+```powershell
+C:\Xilinx\Vivado\2023.1\bin\xsdb.bat D:\Users\u\tmac-zynq-fpga\vitis_linux\scripts\boot_linux_jtag.tcl
+```
+
+This loads the bitstream from `vitis_linux/workspace/z7_linux/hw/`, runs
+ps7_init, programs AFI (HP0), loads zImage/DTB/initramfs from
+`vitis_linux/prebuilt/` to DDR, and boots the kernel (r0=0 r1=~0 r2=dtb pc=zImage).
+Console via DCC is captured by `readjtaguart` (capped at ~544 B/session).
 
 ---
 
