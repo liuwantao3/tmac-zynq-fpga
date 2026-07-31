@@ -922,7 +922,7 @@ Three bugs in the multi-group Q8 iteration were found and fixed during iVerilog 
 - `vivado_integration/proj_bd/matmul_bd.runs/impl_1/system_wrapper.bit`: Synthesized bitstream (reordered PS7 config)
 - `D:/Users/u/workspace/tmac/Debug/tmac.elf`: Vitis ELF loaded by XSDB
 - `docs/debug_log.md`: Full debug history
-- `linux/README.md`: Linux-on-SD boot build guide + Windows SD card creation steps
+- `linux/README.md`: Linux-on-SD boot build guide (U-Boot + kernel on Lima VM; BOOT.BIN via buildroot bootgen — no Windows)
 - `linux/tmac_linux.c`: Linux userspace FPGA test program (uses /dev/mem mmap)
 - `linux/boot/boot.bif`: Bootgen config (FSBL + bitstream + U-Boot)
 - `linux/boot/system_wrapper.bit`: FPGA bitstream for Linux boot
@@ -958,24 +958,24 @@ Use `iomem=relaxed` bootarg if STRICT_DEVMEM blocks 0x43C00000 range.
 The Lima VM approach eliminates all macOS SDK conflicts — builds take
 ~5 min for U-Boot + kernel, no patches needed.
 
-### Windows (Vivado) — BOOT.BIN; Mac — SD Card Creation
+### Windows (Vivado) — bitstream/FSBL only; Mac — everything else
 
 **Pre-built files** in `linux/boot/`:
 - `system_wrapper.bit` — FPGA bitstream (prebuilt)
 - `matmul_bd.xsa` — hardware handoff
 - `boot.bif` — bootgen config (FSBL + bitstream + U-Boot)
 - `boot.cmd` — U-Boot auto-boot script source (committed; `boot.scr` generated from it by `mkimage` in `linux/build_all.sh`)
-- `fsbl.elf` — built FSBL (regenerable via XSCT, at `vitis_linux/workspace/z7_linux/export/z7_linux/sw/z7_linux/boot/fsbl.elf`)
-
-**Windows step** (see `linux/README.md` for details):
-1. Run `bootgen -image boot.bif -o BOOT.BIN -w` in `linux/boot/` (bootgen at `C:\Xilinx\Vivado\2023.1\bin\bootgen.bat`; not on PATH)
+- `fsbl.elf` — **committed** (built from `matmul_bd.xsa`; regenerable via XSCT, at `vitis_linux/workspace/z7_linux/export/z7_linux/sw/z7_linux/boot/fsbl.elf`)
 
 **Mac steps** (user has an SD writer; SD boot is the primary path, JTAG hand-boot is the fallback):
 1. Build `u-boot.elf`, `uImage`, `devicetree.dtb`, `uramdisk.image.gz`, `boot.scr` via `linux/build_all.sh` in the Lima VM
-2. Format SD with `diskutil partitionDisk /dev/diskX MBR FAT32 SD_BOOT 128M FAT32 SD_DATA R` (two FAT32 partitions — no ext4 tools needed on macOS)
-3. Copy `BOOT.BIN` + `uImage` + `devicetree.dtb` + `uramdisk.image.gz` + `boot.scr` → FAT32 p1
-4. Copy `model.tmac` + `tmac` → FAT32 p2 (initramfs mounts `/dev/mmcblk0p2` on `/root`)
-5. **Power-cycle** board, insert SD, set boot mode jumper **J1** to SD, connect UART (115200 baud) — U-Boot distro boot (`CONFIG_DISTRO_DEFAULTS=y`) auto-runs `boot.scr`
+2. **`linux/build_all.sh` also runs `linux/build_bootbin.sh`** — builds Xilinx `bootgen` via buildroot's `host-bootgen` package (into `/tmp/arm-build/buildroot/output/host/bin/bootgen`) and fuses `BOOT.BIN` from the committed `fsbl.elf` + `system_wrapper.bit` + `u-boot.elf`. No Windows step needed for the SD flow.
+3. Format SD with `diskutil partitionDisk /dev/diskX MBR FAT32 SD_BOOT 128M FAT32 SD_DATA R` (two FAT32 partitions — no ext4 tools needed on macOS)
+4. Copy `BOOT.BIN` + `uImage` + `devicetree.dtb` + `uramdisk.image.gz` + `boot.scr` → FAT32 p1
+5. Copy `model.tmac` + `tmac` → FAT32 p2 (initramfs mounts `/dev/mmcblk0p2` on `/root`)
+6. **Power-cycle** board, insert SD, set boot mode jumper **J1** to SD, connect UART (115200 baud) — U-Boot distro boot (`CONFIG_DISTRO_DEFAULTS=y`) auto-runs `boot.scr`
+
+**Windows is only needed if the hardware changes:** rebuild `system_wrapper.bit` (Vivado) + `fsbl.elf` (XSCT), commit them, then re-run `build_bootbin.sh` on the Mac. Windows `bootgen.bat` (`C:\Xilinx\Vivado\2023.1\bin\bootgen.bat`) remains a working fallback.
 
 **U-Boot bootargs** for FPGA access:
 ```
@@ -1020,3 +1020,5 @@ Full workflow: `vitis_linux/README.md`.
 18. **JTAG initrd mechanism — `devicetree-jtag.dtb` via `linux/patch_dtb_initrd.py` (2026-07-31):** The U-Boot-less hand boot (`boot_linux_jtag.tcl`) needs the initramfs to reach a login shell, and U-Boot `bootm` isn't in that path. Added a dependency-free Python FDT rewriter `linux/patch_dtb_initrd.py` that bakes `/chosen/linux,initrd-start/end` (u32 physical addresses) into a copy of `devicetree.dtb`, plus a raw gzipped cpio `initramfs.cpio.gz` (strips any 64-byte mkimage header if buildroot ever adds one). The kernel then locates the initrd loaded at 0x03000000 entirely from the DTB. Patch script validated: algorithm first prototyped in PowerShell and verified by re-walk + canonical prop diff (only the two new `/chosen` props differ among 557); then the shipped Python produced a **byte-identical** 17216-byte `devicetree-jtag.dtb` (SHA256 `E385FE92…`). `linux/build_all.sh` now generates both artifacts after buildroot and mirrors them to `vitis_linux/prebuilt/`; `boot_linux_jtag.tcl` loads `devicetree-jtag.dtb` + `initramfs.cpio.gz`. Console stays on ttyPS0 (`/chosen/bootargs` empty → baked-in `CONFIG_CMDLINE`). Note: the Python closure trap (`strings_new +=` inside `add_string` shadowed the outer name → `UnboundLocalError`) was fixed with `nonlocal`. Pending: Mac-side rebuild + on-hardware boot verification.
 
 19. **SD boot is primary — auto-run `boot.scr`, JTAG stays as fallback (2026-07-31):** User has an SD writer on the Mac, so the natural Zynq boot path is FSBL → U-Boot → `bootm` from SD (exactly what the MicroPhase reference repo assumes; `xilinx_zynq_virt_defconfig` has `CONFIG_DISTRO_DEFAULTS=y`, so U-Boot auto-runs `boot.scr` from the FAT32 partition — no interactive prompt). Added committed `linux/boot/boot.cmd` (the source; fatloads uImage@0x03000000, dtb@0x02A00000, uramdisk@0x02000000, then `bootm` — matching the README manual boot) and `linux/build_all.sh` now generates `boot.scr` from it with U-Boot's own `./tools/mkimage` (NOT kernel u-boot-tools) right after the U-Boot build. `.gitignore` covers `linux/boot/boot.scr` + the already-untracked `initramfs.cpio.gz`/`devicetree-jtag.dtb`. SD card is now two FAT32 partitions (p1 boot: BOOT.BIN/uImage/devicetree.dtb/uramdisk.image.gz/boot.scr; p2 data: model.tmac + tmac — vfat keeps macOS tools sufficient, no ext4 needed; the initramfs `mount /dev/mmcblk0p2 /root` auto-detects) written on the Mac with `diskutil partitionDisk /dev/diskX MBR FAT32 SD_BOOT 128M FAT32 SD_DATA R`. Boot mode jumper is **J1** (not a DIP). The JTAG initrd mechanism (#18) is kept as the bring-up fallback. Docs updated: `linux/README.md` (manual-flow mkimage step, corrected `boot.bif` contents — FSBL path `fsbl.elf`+`system_wrapper.bit`+`u-boot.elf`, not the stale SPL snippet), `AGENTS.md` SD section, `linux/build_all.sh` summary. **Mac-agent clarity:** `build_all.sh` is now host-agnostic (guards `HOSTCC=clang`/brew openssl and the `/tmp/arm-toolchain/elf.h` requirement behind `uname -s = Darwin`), so it runs in the Lima Ubuntu VM (apt gcc-arm-linux-gnueabihf) or on the macOS host (clang wrapper); the README opens with a step-by-step "Quickstart: automated build" (`clone` → `clone_repos.sh` → `build_all.sh` → artifact verification table → SD card prep) plus a note that `model.tmac` is NOT in the repo (gitignored, ask the user / copy from Windows `models/`).
+
+20. **BOOT.BIN produced on the Mac — buildroot `host-bootgen` (2026-07-31):** The last Windows-only step in the SD flow — fusing `BOOT.BIN` — was removed. Buildroot (already cloned by `clone_repos.sh`) ships a `host-bootgen` package (package `bootgen`, Xilinx/bootgen `xilinx_v2026.1`, deps host-openssl + host-pkgconf auto-built) that installs `bootgen` into `/tmp/arm-build/buildroot/output/host/bin/bootgen` via `make host-bootgen`. Added `linux/build_bootbin.sh`: builds bootgen via buildroot (fallback: direct clone of `Xilinx/bootgen` + `make LIBS=$(pkg-config --libs libssl libcrypto)`), then fuses `BOOT.BIN` from `fsbl.elf` + `system_wrapper.bit` + `u-boot.elf` using the committed `boot.bif` (`bootgen -image boot.bif -o BOOT.BIN -w`, run in `linux/boot/` so the relative BIF paths resolve — same invocation as the old Windows step). Committed `linux/boot/fsbl.elf` (227784 B, built from `matmul_bd.xsa` via the z7_linux workspace — un-ignored in `.gitignore` with a `!linux/boot/fsbl.elf` override); it only changes if the HW design does. `linux/build_all.sh` step [4/4] now calls `build_bootbin.sh`, so a single VM command produces `u-boot.elf` + `boot.scr` + `uImage` + dtb + initramfs **and** `BOOT.BIN`. README + AGENTS.md updated: the flow is now single-machine (Mac/Lima VM), Windows/Vivado only to rebuild bitstream/FSBL on HW changes; Windows `bootgen.bat` kept as a documented fallback. Note: `bootgen` on the Mac produces a Zynq-7000 image with the same `boot.bif` (FSBL path) — SPL is not used.

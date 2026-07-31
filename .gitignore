@@ -130,6 +130,8 @@ gguf-tools-main/*.o
 
 # Linux boot files (rebuilt on Mac by the user)
 linux/boot/*.elf
+# fsbl.elf is committed: it is only regenerated on Windows if the HW changes
+!linux/boot/fsbl.elf
 linux/boot/*.bin
 linux/boot/*.img
 linux/boot/uImage

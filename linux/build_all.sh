@@ -45,7 +45,7 @@ export PATH="$TOOLCHAIN_DIR:$PATH"
 if command -v gmake >/dev/null 2>&1; then
     export MAKE=gmake
 fi
-echo "=== [1/3] Building U-Boot ==="
+echo "=== [1/4] Building U-Boot ==="
 cd "$WORKDIR/u-boot-xlnx"
 
 # ── Reset to clean state (idempotent for re-runs) ──
@@ -143,7 +143,7 @@ echo "  → boot.scr copied to $BOOT_DIR/"
 echo ""
 
 # ── 2. Linux Kernel ──
-echo "=== [2/3] Building Linux Kernel ==="
+echo "=== [2/4] Building Linux Kernel ==="
 cd "$WORKDIR/linux-xlnx"
 
 # macOS-only: minimal elf.h for host tools (Linux hosts have real ELF headers)
@@ -173,7 +173,7 @@ echo "  → uImage, devicetree.dtb copied to $BOOT_DIR/"
 echo ""
 
 # ── 3. Buildroot (rootfs) ──
-echo "=== [3/3] Building Buildroot rootfs ==="
+echo "=== [3/4] Building Buildroot rootfs ==="
 cd "$WORKDIR/buildroot"
 ${MAKE:-make} qemu_arm_vexpress_defconfig
 
@@ -217,18 +217,22 @@ if [ -d "$VITIS_PREBUILT" ]; then
 fi
 echo ""
 
+# ── 4. BOOT.BIN — Mac-side bootgen via buildroot (no Windows needed) ──
+echo "=== [4/4] Creating BOOT.BIN (buildroot host-bootgen) ==="
+bash "$FPGA_ROOT/linux/build_bootbin.sh" "$WORKDIR" "$FPGA_ROOT"
+echo ""
+
 # ── Summary ──
 echo "============================================"
 echo "  Build complete. Boot files in $BOOT_DIR/:"
 echo "============================================"
-ls -lh "$BOOT_DIR"/{u-boot.elf,uImage,devicetree.dtb,devicetree-jtag.dtb,uramdisk.image.gz,initramfs.cpio.gz,boot.scr} 2>/dev/null
+ls -lh "$BOOT_DIR"/{u-boot.elf,boot.scr,uImage,devicetree.dtb,devicetree-jtag.dtb,uramdisk.image.gz,initramfs.cpio.gz,BOOT.BIN} 2>/dev/null
 echo ""
-echo "Next steps:"
-echo "  1. On Windows with Vivado: cd $BOOT_DIR && bootgen -image boot.bif -o BOOT.BIN -w"
-echo "  2. On the Mac (SD writer): format SD — FAT32 p1 (128MB) + FAT32 p2 (rest)"
-echo "  3. Copy BOOT.BIN + uImage + devicetree.dtb + uramdisk.image.gz + boot.scr → FAT32 p1"
-echo "  4. Copy model.tmac + tmac → FAT32 p2 (initramfs mounts /dev/mmcblk0p2 on /root)"
-echo "  5. Insert SD, set J1 boot mode to SD, power on — U-Boot auto-runs boot.scr (UART0 console)"
+echo "Next steps (all on the Mac — no Windows needed for the SD flow):"
+echo "  1. Format SD: diskutil partitionDisk /dev/diskX MBR FAT32 SD_BOOT 128M FAT32 SD_DATA R"
+echo "  2. Copy BOOT.BIN + uImage + devicetree.dtb + uramdisk.image.gz + boot.scr → FAT32 p1"
+echo "  3. Copy model.tmac + tmac → FAT32 p2 (initramfs mounts /dev/mmcblk0p2 on /root)"
+echo "  4. Insert SD, set J1 boot mode to SD, power on — U-Boot auto-runs boot.scr (UART0 console)"
 echo ""
 echo "JTAG boot (no SD): devicetree-jtag.dtb + initramfs.cpio.gz were mirrored to"
 echo "  vitis_linux/prebuilt/ if present — run vitis_linux/scripts/boot_linux_jtag.tcl."
