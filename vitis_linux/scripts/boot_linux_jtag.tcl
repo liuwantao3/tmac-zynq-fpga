@@ -4,8 +4,10 @@
 # Or standalone:     C:\Xilinx\Vivado\2023.1\bin\xsdb.bat D:/Users/u/tmac-zynq-fpga/vitis_linux/scripts/boot_linux_jtag.tcl
 #
 # Flow: bitstream -> ps7_init -> AFI -> load zImage/dtb/initramfs -> boot kernel (r0=0 r1=~0 r2=dtb pc=zImage)
-# Kernel console goes to UART0 (CH340 USB-UART, works) AND/OR DCC.
-# DCC capture via readjtaguart is capped (~544 B/session), so it only proves the kernel starts.
+# Kernel console is on the USB-UART0 (CH340): the DTB /chosen/bootargs is empty,
+# so the kernel uses the baked-in CONFIG_CMDLINE "console=ttyPS0,115200 ...".
+# Open a 115200 8N1 terminal (PuTTY) on the CH340 COM port to see U-Boot-less
+# boot output (see linux/README.md). The kernel starts even if no terminal is open.
 # Verified signals of a live kernel: PC advances out of zImage, CLK_CNT keeps incrementing.
 #
 # Requires a board power-cycle before ps7_init (PLL re-lock hang).
@@ -61,9 +63,8 @@ dow -data $DTB $DTB_LOAD; after 200
 puts "6. Loading initramfs to 0x[format %08x $RAMFS_LOAD]..."
 dow -data $RAMFS $RAMFS_LOAD; after 300
 
-puts "7. DCC capture + boot..."
-set dcc_fp [open "dcc_boot_output.txt" w]
-readjtaguart -start -handle $dcc_fp
+puts "7. Booting kernel (console on USB-UART0, 115200 8N1)..."
+puts "   Attach PuTTY to the CH340 COM port to watch kernel/initramfs output."
 catch {stop}; after 200
 targets -set -filter {name =~ "*Cortex-A9*#0*"}; after 200
 rwr r0 0
@@ -79,11 +80,5 @@ after 30000
 catch {targets -set -filter {name =~ "*Cortex-A9*#0*"}}; after 100
 catch {stop}; after 200
 catch {rdreg pc} msg; puts "   pc = $msg"
-readjtaguart -stop
-close $dcc_fp
 
-puts "\n=== DCC Console Output (first 544 B) ==="
-set fp [open "dcc_boot_output.txt" r]
-puts [read $fp]
-close $fp
-puts "\n=== Done ==="
+puts "\n=== Done. Kernel console log was on USB-UART0 (see PuTTY). ==="

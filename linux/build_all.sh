@@ -118,6 +118,11 @@ export CROSS_COMPILE=arm-linux-gnueabihf-
 export HOSTCC=clang
 export HOSTCFLAGS="-I$(brew --prefix openssl 2>/dev/null || echo /opt/homebrew/opt/openssl@3)/include"
 export HOSTLDFLAGS="-L$(brew --prefix openssl 2>/dev/null || echo /opt/homebrew/opt/openssl@3)/lib"
+# Console = UART0: the stock xilinx_zynq_virt_defconfig has CONFIG_ZYNQ_SERIAL=y
+# (Cadence uart) plus a default device tree (zynq-zc706) whose stdout-path is
+# "serial0:115200n8", so the serial console goes to UART0 at 115200. The stock
+# CONFIG_ARM_DCC=y in this defconfig only adds the optional ARM DCC driver; it
+# does NOT become the console (no "arm,dcc" DT node, stdout-path = serial0).
 ${MAKE:-make} xilinx_zynq_virt_defconfig
 ${MAKE:-make} -j"$CORES" u-boot spl/u-boot-spl.bin
 cp u-boot "$BOOT_DIR/u-boot.elf"
@@ -136,6 +141,15 @@ cd "$WORKDIR/linux-xlnx"
 export HOSTCFLAGS="-I/tmp/arm-toolchain"
 
 ${MAKE:-make} ARCH=arm xilinx_zynq_defconfig
+
+# UART0 console (ttyPS0): bake the command line into CONFIG_CMDLINE so both
+# SD-boot (U-Boot) and JTAG-boot (boot_linux_jtag.tcl, empty DT /chosen/bootargs)
+# get the console on the USB-UART. The stock defconfig already sets
+# CONFIG_SERIAL_XILINX_PS_UART(_CONSOLE)=y; this REPLACES the DCC earlycon
+# (earlycon=dcc console=hvc0) that was baked in on 2026-07-30.
+./scripts/config --enable SERIAL_XILINX_PS_UART_CONSOLE
+./scripts/config --set-str CMDLINE "earlycon console=ttyPS0,115200 root=/dev/ram0 rw iomem=relaxed"
+${MAKE:-make} -j"$CORES" ARCH=arm olddefconfig
 ${MAKE:-make} -j"$CORES" ARCH=arm UIMAGE_LOADADDR=0x8000 uImage
 ${MAKE:-make} ARCH=arm dtbs
 cp arch/arm/boot/uImage "$BOOT_DIR/"

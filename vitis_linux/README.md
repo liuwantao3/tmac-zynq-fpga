@@ -29,12 +29,14 @@ https://xilinx.github.io/Embedded-Design-Tutorials/docs/2023.1/build/html/docs/I
 1. **No Ethernet** (MicroPhase Z7-Lite) → Vitis "Run As → Linux Application Debug"
    cannot deploy via TCF agent. The Linux domain + app are used for
    cross-compilation; execution is done via JTAG.
-2. **USB-UART on UART0 works** (CH340, MIO 14/15, 115200 8N1) but is not used for
-   the run flow here: kernel console is on JTAG DCC (`hvc0`). DCC via
-   `readjtaguart` is capped at ~544 B/session and
-   the drain dies after ~4 sessions, so a full kernel log cannot be captured.
-   For a GUI-verifiable serial flow on this same hardware, use the bare-metal
-   workspace `../vitis_bm/` (Vitis GUI → Run As → Launch Hardware, console on UART0).
+2. **USB-UART on UART0 works** (CH340, MIO 14/15, 115200 8N1) and carries the
+   whole console: U-Boot (SD boot) and kernel both print to ttyPS0. The kernel
+   `CONFIG_CMDLINE` is baked to `console=ttyPS0,115200 root=/dev/ram0 rw iomem=relaxed`
+   (the DTB `/chosen/bootargs` is empty, so the kernel uses the baked-in command
+   line). The old JTAG DCC console (`hvc0`, `readjtaguart`) was capped at
+   ~544 B/session and has been removed. For a GUI-verifiable serial flow on this
+   same hardware, use the bare-metal workspace `../vitis_bm/` (Vitis GUI → Run
+   As → Launch Hardware, console on UART0).
 3. **No SD reader on Windows** → SD-card boot images are built on the Lima VM.
 
 ## Open the workspace in the Vitis GUI
@@ -56,7 +58,8 @@ The board must be **power-cycled** first (PLL re-lock hang in ps7_init).
 1. **Xilinx → XSCT Console** (integrated TCL console).
 2. `source {D:/Users/u/tmac-zynq-fpga/vitis_linux/scripts/boot_linux_jtag.tcl}`
 3. The script programs the bitstream, runs ps7_init + AFI, loads zImage/dtb/
-   initramfs, and boots the kernel. Output shows in `dcc_boot_output.txt`.
+   initramfs, and boots the kernel. Kernel console appears on the USB-UART0
+   (open a 115200 8N1 PuTTY terminal on the CH340 COM port to watch it).
 4. Verify the kernel is alive: `pc` will have advanced, CLK_CNT keeps counting.
 
 ## Running hello_linux on the target
@@ -75,8 +78,8 @@ needs the rootfs libc). To actually execute it on Linux:
   `iomem=relaxed` in the kernel bootargs (already set) for /dev/mem access to
   0x1F000000 (kernel RAM).
 - **Console path**: the USB-UART (UART0) works — attach a 115200 8N1 terminal
-  and run `./hello_linux` at the login shell (kernel console currently boots to
-  JTAG DCC `hvc0`).
+  and run `./hello_linux` at the initramfs login shell (kernel console boots to
+  ttyPS0).
 
 ## Rebuild from scratch (headless)
 
