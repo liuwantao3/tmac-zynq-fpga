@@ -126,12 +126,14 @@ git clone --depth=1 --branch xilinx-v2022.1 \
 cd ~/u-boot-xlnx
 export CROSS_COMPILE=arm-linux-gnueabihf-
 
-# No DCC config needed: the stock defconfig has CONFIG_ZYNQ_SERIAL=y (Cadence
-# uart) and its default device tree (zynq-zc706) has stdout-path="serial0:115200n8",
-# so the serial console is UART0 (CH340 USB-UART) at 115200 8N1. The stock
-# CONFIG_ARM_DCC=y only adds the optional ARM DCC driver — it is not selected as
+# The stock defconfig uses zynq-zc706 DTB (console on UART1, MIO 48/49).
+# Switch to zynq-zc702 which routes the console to UART0 (MIO 14/15) —
+# this matches the Z7-Lite's CH340 USB-UART pin assignments.
+# CONFIG_ARM_DCC=y only adds an optional DCC driver; it is not selected as
 # the console because there is no "arm,dcc" DT node.
 make xilinx_zynq_virt_defconfig
+echo 'CONFIG_DEFAULT_DEVICE_TREE="zynq-zc702"' >> .config
+make olddefconfig
 # Fix SPL build for Zynq 7010
 sed -i 's|@dd if=$$< of=$$@ conv=block,sync bs=4 2>/dev/null;|@cp $$< $$@|' scripts/Makefile.spl
 make -j$(nproc)
@@ -368,7 +370,7 @@ kernel uses the baked-in `CONFIG_CMDLINE=console=ttyPS0,115200 ...`). Open a
 | Hardware | CH340 USB-UART (works) | JTAG (Digilent HS-2) |
 | Speed | 115200 baud (~11 KB/s) | ~200-500 KB/s |
 | Console | `ttyPS0` (kernel) / U-Boot serial | `hvc0` |
-| Config | kernel `CONFIG_CMDLINE=console=ttyPS0,115200`; U-Boot stock defconfig (`stdout-path=serial0`) | kernel `earlycon=dcc console=hvc0`; U-Boot `CONFIG_ARM_DCC=y` |
+| Config | kernel `CONFIG_CMDLINE=console=ttyPS0,115200`; U-Boot `xilinx_zynq_virt_defconfig` with `CONFIG_DEFAULT_DEVICE_TREE="zynq-zc702"` (stdout-path=serial0 on UART0) | kernel `earlycon=dcc console=hvc0`; U-Boot `CONFIG_ARM_DCC=y` |
 | Capture | Serial terminal (PuTTY) | `readjtaguart -start` in XSDB |
 
 The CH340 USB-UART works (UART0, MIO 14/15, 115200 8N1) — see AGENTS.md Key

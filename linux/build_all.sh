@@ -125,12 +125,15 @@ if [ "$(uname -s)" = "Darwin" ]; then
   export HOSTCFLAGS="-I$(brew --prefix openssl 2>/dev/null || echo /opt/homebrew/opt/openssl@3)/include"
   export HOSTLDFLAGS="-L$(brew --prefix openssl 2>/dev/null || echo /opt/homebrew/opt/openssl@3)/lib"
 fi
-# Console = UART0: the stock xilinx_zynq_virt_defconfig has CONFIG_ZYNQ_SERIAL=y
-# (Cadence uart) plus a default device tree (zynq-zc706) whose stdout-path is
-# "serial0:115200n8", so the serial console goes to UART0 at 115200. The stock
-# CONFIG_ARM_DCC=y in this defconfig only adds the optional ARM DCC driver; it
-# does NOT become the console (no "arm,dcc" DT node, stdout-path = serial0).
+# Console = UART0: The default device tree (zynq-zc706) uses UART1
+# (MIO 48/49), but the Z7-Lite board has the CH340 USB-UART on UART0
+# (MIO 14/15). Switch to zynq-zc702 DTB, which routes the console to
+# UART0/serial0 and matches our MIO pin assignments. The stock
+# CONFIG_ARM_DCC=y only adds an optional DCC driver; it does NOT become
+# the console (no "arm,dcc" DT node, stdout-path=serial0).
 ${MAKE:-make} xilinx_zynq_virt_defconfig
+echo 'CONFIG_DEFAULT_DEVICE_TREE="zynq-zc702"' >> .config
+${MAKE:-make} olddefconfig
 ${MAKE:-make} -j"$CORES" u-boot spl/u-boot-spl.bin
 cp u-boot "$BOOT_DIR/u-boot.elf"
 echo "  → u-boot.elf copied to $BOOT_DIR/"
