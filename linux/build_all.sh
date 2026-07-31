@@ -1,6 +1,9 @@
 #!/bin/bash
 # Build U-Boot + Linux kernel + Buildroot for Zynq-7010 SD card boot
-# Requires: step 1 (clone) completed, arm-linux-gnueabihf- toolchain in PATH
+# Works in BOTH environments:
+#   - Lima ARM64 Ubuntu VM (recommended): apt gcc-arm-linux-gnueabihf + libssl-dev
+#   - macOS host: clang wrapper via setup_toolchain.sh + brew binutils + openssl
+# Requires: bash linux/clone_repos.sh completed (or repos in workdir)
 # Usage: bash linux/build_all.sh [workdir] [fpga_root]
 
 set -euo pipefail
@@ -115,9 +118,13 @@ echo "  patches applied"
 
 # ── Build ──
 export CROSS_COMPILE=arm-linux-gnueabihf-
-export HOSTCC=clang
-export HOSTCFLAGS="-I$(brew --prefix openssl 2>/dev/null || echo /opt/homebrew/opt/openssl@3)/include"
-export HOSTLDFLAGS="-L$(brew --prefix openssl 2>/dev/null || echo /opt/homebrew/opt/openssl@3)/lib"
+# macOS host: U-Boot host tools need clang + Homebrew openssl. Inside the Lima
+# Ubuntu VM (recommended) these are left to defaults (gcc + libssl-dev).
+if [ "$(uname -s)" = "Darwin" ]; then
+  export HOSTCC=clang
+  export HOSTCFLAGS="-I$(brew --prefix openssl 2>/dev/null || echo /opt/homebrew/opt/openssl@3)/include"
+  export HOSTLDFLAGS="-L$(brew --prefix openssl 2>/dev/null || echo /opt/homebrew/opt/openssl@3)/lib"
+fi
 # Console = UART0: the stock xilinx_zynq_virt_defconfig has CONFIG_ZYNQ_SERIAL=y
 # (Cadence uart) plus a default device tree (zynq-zc706) whose stdout-path is
 # "serial0:115200n8", so the serial console goes to UART0 at 115200. The stock
@@ -127,18 +134,26 @@ ${MAKE:-make} xilinx_zynq_virt_defconfig
 ${MAKE:-make} -j"$CORES" u-boot spl/u-boot-spl.bin
 cp u-boot "$BOOT_DIR/u-boot.elf"
 echo "  → u-boot.elf copied to $BOOT_DIR/"
+
+# ── Boot script (boot.scr): CONFIG_DISTRO_DEFAULTS=y makes U-Boot auto-run
+#    boot.scr from the FAT32 partition, so SD boot needs no interactive prompt.
+#    Use U-Boot's own mkimage (NOT kernel u-boot-tools) for a legacy script image.
+./tools/mkimage -A arm -T script -C none -n "Boot" -d "$BOOT_DIR/boot.cmd" "$BOOT_DIR/boot.scr"
+echo "  → boot.scr copied to $BOOT_DIR/"
 echo ""
 
 # ── 2. Linux Kernel ──
 echo "=== [2/3] Building Linux Kernel ==="
 cd "$WORKDIR/linux-xlnx"
 
-# Create minimal elf.h for macOS (no system-level ELF support)
-[ -f /tmp/arm-toolchain/elf.h ] || {
-    echo "ERROR: /tmp/arm-toolchain/elf.h not found. Run: bash linux/setup_toolchain.sh"
-    exit 1
-}
-export HOSTCFLAGS="-I/tmp/arm-toolchain"
+# macOS-only: minimal elf.h for host tools (Linux hosts have real ELF headers)
+if [ "$(uname -s)" = "Darwin" ]; then
+  [ -f /tmp/arm-toolchain/elf.h ] || {
+      echo "ERROR: /tmp/arm-toolchain/elf.h not found. Run: bash linux/setup_toolchain.sh"
+      exit 1
+  }
+  export HOSTCFLAGS="-I/tmp/arm-toolchain"
+fi
 
 ${MAKE:-make} ARCH=arm xilinx_zynq_defconfig
 
@@ -206,14 +221,14 @@ echo ""
 echo "============================================"
 echo "  Build complete. Boot files in $BOOT_DIR/:"
 echo "============================================"
-ls -lh "$BOOT_DIR"/{u-boot.elf,uImage,devicetree.dtb,devicetree-jtag.dtb,uramdisk.image.gz,initramfs.cpio.gz} 2>/dev/null
+ls -lh "$BOOT_DIR"/{u-boot.elf,uImage,devicetree.dtb,devicetree-jtag.dtb,uramdisk.image.gz,initramfs.cpio.gz,boot.scr} 2>/dev/null
 echo ""
 echo "Next steps:"
 echo "  1. On Windows with Vivado: cd $BOOT_DIR && bootgen -image boot.bif -o BOOT.BIN -w"
-echo "  2. Format SD card: partition 1 FAT32, partition 2 ext4"
-echo "  3. Copy BOOT.BIN + uImage + devicetree.dtb + uramdisk.image.gz → FAT32 partition"
-echo "  4. Copy model.tmac + tmac → ext4 partition"
-echo "  5. Insert SD, set boot mode to SD, power on"
+echo "  2. On the Mac (SD writer): format SD — FAT32 p1 (128MB) + FAT32 p2 (rest)"
+echo "  3. Copy BOOT.BIN + uImage + devicetree.dtb + uramdisk.image.gz + boot.scr → FAT32 p1"
+echo "  4. Copy model.tmac + tmac → FAT32 p2 (initramfs mounts /dev/mmcblk0p2 on /root)"
+echo "  5. Insert SD, set J1 boot mode to SD, power on — U-Boot auto-runs boot.scr (UART0 console)"
 echo ""
 echo "JTAG boot (no SD): devicetree-jtag.dtb + initramfs.cpio.gz were mirrored to"
 echo "  vitis_linux/prebuilt/ if present — run vitis_linux/scripts/boot_linux_jtag.tcl."

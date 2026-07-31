@@ -138,6 +138,9 @@ linux/boot/uramdisk.image.gz
 linux/boot/u-boot-spl.bin
 linux/boot/BOOT.BIN
 linux/boot/zImage
+linux/boot/boot.scr
+linux/boot/initramfs.cpio.gz
+linux/boot/devicetree-jtag.dtb
 
 # Vitis Linux workspace (regenerable via XSCT — see vitis_linux/README.md)
 vitis_linux/workspace/

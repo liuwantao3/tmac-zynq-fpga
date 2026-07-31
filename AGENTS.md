@@ -958,19 +958,24 @@ Use `iomem=relaxed` bootarg if STRICT_DEVMEM blocks 0x43C00000 range.
 The Lima VM approach eliminates all macOS SDK conflicts — builds take
 ~5 min for U-Boot + kernel, no patches needed.
 
-### Windows (Vivado) — SD Card Creation
+### Windows (Vivado) — BOOT.BIN; Mac — SD Card Creation
 
 **Pre-built files** in `linux/boot/`:
 - `system_wrapper.bit` — FPGA bitstream (prebuilt)
 - `matmul_bd.xsa` — hardware handoff
 - `boot.bif` — bootgen config (FSBL + bitstream + U-Boot)
+- `boot.cmd` — U-Boot auto-boot script source (committed; `boot.scr` generated from it by `mkimage` in `linux/build_all.sh`)
+- `fsbl.elf` — built FSBL (regenerable via XSCT, at `vitis_linux/workspace/z7_linux/export/z7_linux/sw/z7_linux/boot/fsbl.elf`)
 
-**Windows steps** (see `linux/README.md` for details):
-1. Build `fsbl.elf` in Vivado SDK from `matmul_bd.xsa`
-2. Copy `u-boot-spl.bin`, `u-boot.img`, `uImage`, `devicetree.dtb`, `uramdisk.image.gz` from macOS build
-3. Run `bootgen -image boot.bif -o BOOT.BIN -w`
-4. Format SD: FAT32 partition (BOOT.BIN + uImage + dtb + initramfs), ext4 partition (model.tmac + tmac)
-5. **Power-cycle** board, insert SD, set SD boot mode, connect UART (115200 baud)
+**Windows step** (see `linux/README.md` for details):
+1. Run `bootgen -image boot.bif -o BOOT.BIN -w` in `linux/boot/` (bootgen at `C:\Xilinx\Vivado\2023.1\bin\bootgen.bat`; not on PATH)
+
+**Mac steps** (user has an SD writer; SD boot is the primary path, JTAG hand-boot is the fallback):
+1. Build `u-boot.elf`, `uImage`, `devicetree.dtb`, `uramdisk.image.gz`, `boot.scr` via `linux/build_all.sh` in the Lima VM
+2. Format SD with `diskutil partitionDisk /dev/diskX MBR FAT32 SD_BOOT 128M FAT32 SD_DATA R` (two FAT32 partitions — no ext4 tools needed on macOS)
+3. Copy `BOOT.BIN` + `uImage` + `devicetree.dtb` + `uramdisk.image.gz` + `boot.scr` → FAT32 p1
+4. Copy `model.tmac` + `tmac` → FAT32 p2 (initramfs mounts `/dev/mmcblk0p2` on `/root`)
+5. **Power-cycle** board, insert SD, set boot mode jumper **J1** to SD, connect UART (115200 baud) — U-Boot distro boot (`CONFIG_DISTRO_DEFAULTS=y`) auto-runs `boot.scr`
 
 **U-Boot bootargs** for FPGA access:
 ```
@@ -1013,3 +1018,5 @@ Full workflow: `vitis_linux/README.md`.
 17. **vitis_bm — bare-metal Vitis GUI workspace (2026-07-31):** Created `vitis_bm/` — a Vitis 2023.1 bare-metal (standalone) workspace mirroring the reference MicroPhase `03_dma` project layout, so the GUI can Program-FPGA + run FSBL + run the app over JTAG with console on the USB-UART. The workspace IS `vitis_bm/` itself (like `03_dma/arm`); `build.tcl` regenerates the platform `z7_bm` (from `vitis_linux/matmul_bd.xsa`, `ps7_cortexa9_0`, standalone) + app `tmac_serial` (imports `vitis_bm/app/src/tmac_serial.c`). The app exercises both UART paths: direct xuartps register programming (identical to the fixed `uart_init()`) and the BSP `xil_printf` driver, then prints live FPGA registers (CLK_CNT/STATUS/DEBUG/Q8DBG) over AXI4-Lite and a 1 Hz tick loop. Verified headless: `xsct.bat build.tcl` → EXIT=0, `tmac_serial.elf` built, app disassembly shows correct UART registers (BAUDGEN=124, CR=0x14, FIFO=0x30). `scripts/run_serial.tcl` is the XSDB headless runner (loads `sw/uart_test.elf`). Added standalone `sw/uart_test.c` + `uart_test.elf` to the clang Makefile flow (serial smoke test without a model); removed dead `hp_baremetal.elf`/`test_int16.elf` Makefile targets whose sources were deleted in the cleanup. **Next increment: Linux** — migrate the kernel console from JTAG DCC capture to UART0 (ttyPS0): rebuilt kernel with `CONFIG_CMDLINE=console=ttyPS0,115200 ...` and U-Boot with stock defconfig (no DCC additions); `boot_linux_jtag.tcl` no longer captures via `readjtaguart` (see `linux/README.md`).
 
 18. **JTAG initrd mechanism — `devicetree-jtag.dtb` via `linux/patch_dtb_initrd.py` (2026-07-31):** The U-Boot-less hand boot (`boot_linux_jtag.tcl`) needs the initramfs to reach a login shell, and U-Boot `bootm` isn't in that path. Added a dependency-free Python FDT rewriter `linux/patch_dtb_initrd.py` that bakes `/chosen/linux,initrd-start/end` (u32 physical addresses) into a copy of `devicetree.dtb`, plus a raw gzipped cpio `initramfs.cpio.gz` (strips any 64-byte mkimage header if buildroot ever adds one). The kernel then locates the initrd loaded at 0x03000000 entirely from the DTB. Patch script validated: algorithm first prototyped in PowerShell and verified by re-walk + canonical prop diff (only the two new `/chosen` props differ among 557); then the shipped Python produced a **byte-identical** 17216-byte `devicetree-jtag.dtb` (SHA256 `E385FE92…`). `linux/build_all.sh` now generates both artifacts after buildroot and mirrors them to `vitis_linux/prebuilt/`; `boot_linux_jtag.tcl` loads `devicetree-jtag.dtb` + `initramfs.cpio.gz`. Console stays on ttyPS0 (`/chosen/bootargs` empty → baked-in `CONFIG_CMDLINE`). Note: the Python closure trap (`strings_new +=` inside `add_string` shadowed the outer name → `UnboundLocalError`) was fixed with `nonlocal`. Pending: Mac-side rebuild + on-hardware boot verification.
+
+19. **SD boot is primary — auto-run `boot.scr`, JTAG stays as fallback (2026-07-31):** User has an SD writer on the Mac, so the natural Zynq boot path is FSBL → U-Boot → `bootm` from SD (exactly what the MicroPhase reference repo assumes; `xilinx_zynq_virt_defconfig` has `CONFIG_DISTRO_DEFAULTS=y`, so U-Boot auto-runs `boot.scr` from the FAT32 partition — no interactive prompt). Added committed `linux/boot/boot.cmd` (the source; fatloads uImage@0x03000000, dtb@0x02A00000, uramdisk@0x02000000, then `bootm` — matching the README manual boot) and `linux/build_all.sh` now generates `boot.scr` from it with U-Boot's own `./tools/mkimage` (NOT kernel u-boot-tools) right after the U-Boot build. `.gitignore` covers `linux/boot/boot.scr` + the already-untracked `initramfs.cpio.gz`/`devicetree-jtag.dtb`. SD card is now two FAT32 partitions (p1 boot: BOOT.BIN/uImage/devicetree.dtb/uramdisk.image.gz/boot.scr; p2 data: model.tmac + tmac — vfat keeps macOS tools sufficient, no ext4 needed; the initramfs `mount /dev/mmcblk0p2 /root` auto-detects) written on the Mac with `diskutil partitionDisk /dev/diskX MBR FAT32 SD_BOOT 128M FAT32 SD_DATA R`. Boot mode jumper is **J1** (not a DIP). The JTAG initrd mechanism (#18) is kept as the bring-up fallback. Docs updated: `linux/README.md` (manual-flow mkimage step, corrected `boot.bif` contents — FSBL path `fsbl.elf`+`system_wrapper.bit`+`u-boot.elf`, not the stale SPL snippet), `AGENTS.md` SD section, `linux/build_all.sh` summary. **Mac-agent clarity:** `build_all.sh` is now host-agnostic (guards `HOSTCC=clang`/brew openssl and the `/tmp/arm-toolchain/elf.h` requirement behind `uname -s = Darwin`), so it runs in the Lima Ubuntu VM (apt gcc-arm-linux-gnueabihf) or on the macOS host (clang wrapper); the README opens with a step-by-step "Quickstart: automated build" (`clone` → `clone_repos.sh` → `build_all.sh` → artifact verification table → SD card prep) plus a note that `model.tmac` is NOT in the repo (gitignored, ask the user / copy from Windows `models/`).

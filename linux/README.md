@@ -4,7 +4,9 @@
 
 Hardware: MicroPhase Z7-Lite (xc7z010clg400-1), UART0 MIO14/15 (CH340 USB-UART, 115200 8N1). All console output (U-Boot + kernel) is on UART0.
 
-## Quickstart: macOS Build
+## Quickstart: automated build (recommended)
+
+Single-command flow that an automated agent (or the user) can run end-to-end.
 
 ### One-time: Lima VM setup
 
@@ -15,14 +17,91 @@ limactl shell linux-build
 sudo apt update && sudo apt install -y \
     gcc-arm-linux-gnueabihf build-essential flex bison bc libelf-dev libssl-dev \
     busybox-static cpio git
+exit   # back to the macOS host
 ```
 
-### Clone repo (includes FPGA bitstream + XSA from Windows)
+`build_all.sh` auto-detects the host: inside the Lima VM it uses the apt
+cross-compiler + libssl-dev; on the macOS host it uses the clang wrapper
+(`setup_toolchain.sh`) + Homebrew binutils/openssl. **The Lima VM is the
+recommended environment.**
+
+### 1. Clone the repo (macOS host — the VM shares the host home dir)
 
 ```bash
-git clone <your-repo-url> ~/tmac-zynq-fpga
+cd ~
+git clone https://github.com/liuwantao3/tmac-zynq-fpga.git
 cd ~/tmac-zynq-fpga
 ```
+
+The committed `linux/boot/` already contains the Windows-built
+`system_wrapper.bit`, `matmul_bd.xsa`, `boot.bif`, `boot.cmd`, and the `tmac`
+ARM binary. Everything else is built below.
+
+### 2. Clone U-Boot / kernel / buildroot (inside the VM: `limactl shell linux-build`)
+
+```bash
+cd ~/tmac-zynq-fpga
+bash linux/clone_repos.sh
+# clones into /tmp/arm-build/{u-boot-xlnx,linux-xlnx,buildroot} (VM-local tmp)
+```
+
+### 3. Build everything (inside the VM)
+
+```bash
+cd ~/tmac-zynq-fpga
+bash linux/build_all.sh          # from the repo root; artifacts land in linux/boot/
+# or with explicit paths:
+# bash linux/build_all.sh /tmp/arm-build ~/tmac-zynq-fpga
+```
+
+Build time ~5-15 min. Outputs in `linux/boot/` (shared with the host):
+`u-boot.elf`, `boot.scr`, `uImage`, `devicetree.dtb`, `uramdisk.image.gz`,
+`devicetree-jtag.dtb`, `initramfs.cpio.gz`.
+
+### 4. Verify the artifacts
+
+```bash
+cd ~/tmac-zynq-fpga/linux/boot
+ls -la
+file uImage boot.scr uramdisk.image.gz devicetree.dtb u-boot.elf
+```
+
+Expected (approximate, from the last build):
+
+| file | size | check |
+|------|------|-------|
+| `u-boot.elf` | ~1.1 MB | ARM ELF |
+| `boot.scr` | ~500 B | mkimage legacy script (magic `0x27051956`) |
+| `uImage` | ~4.9 MB | mkimage legacy kernel (magic `0x27051956`) |
+| `devicetree.dtb` | ~17 KB | DTB |
+| `uramdisk.image.gz` | ~1.3 MB | gzip (`1F 8B`) — raw gzipped cpio, no mkimage header |
+| `devicetree-jtag.dtb` | ~17 KB | patched DTB (JTAG fallback only) |
+| `initramfs.cpio.gz` | ~1.3 MB | gzip — same content as `uramdisk.image.gz` |
+
+### 5. Prepare the SD card (macOS host)
+
+```bash
+diskutil list                     # find the SD disk, e.g. /dev/disk4
+diskutil partitionDisk /dev/disk4 MBR FAT32 SD_BOOT 128M FAT32 SD_DATA R
+```
+
+| Partition | Type | Size | Contents |
+|-----------|------|------|----------|
+| 1 (`SD_BOOT`) | FAT32 | ~128 MB | `BOOT.BIN`, `uImage`, `devicetree.dtb`, `uramdisk.image.gz`, `boot.scr` |
+| 2 (`SD_DATA`) | FAT32 (vfat) | Rest | `model.tmac` (~374 MB), `tmac` |
+
+**`model.tmac` is NOT in the repo** (gitignored, ~374 MB). Ask the user for it
+(it lives on the Windows machine at `models/model.tmac`) and copy it onto the
+SD p2 — everything else can be built and verified without it.
+
+### 6. BOOT.BIN — do this on Windows (after switching back)
+
+The FSBL + bitstream + U-Boot are fused into `BOOT.BIN` on the Windows machine
+(see the Windows section below). Copy it onto the SD p1.
+
+---
+
+## Manual Build (reference — what `build_all.sh` automates)
 
 ### 1. Build U-Boot (console on UART0)
 
@@ -43,7 +122,7 @@ make xilinx_zynq_virt_defconfig
 sed -i 's|@dd if=$$< of=$$@ conv=block,sync bs=4 2>/dev/null;|@cp $$< $$@|' scripts/Makefile.spl
 make -j$(nproc)
 cp u-boot u-boot.elf
-cp u-boot-spl.bin u-boot-spl.bin
+cp u-boot-spl.bin ~/tmac-zynq-fpga/linux/boot/
 ```
 
 ### 2. Build Linux kernel (console on UART0)
@@ -98,8 +177,8 @@ mount -t devtmpfs none /dev
 echo "=== FPGA Linux Boot — Zynq 7010 (UART0 console) ==="
 echo "Console: USB-UART0 (CH340), 115200 8N1 — see docs/infrastructure.md"
 echo ""
-# Mount SD ext4 partition if present
-mount /dev/mmcblk0p2 /root 2>/dev/null && echo "SD ext4 mounted at /root"
+# Mount SD data partition if present (vfat or ext4, auto-detected)
+mount /dev/mmcblk0p2 /root 2>/dev/null && echo "SD data mounted at /root"
 echo "Ready. Run /root/tmac for FPGA test."
 exec /bin/sh
 INIT
@@ -114,13 +193,29 @@ cp ~/u-boot-xlnx/u-boot.elf ~/tmac-zynq-fpga/linux/boot/
 cp ~/u-boot-xlnx/u-boot-spl.bin ~/tmac-zynq-fpga/linux/boot/
 ```
 
-### 5. Build BOOT.BIN (must be done on Windows with Vivado)
+### 5. Build boot.scr (auto-boot script)
 
-See "Windows: BOOT.BIN + SD Card" section below.
+`xilinx_zynq_virt_defconfig` sets `CONFIG_DISTRO_DEFAULTS=y`, so U-Boot
+automatically runs `boot.scr` from the FAT32 partition — no interactive prompt
+needed. Generate it from the committed `linux/boot/boot.cmd` with U-Boot's own
+`mkimage` (do **not** use kernel u-boot-tools):
+
+```bash
+cd ~/u-boot-xlnx
+./tools/mkimage -A arm -T script -C none -n "Boot" \
+    -d ~/tmac-zynq-fpga/linux/boot/boot.cmd \
+    ~/tmac-zynq-fpga/linux/boot/boot.scr
+```
+
+(`linux/build_all.sh` does this automatically.)
+
+### 6. Build BOOT.BIN (must be done on Windows with Vivado)
+
+See the "Windows: BOOT.BIN; Mac: SD Card" section below.
 
 ---
 
-## Windows: BOOT.BIN + SD Card
+## Windows: BOOT.BIN; Mac: SD Card
 
 **Prerequisites:** Vivado 2023.1 (provides `bootgen` and FSBL build).
 
@@ -131,13 +226,19 @@ linux/boot/
 ├── system_wrapper.bit   ← committed (from repo, built in Vivado on Windows)
 ├── matmul_bd.xsa        ← committed (hardware handoff)
 ├── boot.bif             ← committed (bootgen config)
+├── boot.cmd             ← committed (U-Boot auto-boot script source)
 ├── u-boot.elf           ← copy from Mac build
 ├── u-boot-spl.bin       ← copy from Mac build
+├── boot.scr             ← generated by mkimage from boot.cmd (Mac build)
 ├── uImage               ← copy from Mac build
 ├── devicetree.dtb        ← copy from Mac build
 ├── uramdisk.image.gz     ← copy from Mac build
 └── tmac                 ← copy from Mac build
 ```
+
+FSBL: the workspace builds `fsbl.elf` at
+`vitis_linux/workspace/z7_linux/export/z7_linux/sw/z7_linux/boot/fsbl.elf` (and
+`zynq_fsbl/fsbl.elf`), regenerable via XSCT (`vitis_linux/README.md`).
 
 ### Step 2: Build FSBL
 
@@ -155,33 +256,50 @@ cd D:\Users\u\tmac-zynq-fpga\linux\boot
 bootgen -image boot.bif -o BOOT.BIN -w
 ```
 
-`boot.bif` contents:
+`boot.bif` contents (FSBL path — SPL is **not** used; U-Boot is loaded from
+`u-boot.elf` by the FSBL):
 ```
 the_ROM_image:
 {
-    [bootloader] u-boot-spl.bin
+    [bootloader] fsbl.elf
     system_wrapper.bit
-    u-boot-spl.bin
+    u-boot.elf
 }
 ```
 
-### Step 4: Format SD Card
+### Step 4: Format SD Card (on the Mac, SD writer)
+
+The Z7-Lite has no SD slot on Windows — write the card on the Mac. Two FAT32
+partitions: p1 for boot files, p2 for the model data (the initramfs `init`
+mounts `/dev/mmcblk0p2` on `/root`; `mount` auto-detects vfat/ext4, and a
+FAT32 p2 keeps macOS tools sufficient — no ext4 tools needed):
+
+```bash
+diskutil list                     # find the SD disk, e.g. /dev/disk4
+diskutil partitionDisk /dev/disk4 MBR FAT32 SD_BOOT 128M FAT32 SD_DATA R
+# p1 = SD_BOOT (128 MB), p2 = SD_DATA (rest). Copy the files below onto each.
+```
 
 | Partition | Type | Size | Contents |
 |-----------|------|------|----------|
-| 1 | FAT32 | 64 MB | BOOT.BIN, uImage, devicetree.dtb, uramdisk.image.gz |
-| 2 | ext4 | Rest | model.tmac (~374 MB), tmac |
+| 1 | FAT32 | ~128 MB | BOOT.BIN, uImage, devicetree.dtb, uramdisk.image.gz, boot.scr |
+| 2 | FAT32 (vfat) | Rest | model.tmac (~374 MB), tmac |
+
+The model is reachable at `/root/model.tmac` inside the initramfs.
 
 ### Step 5: Boot
 
 1. Power-cycle the board (required — PLL re-init hangs on warm reset)
-2. Insert SD, set boot mode DIP to SD
+2. Insert SD, set boot mode jumper **J1** to SD
 3. Connect the USB-UART cable and open a 115200 8N1 serial terminal (PuTTY,
    COM port of the CH340). All U-Boot + kernel console output appears here.
-4. Power on — U-Boot boots from SD, loads Linux, runs initramfs
+4. Power on — U-Boot (distro boot) auto-runs `boot.scr` from the FAT32
+   partition, loads Linux, runs initramfs
 5. Login shell at the initramfs prompt (see U-Boot manual boot below if auto-boot fails)
 
 ### U-Boot Manual Boot (if auto-boot fails)
+
+These are exactly the commands embedded in `linux/boot/boot.cmd`:
 
 ```
 U-Boot> fatload mmc 0 0x3000000 uImage
@@ -193,10 +311,12 @@ U-Boot> bootm 0x3000000 0x2000000 0x2A00000
 
 ---
 
-## JTAG Boot (no SD card, for testing)
+## JTAG Boot (no SD card, fallback for bring-up)
 
-Direct JTAG boot (bitstream → PS7 init → AFI → kernel/DTB/initrd → Linux) is
-handled by the Vitis Linux workspace:
+SD boot (above) is the primary path. This JTAG hand-boot is the fallback for
+FPGA/DDR bring-up without shuffling SD cards. Direct JTAG boot (bitstream →
+PS7 init → AFI → kernel/DTB/initrd → Linux) is handled by the Vitis Linux
+workspace:
 
 ```tcl
 # From the Vitis GUI XSCT console (power-cycle the board first):
