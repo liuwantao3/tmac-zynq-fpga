@@ -24,6 +24,8 @@ Verified from the GGUF header (290 tensors total):
 |------|-------|---------|
 | Q5_0 | 132 | `attn_q/k/output.weight` (24 each), `ffn_gate/up.weight` (24 each), `attn_v.weight` (12 layers) |
 | Q8_0 | 13 | `token_embd.weight` + `attn_v.weight` (12 layers) |
-| Q6_K | 12 | `blk.*.ffn_down.weight` (even layers) |
-| Q4_K | 12 | `blk.*.ffn_down.weight` (odd layers) |
+| Q6_K | 12 | `blk.*.ffn_down.weight` (12 layers) |
+| Q4_K | 12 | `blk.*.ffn_down.weight` (12 layers) |
 | F32 | 121 | `attn_q/k/v.bias` (24 each), `attn_norm/ffn_norm.weight` (24 each), `output_norm.weight` |
+
+**Per-layer note:** the type split is **not** even/odd parity. `attn_v` + `ffn_down` are correlated per layer: layers `{0,1,3,6,7,8,9,10,13,16,19,21}` have `attn_v`=Q8_0 and `ffn_down`=Q6_K; the remaining 12 layers have `attn_v`=Q5_0 and `ffn_down`=Q4_K (llama.cpp q4_k_m quantizer recipe). The C++ sim dispatches by actual `A->type`, so mixed types are handled automatically.

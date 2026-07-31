@@ -1,17 +1,19 @@
 ## Project State
 
-Qwen2-0.5B FPGA accelerator targeting Zynq 7010. Multi-core Verilog RTL: INT16×INT16 (general), Q8_0 dequant (logits), Q5_0 block decode (attn_q/k/o, ffn_gate/up), Q6_K block decode (ffn_down even), Q4_K block decode (ffn_down odd), with AXI4-Lite memory-mapped I/O.
+Qwen2-0.5B FPGA accelerator targeting Zynq 7010. Multi-core Verilog RTL: INT16×INT16 (general), Q8_0 dequant (logits), Q5_0 block decode (attn_q/k/o, ffn_gate/up), Q6_K block decode (ffn_down subset), Q4_K block decode (ffn_down subset), with AXI4-Lite memory-mapped I/O.
 
-**Model is Q4_K_M (mixed quantization).** Actual tensor types:
+**Model is Q4_K_M (mixed quantization).** Actual tensor types (verified from GGUF header):
 
 | tensor | shape | type | C++ path | Verilog core |
 |--------|-------|------|----------|-------------|
 | `token_embd` | 151936×896 | Q8_0 | ✅ | ✅ `matmul_q8_core.v` |
-| `attn_v` | 128×896 | Q8_0 | ✅ | ✅ `matmul_q8_core.v` |
+| `attn_v` | 128×896 | Q8_0 (12 layers) / Q5_0 (12 layers) | ✅ `matmul_fpga_q8`/`matmul_fpga_q5_0` | ✅ `matmul_q8_core.v` / `matmul_q5_0_core.v` |
 | `attn_q`, `attn_k`, `attn_output` | 896×896 | Q5_0 | ✅ `matmul_fpga_q5_0` | ✅ `matmul_q5_0_core.v` |
 | `ffn_gate`, `ffn_up` | 4864×896 | Q5_0 | ✅ `matmul_fpga_q5_0` | ✅ `matmul_q5_0_core.v` |
-| `ffn_down` (layers 0,2,4,...) | 896×4864 | Q6_K | ✅ `matmul_fpga_q6_k` | ✅ `matmul_q6_k_core.v` |
-| `ffn_down` (layers 1,3,5,...) | 896×4864 | Q4_K | ✅ `matmul_fpga_q4_k` | ✅ `matmul_q4k_core.v` (56×256 tile) |
+| `ffn_down` (layers 0,1,3,6,7,8,9,10,13,16,19,21) | 896×4864 | Q6_K | ✅ `matmul_fpga_q6_k` | ✅ `matmul_q6_k_core.v` |
+| `ffn_down` (layers 2,4,5,11,12,14,15,17,18,20,22,23) | 896×4864 | Q4_K | ✅ `matmul_fpga_q4_k` | ✅ `matmul_q4k_core.v` (56×256 tile) |
+
+**Important (2026-07-31):** the Q6_K/Q4_K and Q8_0/Q5_0 splits are **NOT even/odd parity**. `attn_v` and `ffn_down` are correlated per layer: layers `{0,1,3,6,7,8,9,10,13,16,19,21}` have `attn_v`=Q8_0 + `ffn_down`=Q6_K; layers `{2,4,5,11,12,14,15,17,18,20,22,23}` have `attn_v`=Q5_0 + `ffn_down`=Q4_K. This is llama.cpp's q4_k_m quantizer recipe (higher-precision subset). The C++ sim dispatches by actual `A->type` (`sim/tmac_gguf.cpp:475-482`), so mixed types are handled automatically — no code change needed, only the docs previously misdescribed the split as even/odd.
 
 ## Key Decisions (2026-07-12)
 
@@ -163,8 +165,8 @@ redundant DDR act reads.
 ### Dispatch Logic (tmac_gguf.cpp:452-465):
 ```
 if (g_fpga_q5_0 && A->type == TENSOR_Q5_0) → matmul_fpga_q5_0()  (attn_q/k/o, ffn_gate/up)
-else if (g_fpga_q6_k && A->type == TENSOR_Q6_K) → matmul_fpga_q6_k()  (ffn_down even)
-else if (g_fpga_q4k && A->type == TENSOR_Q4_K) → matmul_fpga_q4_k()  (ffn_down odd)
+else if (g_fpga_q6_k && A->type == TENSOR_Q6_K) → matmul_fpga_q6_k()  (ffn_down high-precision subset)
+else if (g_fpga_q4k && A->type == TENSOR_Q4_K) → matmul_fpga_q4_k()  (ffn_down low-precision subset)
 else if (g_fpga_q8 && A->type == TENSOR_Q8_0) → matmul_fpga_q8()   (token_embd, attn_v, logits)
 else → matmul_fpga_int16()   (F32 norms, fallback)
 ```

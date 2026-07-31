@@ -3,11 +3,13 @@
 ## Overview
 
 Custom Verilog RTL for 5 quantization formats on Xilinx Zynq 7010:
-- Q8_0: token embedding, attn_v, logits (151936×896)
-- Q5_0: attn_q/k/o, ffn_gate/up (896×896, 4864×896)
-- Q6_K: ffn_down even layers (896×4864)
-- Q4_K: ffn_down odd layers (896×4864)
+- Q8_0: token embedding, attn_v (12 layers), logits (151936×896, 128×896)
+- Q5_0: attn_q/k/o, ffn_gate/up, attn_v (12 layers) (896×896, 4864×896, 128×896)
+- Q6_K: ffn_down subset (896×4864, 12 layers)
+- Q4_K: ffn_down subset (896×4864, 12 layers)
 - INT16: F32 norm fallback
+
+The attn_v/ffn_down type split is per-layer, not even/odd parity (see AGENTS.md).
 
 ## Status (2026-07-05)
 

@@ -41,11 +41,14 @@ quad-core top) and simulated standalone; the active hardware FSM
 | tensor | shape | type | Verilog core |
 |--------|-------|------|-------------|
 | `token_embd` | 151936×896 | Q8_0 | `matmul_q8_core.v` |
-| `attn_v` | 128×896 | Q8_0 | `matmul_q8_core.v` |
+| `attn_v` | 128×896 | Q8_0 (12) / Q5_0 (12) | `matmul_q8_core.v` / `matmul_q5_0_core.v` |
 | `attn_q`, `attn_k`, `attn_output` | 896×896 | Q5_0 | `matmul_q5_0_core.v` |
 | `ffn_gate`, `ffn_up` | 4864×896 | Q5_0 | `matmul_q5_0_core.v` |
-| `ffn_down` (even layers) | 896×4864 | Q6_K | `matmul_q6_k_core.v` |
-| `ffn_down` (odd layers) | 896×4864 | Q4_K | `matmul_q4k_core.v` |
+| `ffn_down` (high-precision subset) | 896×4864 | Q6_K | `matmul_q6_k_core.v` |
+| `ffn_down` (low-precision subset) | 896×4864 | Q4_K | `matmul_q4k_core.v` |
+
+The `attn_v`/`ffn_down` type split is per-layer (not even/odd parity): layers
+`{0,1,3,6,7,8,9,10,13,16,19,21}` are Q8_0+Q6_K, the other 12 layers are Q5_0+Q4_K.
 
 ### Multi-Tile Descriptors
 

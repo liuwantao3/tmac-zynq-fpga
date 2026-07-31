@@ -22,7 +22,7 @@ Each transformer layer (blk.N):
 2. **QKV projections** → attn_q/k/v.weight + bias
    - Q: [896×896] Q5_0
    - K: [128×896] Q5_0
-   - V: [128×896] Q8_0
+   - V: [128×896] Q8_0 (12 layers) or Q5_0 (12 layers)
 3. **RoPE** applied to Q (14 heads) and K (2 heads)
 4. **GQA attention**: 14 Q heads, 2 KV heads, 7 queries per KV
 5. **Output projection** → attn_output.weight [896×896] Q5_0
@@ -36,8 +36,9 @@ Each transformer layer (blk.N):
 
 ### Weight tensor count breakdown (290 total)
 - 12× Q6_K: selected ffn_down layers (0,1,3,6,7,8,9,10,13,16,19,21)
-- 132× Q5_0: most weight tensors
-- Q8_0: token_embd.weight, attn_v.weight
+- 12× Q4_K: other ffn_down layers (2,4,5,11,12,14,15,17,18,20,22,23)
+- 132× Q5_0: most weight tensors (attn_q/k/output, ffn_gate/up, 12× attn_v)
+- Q8_0: token_embd.weight + 12× attn_v.weight (same layers as Q6_K ffn_down)
 - F32: norm weights, biases, output_norm.weight
 
 ---
@@ -121,9 +122,9 @@ Straightforward: `val = d * q`
 | Type | Block | Block Bytes | Tensor Shape | Tile | Blocks/Tile | Bytes/Tile | weight_buf | Status |
 |------|-------|-------------|--------------|------|-------------|------------|------------|--------|
 | Q8_0 | 32 | 34 | 151936×896, 128×896 | 64×896 | — | 4100 | 4096 | ✅ `matmul_q8_core.v` |
-| Q5_0 | 32 | 22 | 896×896, 4864×896 | 8×896 | 224 | 4928 | 8192 | ✅ `matmul_q5_0_core.v` |
-| Q6_K | 256 | 210 | 896×4864 (even layers) | 32×256 | 32 | 6720 | 8192 | ✅ `matmul_q6_k_core.v` |
-| Q4_K | 256 | 144 | 896×4864 (odd layers) | 56×256 | 56 | 8064 | 8192 | ✅ `matmul_q4k_core.v` |
+| Q5_0 | 32 | 22 | 896×896, 4864×896, 128×896 | 8×896 | 224 | 4928 | 8192 | ✅ `matmul_q5_0_core.v` |
+| Q6_K | 256 | 210 | 896×4864 (12 layers) | 32×256 | 32 | 6720 | 8192 | ✅ `matmul_q6_k_core.v` |
+| Q4_K | 256 | 144 | 896×4864 (12 layers) | 56×256 | 56 | 8064 | 8192 | ✅ `matmul_q4k_core.v` |
 | INT16 | — | — | any | 64×64 | — | 8192 | 8192 | ✅ `matmul_int16_core.v` |
 
 ### Q5_0 Block Layout (22 bytes)
