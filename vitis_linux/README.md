@@ -22,16 +22,19 @@ https://xilinx.github.io/Embedded-Design-Tutorials/docs/2023.1/build/html/docs/I
 | Linux images | PetaLinux → `BOOT.BIN` + `image.ub` + `boot.scr` | Prebuilt uImage/uramdisk/dtb from the Lima VM U-Boot/kernel build (functionally equivalent; JTAG boot instead of SD) |
 | Linux domain | OS=Linux, Processor=`ps7_cortexa9` | Same (this processor name is mandatory for Linux domains) |
 | App | "Linux Hello World" template, SYSROOT optional | Same; built without external SYSROOT (Vitis ships the aarch32 Linux sysroot) |
-| Run app from GUI | Requires **TCF agent over Ethernet** + UART login | **Not possible on this board** — no Ethernet, CH340 UART broken. Verified via JTAG + DDR markers instead |
+| Run app from GUI | Requires **TCF agent over Ethernet** + UART login | **Not possible on this board** — no Ethernet. Verified via JTAG + DDR markers instead |
 
 ## Board constraints that change the run flow
 
 1. **No Ethernet** (MicroPhase Z7-Lite) → Vitis "Run As → Linux Application Debug"
    cannot deploy via TCF agent. The Linux domain + app are used for
    cross-compilation; execution is done via JTAG.
-2. **UART0 broken** (CH340 RX pin dead) → no login console. Kernel console on
-   UART0 is invisible. DCC via `readjtaguart` is capped at ~544 B/session and
+2. **USB-UART on UART0 works** (CH340, MIO 14/15, 115200 8N1) but is not used for
+   the run flow here: kernel console is on JTAG DCC (`hvc0`). DCC via
+   `readjtaguart` is capped at ~544 B/session and
    the drain dies after ~4 sessions, so a full kernel log cannot be captured.
+   For a GUI-verifiable serial flow on this same hardware, use the bare-metal
+   workspace `../vitis_bm/` (Vitis GUI → Run As → Launch Hardware, console on UART0).
 3. **No SD reader on Windows** → SD-card boot images are built on the Lima VM.
 
 ## Open the workspace in the Vitis GUI
@@ -71,8 +74,9 @@ needs the rootfs libc). To actually execute it on Linux:
   Read these back with XSDB `mrd 0x1F000000 4` after boot. Requires
   `iomem=relaxed` in the kernel bootargs (already set) for /dev/mem access to
   0x1F000000 (kernel RAM).
-- **Console path**: if a working console is ever attached (e.g. repaired CH340
-  or UART1 on a header), just `./hello_linux` at the login shell.
+- **Console path**: the USB-UART (UART0) works — attach a 115200 8N1 terminal
+  and run `./hello_linux` at the login shell (kernel console currently boots to
+  JTAG DCC `hvc0`).
 
 ## Rebuild from scratch (headless)
 

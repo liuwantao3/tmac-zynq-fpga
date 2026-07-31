@@ -108,7 +108,6 @@ vivado_integration/sw/*.o
 vivado_integration/sw/*.bin
 
 # DCC capture output
-vivado_integration/sw/dcc_*.txt
 dcc_boot_output.txt
 
 # XSDB console dumps

@@ -11,7 +11,7 @@ LDFLAGS = -T link.ld
 
 OBJS_COMMON = startup.o
 
-all: tmac_baremetal.elf tmac_baremetal.bin test_fpga_cores.elf test_fpga_cores.bin hp_baremetal.elf test_int16.elf uart_test.elf uart_test.bin
+all: tmac_baremetal.elf tmac_baremetal.bin test_fpga_cores.elf test_fpga_cores.bin uart_test.elf uart_test.bin
 
 # ===== T-MAC Bare-Metal Inference Engine =====
 tmac_baremetal.elf: $(OBJS_COMMON) tmac_baremetal.o link.ld tmac_baremetal.h
@@ -29,16 +29,6 @@ test_fpga_cores.elf: $(OBJS_COMMON) test_fpga_cores.o link.ld tmac_baremetal.h
 test_fpga_cores.bin: test_fpga_cores.elf
 	$(OBJCOPY) -O binary $< $@
 
-# ===== Existing HP FSM test =====
-hp_baremetal.elf: $(OBJS_COMMON) hp_baremetal.o link.ld
-	$(LD) $(LDFLAGS) $(OBJS_COMMON) hp_baremetal.o -o $@
-	$(SIZE) $@
-
-# ===== Legacy INT16 test =====
-test_int16.elf: $(OBJS_COMMON) main.o link.ld
-	$(LD) $(LDFLAGS) $(OBJS_COMMON) main.o -o $@
-	$(SIZE) $@
-
 # ===== UART test =====
 uart_test.elf: startup.o uart_test.o link.ld
 	$(LD) $(LDFLAGS) startup.o uart_test.o -o $@
@@ -48,7 +38,7 @@ uart_test.bin: uart_test.elf
 	$(OBJCOPY) -O binary $< $@
 
 # Compilation rules
-%.o: %.c regs.h
+%.o: %.c regs.h tmac_baremetal.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 %.o: %.cpp regs.h tmac_baremetal.h

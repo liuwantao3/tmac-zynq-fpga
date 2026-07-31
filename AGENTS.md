@@ -501,7 +501,7 @@ Total: 56 × 48 = 2688 bytes block data + 8 bytes norm (4 × UQ8.8) = 2696 bytes
 
 9. **Scratch buffer addresses** — Must use addresses within the first ~500 MB of DDR. The range `0x1F000000-0x1F004000` (just below the last 1MB) is verified working. Higher addresses in the `0x17E00000` range may have DDR access issues.
 
-10. **UART not initialized by ps7_init** — PS7 UART at 0xE0000000 is not fully initialized after ps7_post_config. `uart_init()` must program baud rate and enable TX. Until fixed, avoid UART output in test programs — use DDR buffer writes for result reporting.
+10. **UART0 requires explicit init in bare-metal code** — `ps7_init` (via XSDB `ps7_peripherals_init_data_3_0`) does program UART0 (0xE0000000, MIO 14/15) to 115200 8N1 with RX/TX enabled (CR=0x17), matching the reference MicroPhase project. But bare-metal `uart_init()` must repeat the same programming to be self-contained (works even if the app runs without ps7_init, e.g. from SD boot). See Key Decision #16 (2026-07-31) for the register bug that was fixed.
 
 ### Test Results (HW, 2026-07-11)
 
@@ -595,6 +595,10 @@ xsdb.bat vivado_integration\sw\run_hp_fsm_comprehensive.tcl
 xsdb.bat vivado_integration\sw\run_test_fpga_cores.tcl    # Q8/Q5_0 core tests (5/5 PASS)
 xsdb.bat vivado_integration\sw\run_tmac_baremetal.tcl    # full inference
 
+# Bare-metal Vitis GUI workspace (platform + serial app — see vitis_bm/README.md)
+xsct.bat vitis_bm\build.tcl                                # regenerate z7_bm + tmac_serial
+xsdb.bat vitis_bm\scripts\run_serial.tcl                   # headless serial test (UART0)
+
 # Vitis Linux platform + app (headless XSCT — see vitis_linux/README.md)
 #   xsct.bat; then:
 #   platform create -name z7_linux -hw matmul_bd.xsa -proc ps7_cortexa9 -os linux -out workspace
@@ -676,6 +680,7 @@ python3 scripts/extract_tmac.py models/qwen2-0_5b-instruct-q4_k_m.gguf /tmp/mode
 - `docs/Q4_K_IMPLEMENTATION_PLAN.md` — Original plan (outdated, kept as archive)
 - `linux/README.md` — Linux-on-SD build guide (U-Boot + kernel on Lima VM)
 - `vitis_linux/README.md` — Vitis 2023.1 Linux platform + app workflow
+- `vitis_bm/README.md` — Vitis 2023.1 bare-metal workspace (UART serial console app)
 
 ## Target Board: MicroPhase Z7-Lite
 
@@ -704,6 +709,12 @@ python3 scripts/extract_tmac.py models/qwen2-0_5b-instruct-q4_k_m.gguf /tmp/mode
 - **Q8 multi-group/multi-tile regression (2026-07-12):** Q5_0 clean-slate rewrite (2026-07-07) broke Q8 multi-group (Test 9a) and multi-tile (Test 10). Both FAIL on current bitstream. **Fixed (2026-07-12):** Test 9a — weight buffer size changed from 4096 to `num_groups × 4096` (was leaving group 1 weight as scale data). Test 10 — `Q10_ACT_ADDR=0x00109000` collided with tile 0 scales at `weight_addr+4096`, moved to `0x0010C000`; `Q10_RES_ADDR=0x0010A000` collided with tile 1 scales at `weight_addr+tile_stride+4096`, moved to `0x0010B000`. Both are test-data layout bugs, no RTL changes needed.
 
 ## Hardware Gotchas
+
+> **UART0 is major infrastructure** (console for bare-metal + future Linux `ttyPS0`).
+> Verified facts, the 2026-07-30/31 silent-console failure and its root causes, and
+> the canonical init sequence are documented in
+> [`docs/infrastructure.md`](docs/infrastructure.md), alongside DDR3/AXI HP0,
+> PS7 clocks/PLL, and JTAG/DAP gotchas.
 
 ### Critical: ps7_init re-execution hang
 `ps7_pll_init_data_3_0` **hangs if PLLs are already configured** from a prior session. The PLL reset sequence (bypass→power-down→reset→wait-for-lock) can't re-lock when the PLLs are already locked from a previous session. This leaves the PS7 in a partially-configured state and all subsequent ps7_init attempts also hang (DDR init's `mask_poll 0xF8000B74 0x00002000` waits for calibration that depends on PLL clock).
@@ -967,9 +978,10 @@ setenv bootargs "console=ttyPS0,115200 root=/dev/ram0 rw iomem=relaxed"
 ## Vitis Linux Workspace (2026-07-31)
 
 Standard Vitis 2023.1 Linux project in `vitis_linux/`, GUI-operable, independent of
-the bare-metal effort. Because the board has no Ethernet and the CH340 UART is
-broken, the standard GUI **Run** flow (TCF agent over Ethernet + UART login) is
-impossible — execution is verified via JTAG boot + DDR markers instead.
+the bare-metal effort. Because the board has no Ethernet, the standard GUI **Run**
+flow (TCF agent over Ethernet + UART login) is impossible — execution is verified
+via JTAG boot + DDR markers instead. The USB-UART works (UART0, MIO 14/15,
+115200 8N1) — see Key Decision #16 (2026-07-31).
 
 **Contents:**
 - `matmul_bd.xsa` — hardware handoff (bitstream + ps7_init)
@@ -988,8 +1000,12 @@ Full workflow: `vitis_linux/README.md`.
 
 ## Key Decisions (2026-07-30)
 
-14. **DCC integration for tmac_baremetal (2026-07-30):** UART0 debug output (`uart_puts`/`putc`/`puthex`/`putdec`) redirected to JTAG DCC. CH340 physically broken (PS7 TX works, FX reads pin is dead). Approach: modified `tmac_baremetal.h` to include `dcc_io.h` and replaced UART output function bodies with DCC wrappers. Added `dcc_putdec()` to `dcc_io.h`. Zero changes needed in `tmac_baremetal.cpp` (calls `uart_*` functions unchanged). `dcc_unlock()` added to `uart_init()`. ELF rebuilt with LLVM/clang (Vitis 2023.1 toolchain). `run_tmac_baremetal.tcl` updated to use `readjtaguart -start/-handle/-stop` for DCC output capture.
+14. **DCC integration for tmac_baremetal (2026-07-30, SUPERSEDED 2026-07-31):** UART0 debug output (`uart_puts`/`putc`/`puthex`/`putdec`) was redirected to JTAG DCC under the assumption that the CH340 was physically broken (PS7 TX works, FX reads pin is dead). Approach: modified `tmac_baremetal.h` to include `dcc_io.h` and replaced UART output function bodies with DCC wrappers. Added `dcc_putdec()` to `dcc_io.h`. `dcc_unlock()` added to `uart_init()`. `run_tmac_baremetal.tcl` updated to use `readjtaguart -start/-handle/-stop` for DCC output capture. **The "broken CH340" conclusion was wrong** — the USB-UART works fine (verified with the reference MicroPhase project `03_dma` in Vitis GUI). The real bug was in `uart_init()` register programming. Reverted in Key Decision #16.
 
 ## Key Decisions (2026-07-31)
 
 15. **Project cleanup + vitis_linux commit:** Deleted all generated artifacts (`.vvp`/`.vcd`, `vivado*.log/.jou`, `proj_bd/`, `.Xil/`, `xsim.dir/`, `sw/*.elf/.o/.bin` — all regenerable). Removed one-off debug/scratch scripts (see git history). Deleted dead modules `verilog/dequant_lut.v` + `verilog/systolic_8x8.v` (never instantiated; removed from Makefile + test_integration.sh). Fixed `linux/README.md` merge-conflict markers that had been committed in 6fd08f5. Corrected layer count in AGENTS.md (28→24, matching `sim/tmac_gguf.cpp:142`). `vitis_linux/` committed (README + XSA + scripts + prebuilt) with `workspace/` gitignored. **Legacy dirs kept as archive:** `hls/`, `firmware/`, `descriptor-orchestrator/`, `sim/Transaction Tracer/`, `vivado/` — superseded by current Verilog RTL + bare-metal code, kept for reference only.
+
+16. **USB-UART works — DCC redirect reverted (2026-07-31):** Running the reference MicroPhase project `D:\Users\u\microphase-z7\03_dma\arm` in Vitis GUI proved the CH340 USB-UART is **not** broken — it prints on UART0 (0xE0000000, MIO 14/15, 115200 8N1). Its PS7 config (UART0, MIO 14/15) and ps7_init UART programming (BAUDGEN=0x7C, BAUDDIV=0x06, MR=0x20, CR=0x17) are identical to ours. **Root cause of our dead UART was `uart_init()` in `tmac_baremetal.h`:** (a) the final `CR` write was `0x20` = **TX_DIS** (TX_EN is bit 4 = 0x10), leaving the transmitter disabled; (b) the baud values were written to the wrong offsets — `uart[8]`/`uart[9]` hit 0x20 (RXWM) and 0x24 (MODEMCR) instead of BAUDGEN 0x18 (uart[6]) and BAUDDIV 0x34 (uart[13]) — the broken baud was masked because ps7_init had already set it; (c) all `uart_put*` bodies were DCC wrappers ("since CH340 UART is broken"), so nothing ever reached the TX FIFO. **Fix:** rewrote `uart_init()` with correct xuartps register programming (CR ends `0x14` = RX_EN|TX_EN) and restored real UART output (`uart_putc` polls SR[0x2C] bit 4 TXFULL, writes FIFO[0x30]). Removed `#include "dcc_io.h"` and deleted `dcc_io.h` (was kept as an unused fallback). `run_tmac_baremetal.tcl` no longer does DCC capture (`readjtaguart`) — console output appears on the USB-UART terminal.
+
+17. **vitis_bm — bare-metal Vitis GUI workspace (2026-07-31):** Created `vitis_bm/` — a Vitis 2023.1 bare-metal (standalone) workspace mirroring the reference MicroPhase `03_dma` project layout, so the GUI can Program-FPGA + run FSBL + run the app over JTAG with console on the USB-UART. The workspace IS `vitis_bm/` itself (like `03_dma/arm`); `build.tcl` regenerates the platform `z7_bm` (from `vitis_linux/matmul_bd.xsa`, `ps7_cortexa9_0`, standalone) + app `tmac_serial` (imports `vitis_bm/app/src/tmac_serial.c`). The app exercises both UART paths: direct xuartps register programming (identical to the fixed `uart_init()`) and the BSP `xil_printf` driver, then prints live FPGA registers (CLK_CNT/STATUS/DEBUG/Q8DBG) over AXI4-Lite and a 1 Hz tick loop. Verified headless: `xsct.bat build.tcl` → EXIT=0, `tmac_serial.elf` built, app disassembly shows correct UART registers (BAUDGEN=124, CR=0x14, FIFO=0x30). `scripts/run_serial.tcl` is the XSDB headless runner (loads `sw/uart_test.elf`). Added standalone `sw/uart_test.c` + `uart_test.elf` to the clang Makefile flow (serial smoke test without a model); removed dead `hp_baremetal.elf`/`test_int16.elf` Makefile targets whose sources were deleted in the cleanup. **Next increment: Linux** — migrate the kernel console from JTAG DCC capture to UART0 (ttyPS0) in `boot_linux_jtag.tcl`, and update `vitis_linux/` app + docs.

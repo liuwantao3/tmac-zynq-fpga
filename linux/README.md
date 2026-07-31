@@ -2,7 +2,7 @@
 
 **Two-machine split:** Windows (Vivado) → bitstream + FSBL + BOOT.BIN. Mac (Lima VM) → U-Boot + kernel + initramfs.
 
-Hardware: MicroPhase Z7-Lite (xc7z010clg400-1), UART0 MIO14/15 CH340 broken — DCC console via JTAG.
+Hardware: MicroPhase Z7-Lite (xc7z010clg400-1), UART0 MIO14/15 (CH340 USB-UART, works at 115200 8N1). Linux console also available via JTAG DCC.
 
 ## Quickstart: macOS Build
 
@@ -221,14 +221,16 @@ Console via DCC is captured by `readjtaguart` (capped at ~544 B/session).
 
 ## DCC Console vs UART
 
-| Feature | UART | DCC (recommended) |
+| Feature | UART | DCC (also available) |
 |---------|------|-------------------|
-| Hardware | CH340 USB-UART (broken) | JTAG (Digilent HS-2, already connected) |
+| Hardware | CH340 USB-UART (works) | JTAG (Digilent HS-2, already connected) |
 | Speed | 115200 baud (~11 KB/s) | ~200-500 KB/s |
 | Console | `ttyPS0` | `hvc0` |
 | U-Boot config | default | `CONFIG_ARM_DCC=y` |
 | Kernel bootargs | `console=ttyPS0,115200` | `earlycon=dcc console=hvc0` |
 | Capture | Serial terminal (PuTTY) | `readjtaguart -start` in XSDB |
 
-The physical CH340 RX pin is dead. PS7 UART TX works but nobody can hear it.
-DCC uses the same JTAG cable already used for FPGA programming and debug — no extra hardware.
+The CH340 USB-UART works (UART0, MIO 14/15, 115200 8N1) — see AGENTS.md Key
+Decision #16. The DCC console was originally adopted because the UART was
+believed broken; it remains a valid alternative that uses the same JTAG cable
+already connected for FPGA programming and debug.

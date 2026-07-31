@@ -4,7 +4,7 @@
 # Or standalone:     C:\Xilinx\Vivado\2023.1\bin\xsdb.bat D:/Users/u/tmac-zynq-fpga/vitis_linux/scripts/boot_linux_jtag.tcl
 #
 # Flow: bitstream -> ps7_init -> AFI -> load zImage/dtb/initramfs -> boot kernel (r0=0 r1=~0 r2=dtb pc=zImage)
-# Kernel console goes to UART0 (broken CH340 on this board) AND/OR DCC.
+# Kernel console goes to UART0 (CH340 USB-UART, works) AND/OR DCC.
 # DCC capture via readjtaguart is capped (~544 B/session), so it only proves the kernel starts.
 # Verified signals of a live kernel: PC advances out of zImage, CLK_CNT keeps incrementing.
 #

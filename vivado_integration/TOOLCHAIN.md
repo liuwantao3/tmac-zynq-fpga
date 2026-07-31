@@ -53,4 +53,4 @@ a warm reset.
 ## Notes
 
 - Bare-metal ARM build: `C:\Xilinx\Vivado\2023.1\tps\llvm\7.0\win64\bin\clang.exe` — see `sw/Makefile`
-- The Vitis GUI flow is documented in `vitis_linux/README.md` (this board has no Ethernet and the CH340 UART is broken, so execution is verified via JTAG boot + DDR markers)
+- The Vitis GUI flow is documented in `vitis_linux/README.md` (this board has no Ethernet, so execution is verified via JTAG boot + DDR markers; USB-UART on UART0 works)

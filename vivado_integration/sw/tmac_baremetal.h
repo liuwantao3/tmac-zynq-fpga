@@ -2,7 +2,6 @@
 #define TMAC_BAREMETAL_H
 
 #include <stdint.h>
-#include "dcc_io.h"
 
 // ===== Model Constants (Qwen2-0.5B) =====
 #define HIDDEN_DIM     896
@@ -289,23 +288,46 @@ static inline void* memset(void* d, int c, unsigned int n) {
     return d;
 }
 
-// UART0 initialization (115200 baud, 8N1) + DCC unlock
+// UART0 initialization (115200 baud, 8N1) — UART0 @ 0xE0000000, MIO 14/15.
+// Register map (xuartps): CR=0x00, MR=0x04, SR=0x2C, FIFO=0x30,
+// BAUDGEN=0x18, BAUDDIV=0x34. Values match the working ps7_init config
+// (UART ref clk = 100 MHz: 100e6/((124+1)*(6+1)) ~= 114286 ~ 115200).
 static inline void uart_init(void) {
-    dcc_unlock();
     volatile uint32_t* uart = (volatile uint32_t*)0xE0000000UL;
-    uart[0] = 0x00000000;
-    uart[0] = 0x00000001;
-    uart[0] = 0x00000000;
-    uart[1] = 0x00000020;
-    uart[8] = 54;
-    uart[9] = 0x00000000;
-    uart[0] = 0x00000020;
+    uart[0] = 0x00000000;            /* CR: disable all */
+    uart[0] = 0x00000001;            /* CR: RXRST */
+    uart[0] = 0x00000002;            /* CR: TXRST */
+    uart[0] = 0x00000000;            /* CR: idle */
+    uart[1] = 0x00000020;            /* MR: 8N1, normal mode */
+    uart[6] = 124;                   /* BAUDGEN (0x18) */
+    uart[13] = 6;                    /* BAUDDIV (0x34) */
+    uart[0] = 0x00000014;            /* CR: RX_EN(0x04) | TX_EN(0x10) */
 }
 
-// DCC-based output (via JTAG, since CH340 UART is broken)
-static inline void uart_putc(char c) { dcc_putc(c); }
-static inline void uart_puts(const char* s) { dcc_puts(s); }
-static inline void uart_puthex(uint32_t val) { dcc_puthex(val); }
-static inline void uart_putdec(int val) { dcc_putdec(val); }
+static inline void uart_putc(char c) {
+    volatile uint32_t* uart = (volatile uint32_t*)0xE0000000UL;
+    while (uart[11] & 0x00000010);   /* SR (0x2C) bit4 = TXFULL: wait for FIFO space */
+    uart[12] = (uint32_t)(unsigned char)c;  /* FIFO (0x30) */
+}
+static inline void uart_puts(const char* s) {
+    while (*s) {
+        if (*s == '\n') uart_putc('\r');
+        uart_putc(*s++);
+    }
+}
+static inline void uart_puthex(uint32_t val) {
+    static const char hex[] = "0123456789ABCDEF";
+    uart_putc('0'); uart_putc('x');
+    for (int i = 28; i >= 0; i -= 4) {
+        uart_putc(hex[(val >> i) & 0xF]);
+    }
+}
+static inline void uart_putdec(int val) {
+    if (val < 0) { uart_putc('-'); val = -val; }
+    char buf[12]; int i = 0;
+    if (val == 0) { uart_putc('0'); return; }
+    while (val) { buf[i++] = '0' + (val % 10); val /= 10; }
+    while (i) uart_putc(buf[--i]);
+}
 
 #endif
