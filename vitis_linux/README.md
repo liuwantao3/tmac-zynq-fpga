@@ -57,9 +57,12 @@ The board must be **power-cycled** first (PLL re-lock hang in ps7_init).
 
 1. **Xilinx → XSCT Console** (integrated TCL console).
 2. `source {D:/Users/u/tmac-zynq-fpga/vitis_linux/scripts/boot_linux_jtag.tcl}`
-3. The script programs the bitstream, runs ps7_init + AFI, loads zImage/dtb/
-   initramfs, and boots the kernel. Kernel console appears on the USB-UART0
-   (open a 115200 8N1 PuTTY terminal on the CH340 COM port to watch it).
+3. The script programs the bitstream, runs ps7_init + AFI, loads zImage +
+   `devicetree-jtag.dtb` + `initramfs.cpio.gz` (raw gzipped cpio), and boots the
+   kernel. The kernel finds the initrd via the DTB's
+   `/chosen/linux,initrd-start/end` (baked in by `linux/patch_dtb_initrd.py`).
+   Console appears on the USB-UART0 (open a 115200 8N1 PuTTY terminal on the
+   CH340 COM port to watch it).
 4. Verify the kernel is alive: `pc` will have advanced, CLK_CNT keeps counting.
 
 ## Running hello_linux on the target

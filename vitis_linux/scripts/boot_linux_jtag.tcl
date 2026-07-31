@@ -4,19 +4,22 @@
 # Or standalone:     C:\Xilinx\Vivado\2023.1\bin\xsdb.bat D:/Users/u/tmac-zynq-fpga/vitis_linux/scripts/boot_linux_jtag.tcl
 #
 # Flow: bitstream -> ps7_init -> AFI -> load zImage/dtb/initramfs -> boot kernel (r0=0 r1=~0 r2=dtb pc=zImage)
+# This is a U-Boot-less hand boot: the kernel finds the initramfs (raw gzipped
+# cpio, initramfs.cpio.gz) via the DTB /chosen/linux,initrd-start/end properties
+# baked into devicetree-jtag.dtb by linux/patch_dtb_initrd.py (see linux/README.md).
 # Kernel console is on the USB-UART0 (CH340): the DTB /chosen/bootargs is empty,
-# so the kernel uses the baked-in CONFIG_CMDLINE "console=ttyPS0,115200 ...".
-# Open a 115200 8N1 terminal (PuTTY) on the CH340 COM port to see U-Boot-less
-# boot output (see linux/README.md). The kernel starts even if no terminal is open.
-# Verified signals of a live kernel: PC advances out of zImage, CLK_CNT keeps incrementing.
+# so the kernel uses the baked-in CONFIG_CMDLINE "earlycon console=ttyPS0,115200 ...".
+# Open a 115200 8N1 terminal (PuTTY) on the CH340 COM port to see kernel/initramfs
+# boot output. Verified signals of a live kernel: PC advances out of zImage,
+# CLK_CNT keeps incrementing.
 #
 # Requires a board power-cycle before ps7_init (PLL re-lock hang).
 
 set BIT  {D:/Users/u/tmac-zynq-fpga/vitis_linux/workspace/z7_linux/hw/matmul_bd.bit}
 set PS7  {D:/Users/u/tmac-zynq-fpga/vitis_linux/workspace/z7_linux/hw/ps7_init.tcl}
 set ZIMG {D:/Users/u/tmac-zynq-fpga/vitis_linux/prebuilt/zImage}
-set DTB  {D:/Users/u/tmac-zynq-fpga/vitis_linux/prebuilt/devicetree.dtb}
-set RAMFS {D:/Users/u/tmac-zynq-fpga/vitis_linux/prebuilt/uramdisk.image.gz}
+set DTB  {D:/Users/u/tmac-zynq-fpga/vitis_linux/prebuilt/devicetree-jtag.dtb}
+set RAMFS {D:/Users/u/tmac-zynq-fpga/vitis_linux/prebuilt/initramfs.cpio.gz}
 
 set KERNEL_LOAD 0x00108000
 set DTB_LOAD    0x02000000
@@ -60,7 +63,8 @@ dow -data $ZIMG $KERNEL_LOAD; after 300
 puts "5. Loading DTB to 0x[format %08x $DTB_LOAD]..."
 dow -data $DTB $DTB_LOAD; after 200
 
-puts "6. Loading initramfs to 0x[format %08x $RAMFS_LOAD]..."
+puts "6. Loading initramfs (raw gzip cpio) to 0x[format %08x $RAMFS_LOAD]..."
+puts "   Kernel locates it via DTB /chosen/linux,initrd-start/end..."
 dow -data $RAMFS $RAMFS_LOAD; after 300
 
 puts "7. Booting kernel (console on USB-UART0, 115200 8N1)..."

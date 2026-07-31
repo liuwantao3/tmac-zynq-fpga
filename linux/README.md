@@ -212,6 +212,11 @@ C:\Xilinx\Vivado\2023.1\bin\xsdb.bat D:\Users\u\tmac-zynq-fpga\vitis_linux\scrip
 This loads the bitstream from `vitis_linux/workspace/z7_linux/hw/`, runs
 ps7_init, programs AFI (HP0), loads zImage/DTB/initramfs from
 `vitis_linux/prebuilt/` to DDR, and boots the kernel (r0=0 r1=~0 r2=dtb pc=zImage).
+
+Because this is a U-Boot-less hand boot, the kernel finds the initramfs through
+the DTB: `devicetree-jtag.dtb` (built by `patch_dtb_initrd.py`) carries
+`/chosen/linux,initrd-start/end` pointing at the raw gzipped cpio
+(`initramfs.cpio.gz`, no U-Boot legacy header) loaded at 0x03000000.
 Kernel console is on the USB-UART0 (the DTB `/chosen/bootargs` is empty, so the
 kernel uses the baked-in `CONFIG_CMDLINE=console=ttyPS0,115200 ...`). Open a
 115200 8N1 terminal (PuTTY) on the CH340 COM port to see it.

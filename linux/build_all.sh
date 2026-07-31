@@ -172,13 +172,41 @@ ${MAKE:-make} -j"$CORES"
 
 cp output/images/rootfs.cpio.uboot "$BOOT_DIR/uramdisk.image.gz"
 echo "  → uramdisk.image.gz copied to $BOOT_DIR/"
+
+# ── JTAG-boot artifacts (U-Boot-less hand boot via boot_linux_jtag.tcl) ──
+# 1. Raw gzipped cpio initramfs (no U-Boot legacy header): the kernel reads the
+#    initrd directly from DDR via /chosen/linux,initrd-start/end. If buildroot
+#    ever wraps it in a 64-byte mkimage header (magic 0x27051956), strip it.
+SRC="$BOOT_DIR/uramdisk.image.gz"
+DST="$BOOT_DIR/initramfs.cpio.gz"
+if [ "$(head -c4 "$SRC" | od -An -tx1 | tr -d ' \n')" = "27051956" ]; then
+  dd if="$SRC" of="$DST" bs=64 skip=1 2>/dev/null
+else
+  cp "$SRC" "$DST"
+fi
+echo "  → initramfs.cpio.gz copied to $BOOT_DIR/ ($(wc -c < "$DST") bytes)"
+
+# 2. DTB with /chosen/linux,initrd-start/end baked in (start must match the
+#    RAMFS_LOAD in boot_linux_jtag.tcl, 0x03000000).
+INITRD_SIZE=$(stat -f%z "$DST" 2>/dev/null || stat -c%s "$DST" 2>/dev/null)
+python3 "$FPGA_ROOT/linux/patch_dtb_initrd.py" "$BOOT_DIR/devicetree.dtb" \
+  0x03000000 "$INITRD_SIZE" "$BOOT_DIR/devicetree-jtag.dtb"
+echo "  → devicetree-jtag.dtb copied to $BOOT_DIR/"
+
+# 3. Mirror the JTAG artifacts into vitis_linux/prebuilt (where the tcl looks)
+VITIS_PREBUILT="$FPGA_ROOT/vitis_linux/prebuilt"
+if [ -d "$VITIS_PREBUILT" ]; then
+  cp "$DST" "$VITIS_PREBUILT/initramfs.cpio.gz"
+  cp "$BOOT_DIR/devicetree-jtag.dtb" "$VITIS_PREBUILT/devicetree-jtag.dtb"
+  echo "  → mirrored to $VITIS_PREBUILT/"
+fi
 echo ""
 
 # ── Summary ──
 echo "============================================"
 echo "  Build complete. Boot files in $BOOT_DIR/:"
 echo "============================================"
-ls -lh "$BOOT_DIR"/{u-boot.elf,uImage,devicetree.dtb,uramdisk.image.gz} 2>/dev/null
+ls -lh "$BOOT_DIR"/{u-boot.elf,uImage,devicetree.dtb,devicetree-jtag.dtb,uramdisk.image.gz,initramfs.cpio.gz} 2>/dev/null
 echo ""
 echo "Next steps:"
 echo "  1. On Windows with Vivado: cd $BOOT_DIR && bootgen -image boot.bif -o BOOT.BIN -w"
@@ -186,3 +214,6 @@ echo "  2. Format SD card: partition 1 FAT32, partition 2 ext4"
 echo "  3. Copy BOOT.BIN + uImage + devicetree.dtb + uramdisk.image.gz → FAT32 partition"
 echo "  4. Copy model.tmac + tmac → ext4 partition"
 echo "  5. Insert SD, set boot mode to SD, power on"
+echo ""
+echo "JTAG boot (no SD): devicetree-jtag.dtb + initramfs.cpio.gz were mirrored to"
+echo "  vitis_linux/prebuilt/ if present — run vitis_linux/scripts/boot_linux_jtag.tcl."
