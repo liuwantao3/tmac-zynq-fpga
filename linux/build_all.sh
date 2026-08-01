@@ -113,6 +113,18 @@ with open(P) as f: content = f.read()
 if 'CONFIG_EFI_LOADER=n' not in content:
     content += '\n# CONFIG_EFI_LOADER is not set\n'
 with open(P,'w') as f: f.write(content)
+# 7. Move debug_uart_init BEFORE initf_dm — the zc702 serial DM probe
+#    hangs against ps7_init's Z7-Lite MIO/clock config. Calling
+#    debug_uart_init early guarantees UART0 output before any DM init.
+import re
+P = "common/board_f.c"
+with open(P) as f: s = f.read()
+moved = re.sub(
+    r'^(\s*)initf_dm,$',
+    r'#ifdef CONFIG_DEBUG_UART\n\1debug_uart_init,\n#endif\n\1initf_dm,',
+    s, flags=re.MULTILINE
+)
+with open(P,'w') as f: f.write(moved)
 PYEOF
 echo "  patches applied"
 
@@ -131,7 +143,9 @@ fi
 # UART0/serial0. Also embed the DTB in the ELF (CONFIG_OF_EMBED=y) so
 # that JTAG-booted U-Boot has its device tree. Enable DEBUG_UART_ZYNQ
 # for early boot output that writes directly to UART0 registers before
-# the driver model initializes — no clocks/pinctrl/DTB dependencies.
+# the driver model initializes. A Python patch (above) moves
+# debug_uart_init before initf_dm in board_f.c so it actually runs
+# before the DM serial probe hangs on the Z7-Lite's non-standard MIO.
 ${MAKE:-make} xilinx_zynq_virt_defconfig
 echo 'CONFIG_DEFAULT_DEVICE_TREE="zynq-zc702"' >> .config
 echo 'CONFIG_OF_EMBED=y' >> .config
