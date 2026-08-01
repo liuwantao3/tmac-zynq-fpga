@@ -129,13 +129,14 @@ fi
 # (MIO 48/49), but the Z7-Lite board has the CH340 USB-UART on UART0
 # (MIO 14/15). Switch to zynq-zc702 DTB, which routes the console to
 # UART0/serial0. Also embed the DTB in the ELF (CONFIG_OF_EMBED=y) so
-# that JTAG-booted U-Boot has its device tree — otherwise the driver
-# model has no serial device and the banner never prints. The stock
-# CONFIG_ARM_DCC=y only adds an optional DCC driver; it does NOT become
-# the console (no "arm,dcc" DT node, stdout-path=serial0).
+# that JTAG-booted U-Boot has its device tree. Enable DEBUG_UART_ZYNQ
+# for early boot output that writes directly to UART0 registers before
+# the driver model initializes — no clocks/pinctrl/DTB dependencies.
 ${MAKE:-make} xilinx_zynq_virt_defconfig
 echo 'CONFIG_DEFAULT_DEVICE_TREE="zynq-zc702"' >> .config
 echo 'CONFIG_OF_EMBED=y' >> .config
+echo 'CONFIG_DEBUG_UART=y' >> .config
+echo 'CONFIG_DEBUG_UART_ZYNQ=y' >> .config
 ${MAKE:-make} olddefconfig
 ${MAKE:-make} -j"$CORES" u-boot spl/u-boot-spl.bin
 cp u-boot "$BOOT_DIR/u-boot.elf"
