@@ -169,6 +169,7 @@ echo 'CONFIG_DEBUG_UART=y' >> .config
 echo 'CONFIG_DEBUG_UART_ZYNQ=y' >> .config
 echo 'CONFIG_DEBUG_UART_BASE=0xE0000000' >> .config
 echo 'CONFIG_DEBUG_UART_CLOCK=100000000' >> .config
+echo 'CONFIG_SYS_L2CACHE_OFF=y' >> .config
 ${MAKE:-make} olddefconfig
 ${MAKE:-make} -j"$CORES" u-boot spl/u-boot-spl.bin
 cp u-boot "$BOOT_DIR/u-boot.elf"
