@@ -137,7 +137,7 @@ echo 'CONFIG_OF_EMBED=y' >> .config
 echo 'CONFIG_DEBUG_UART=y' >> .config
 echo 'CONFIG_DEBUG_UART_ZYNQ=y' >> .config
 echo 'CONFIG_DEBUG_UART_BASE=0xE0000000' >> .config
-echo 'CONFIG_DEBUG_UART_CLOCK=50000000' >> .config
+echo 'CONFIG_DEBUG_UART_CLOCK=100000000' >> .config
 make olddefconfig
 # Fix SPL build for Zynq 7010
 sed -i 's|@dd if=$$< of=$$@ conv=block,sync bs=4 2>/dev/null;|@cp $$< $$@|' scripts/Makefile.spl
