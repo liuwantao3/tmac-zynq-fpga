@@ -137,6 +137,8 @@ echo 'CONFIG_DEFAULT_DEVICE_TREE="zynq-zc702"' >> .config
 echo 'CONFIG_OF_EMBED=y' >> .config
 echo 'CONFIG_DEBUG_UART=y' >> .config
 echo 'CONFIG_DEBUG_UART_ZYNQ=y' >> .config
+echo 'CONFIG_DEBUG_UART_BASE=0xE0000000' >> .config
+echo 'CONFIG_DEBUG_UART_CLOCK=50000000' >> .config
 ${MAKE:-make} olddefconfig
 ${MAKE:-make} -j"$CORES" u-boot spl/u-boot-spl.bin
 cp u-boot "$BOOT_DIR/u-boot.elf"
