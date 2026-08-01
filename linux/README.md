@@ -129,10 +129,13 @@ export CROSS_COMPILE=arm-linux-gnueabihf-
 # The stock defconfig uses zynq-zc706 DTB (console on UART1, MIO 48/49).
 # Switch to zynq-zc702 which routes the console to UART0 (MIO 14/15) —
 # this matches the Z7-Lite's CH340 USB-UART pin assignments.
+# CONFIG_OF_EMBED=y bakes the DTB into the ELF so JTAG-booted U-Boot
+# has its device tree (without it, the driver model has no serial device).
 # CONFIG_ARM_DCC=y only adds an optional DCC driver; it is not selected as
 # the console because there is no "arm,dcc" DT node.
 make xilinx_zynq_virt_defconfig
 echo 'CONFIG_DEFAULT_DEVICE_TREE="zynq-zc702"' >> .config
+echo 'CONFIG_OF_EMBED=y' >> .config
 make olddefconfig
 # Fix SPL build for Zynq 7010
 sed -i 's|@dd if=$$< of=$$@ conv=block,sync bs=4 2>/dev/null;|@cp $$< $$@|' scripts/Makefile.spl
