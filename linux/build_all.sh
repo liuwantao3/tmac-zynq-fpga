@@ -116,15 +116,31 @@ with open(P,'w') as f: f.write(content)
 # 7. Move debug_uart_init BEFORE initf_dm — the zc702 serial DM probe
 #    hangs against ps7_init's Z7-Lite MIO/clock config. Calling
 #    debug_uart_init early guarantees UART0 output before any DM init.
+#    NOTE: init_sequence_f entries are `int (*)(void)`, but debug_uart_init
+#    returns void — so we insert a small int-returning wrapper, plus the
+#    <debug_uart.h> include (board_f.c does not include it by default).
 import re
 P = "common/board_f.c"
 with open(P) as f: s = f.read()
-moved = re.sub(
-    r'^(\s*)initf_dm,$',
-    r'#ifdef CONFIG_DEBUG_UART\n\1debug_uart_init,\n#endif\n\1initf_dm,',
-    s, flags=re.MULTILINE
-)
-with open(P,'w') as f: f.write(moved)
+if '#include <debug_uart.h>' not in s:
+    s = s.replace('#include <serial.h>', '#include <debug_uart.h>\n#include <serial.h>', 1)
+if 'debug_uart_init_wrap' not in s:
+    wrap = '''
+#ifdef CONFIG_DEBUG_UART
+static int debug_uart_init_wrap(void)
+{
+\tdebug_uart_init();
+\treturn 0;
+}
+#endif
+'''
+    s = s.replace('static int initf_dm(void)', wrap + 'static int initf_dm(void)', 1)
+    s = re.sub(
+        r'^(\s*)initf_dm,$',
+        r'#ifdef CONFIG_DEBUG_UART\n\1debug_uart_init_wrap,\n#endif\n\1initf_dm,',
+        s, flags=re.MULTILINE
+    )
+with open(P,'w') as f: f.write(s)
 PYEOF
 echo "  patches applied"
 
