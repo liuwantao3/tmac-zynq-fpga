@@ -853,6 +853,81 @@ mwr -force 0xF800900C 0x00000001  ;# read channel enable
 - HP FSM is ready as building block for weight loading in compute pipeline
 - Next: integrate HP read master with matmul_top's weight_buf loading, or proceed to single-layer compute
 
+## Lessons Learned — Gating Pitfalls (cross-reference to Key Decisions)
+
+### PS7 / Boot / Clock Config
+
+| # | Pitfall | What went wrong | The fix |
+|---|---------|----------------|---------|
+| 1 | `ps7_pll_init` re-lock hang | PLLs already locked by BootROM (SD mode, MIO[6]=0). Running ps7_init warm causes PLL reset to hang waiting for lock. | **Always power-cycle the board** before `ps7_init`. `rst -processor` is insufficient. MIO6 validated against UG585 "PS PLL Initialization". |
+| 2 | `rst -processor` corrupts DAP | JTAG DAP enters unrecoverable state after processor reset. All register reads return 0. | Use `stop` to halt the CPU. Fix requires board power-cycle. |
+| 3 | FCLK_CLK0 enable ignored via DAP | DAP writes to `FPGA_CLK_CTRL[7]` (0xF8000170) are dropped — register locked to secure mode. | **ARM boot code must enable FCLK_CLK0**. In SD boot, U-Boot/Linux clock drivers handle it. |
+| 4 | AFI0 at 0xF800_8000, not 0xF800_9000 | Earlier AGENTS.md had the wrong address. | Correct AFI config: CTRL=0x05, PART=0x44, WRCHAN=0x01. See `AGENTS.md` HW Gotchas for full sequence. |
+| 5 | MIO6 = BootROM PLL lock gate | MIO6 (BOOT_MODE[4]) = 0 enables PLLs; BootROM waits for lock before proceeding. SD boot (MIO[8:6]=110) has MIO[6]=0. | PLL re-lock hang (pitfall #1) is a direct consequence of this Silicon feature. Documented in UG585. |
+
+### Block Design / Vivado
+
+| # | Pitfall | What went wrong | The fix |
+|---|---------|----------------|---------|
+| 6 | **SDIO0 not enabled in XSA** | `PCW_EN_SDIO0=0` in block design → FSBL SD branch compiled OUT → `ILLEGAL_BOOT_MODE` → FsblFallback. This was the root cause of SD boot failure (KD #23). | `PCW_EN_SDIO0=1`, `PCW_SD0_PERIPHERAL_ENABLE=1`, `PCW_SD0_SD0_IO="MIO 40 .. 45"`, CD/WP off. Match MicroPhase `03_dma` reference. |
+| 7 | ps7_init.tcl FCLK patch after XSA export | `build_bd.tcl` patches FCLK in the Vivado project copy but **after** `write_hw_platform` → XSA has unpatched ps7_init. | Not a real issue for SD boot (U-Boot/Linux re-enable FCLK). For JTAG bare-metal, ARM startup code must enable FCLK. |
+| 8 | SD card pin config (CSDN blog) | Third-party builder hit the same issue: custom Vivado project → SD pins wrong → no SD boot. | Use the `03_dma` reference config: SDIO0 on MIO 40..45, function 3, pull-ups enabled (0x1680 per pin). |
+
+### FSBL Build
+
+| # | Pitfall | What went wrong | The fix |
+|---|---------|----------------|---------|
+| 9 | **`bsp setlib xilffs` on standalone_domain** | Creates a BSP without `sdps` driver → `xsdps.h: No such file`. xilffs needs sdps for disk I/O. | `platform create` + `platform generate` only. This auto-creates the `zynq_fsbl` boot domain whose BSP auto-selects sdps from SD-enabled hardware. |
+| 10 | **`app config -name "zynq_fsbl"` for debug** | `zynq_fsbl` is a platform boot component, not a workspace app → "project does not exist". | Edit `zynq_fsbl/Makefile` `CFLAGS := -DFSBL_DEBUG_INFO`; rebuild with `make_4.2.exe` (gnuwin `make.exe` crashes on CMD `SHELL=command.com`). Reference `03_dma` FSBL has no debug — optional. |
+
+### U-Boot Build / Console
+
+| # | Pitfall | What went wrong | The fix |
+|---|---------|----------------|---------|
+| 11 | **zc706 DTB → UART1 (dead)** | Default `xilinx_zynq_virt_defconfig` targets zc706 with UART1 (MIO 48/49). Z7-Lite CH340 is on UART0 (MIO 14/15). | Switch to `zynq-zc702` DTB. |
+| 12 | **CONFIG_OF_SEPARATE** → no DTB in ELF | Without DTB, U-Boot driver model can't enumerate serial port → no banner. | `CONFIG_OF_EMBED=y`. |
+| 13 | **DTS `serial0 = &uart1`** | zc702 DTB aliases serial0 to uart1 → console routed to dead UART1 even after DTB switch. | Patch DTS: `serial0 = &uart0`, replace `&uart1` block with `&uart0 { u-boot,dm-pre-reloc; status="okay"; }`. No pinctrl needed (ps7_init sets MIO). **Regex MUST consume `};`** — early fix produced `};;` (dtc syntax error). |
+| 14 | `debug_uart_init` runs AFTER `initf_dm` | DM serial probe (clock/reset/pinctrl) hangs before debug_uart output reaches the UART. | Python patch inserts `debug_uart_init_wrap` (int-returning wrapper) before `initf_dm` in `board_f.c`. |
+| 15 | `debug_uart_init` returns `void` | `init_sequence_f` entries must have `int (*)(void)` signature — `-Werror=incompatible-pointer-types`. | Wrap with `debug_uart_init_wrap` returning 0. |
+| 16 | **PL310 L2 cache disable crash** | U-Boot `CONFIG_SYS_L2CACHE_OFF=n` triggers PL310 access fault (presence bit). | `CONFIG_SYS_L2CACHE_OFF=y`. |
+
+### AXI HP / DDR
+
+| # | Pitfall | What went wrong | The fix |
+|---|---------|----------------|---------|
+| 17 | **ARSIZE=3 on x16 DDR3** | Zynq-7010 + MT41J256M16 x16 DDR3 → HP0 capped at 32-bit. RDATA[63:32]=0 for every read beat, losing every other word. | Read master: ARSIZE=2 (4 bytes/beat). |
+| 18 | **AWSIZE=2 WSTRB byte-lane** | On 64-bit HP with AWSIZE=2, A[2] selects WSTRB lane: A[2]=0→WSTRB[3:0], A[2]=1→WSTRB[7:4]. Original sent both halves on WDATA[31:0]/WSTRB[3:0] → upper corrupt. | Write master: AWSIZE=3 (8 bytes/beat, PS serializes internally to two 32-bit DDR accesses). Simpler, proven. |
+
+### JTAG Debug
+
+| # | Pitfall | What went wrong | The fix |
+|---|---------|----------------|---------|
+| 19 | **FSBL breakpoints move across builds** | Different XSA → different FSBL binary → different InitSD/FsblFallback addresses. | Current frozen addresses (from lscript.ld): InitSD=0x3908, FsblFallback=0x16A4, FsblHookFallback=0x5AC. Stable for this build; re-verify with `arm-none-eabi-nm` if XSA changes. |
+| 20 | MMU teardown corrupt abort state | Warm re-run without power-cycle leaves MMU/DDR in inconsistent state → DAP reads at 0x04000000 return "MMU section translation fault". | Fix is power-cycle, not MMU teardown stub. |
+
+### Bare-Metal ARM
+
+| # | Pitfall | What went wrong | The fix |
+|---|---------|----------------|---------|
+| 21 | **FPU not enabled** | Cortex-A9 VFP disabled at reset → any float instruction causes undefined exception. | Enable CP10/CP11 in CPACR, set FPEXC.EN=1 in startup.s. |
+| 22 | **48-bit result sign extension** | Q8/Q5 cores output S24.8 fixed-point (48-bit acc), zero-extended to 64-bit words in DDR. Negative results appear as positive. | Manually sign-extend from bit 47: `if (raw & (1ull << 47)) raw \|= 0xFFFF000000000000ULL;` |
+| 23 | **`-O2` BSS layout on LLVM 7.0.1** | `-O2` build has a BSS layout issue on this toolchain version. | Use `-O1` for bare-metal compilation. |
+| 24 | Scratch buffer DDR addresses | Addresses above ~500 MB in DDR may have access issues. | Use addresses in first ~500 MB of DDR (0x1F000000 range verified). |
+
+### Linux Boot
+
+| # | Pitfall | What went wrong | The fix |
+|---|---------|----------------|---------|
+| 25 | **devicetree-jtag.dtb for hand boot** | U-Boot-less JTAG boot (boot_linux_jtag.tcl) needs initramfs location → otherwise kernel panics with "no root". | Python FDT patcher bakes `/chosen/linux,initrd-start/end` into DTB copy. Raw gzipped cpio (strip mkimage header). |
+| 26 | Ethernet PHY errors on boot | Z7-Lite uses RTL8201F PHY, but zc702 DTB expects MARVELL PHY. Kernel prints "Failed to read eth PHY id". | Cosmetic only — no functional impact. Can be silenced by switching to a custom DTB matching the board's PHY. |
+
+### SD Card
+
+| # | Pitfall | What went wrong | The fix |
+|---|---------|----------------|---------|
+| 27 | **SD card format** | FSBL's `f_mount` requires FAT32 MBR partition. exFAT, GPT, or unformatted → `FR_DISK_ERR` → InitSD fails. | Single FAT32 MBR partition. `BOOT.BIN` in root directory. |
+| 28 | Two-partition SD plan → one works | Original design had p1 (128MB boot) + p2 (data). Windows only mounts first FAT32 partition on removable drives. | Single FAT32 partition works for both boot assets and model/tmac. Simpler. |
+
 ## Phase 2: Q8 Compute on Hardware
 
 ### Q8 Pipeline Fix (2026-06-28)
