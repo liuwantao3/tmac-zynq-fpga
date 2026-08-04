@@ -286,7 +286,18 @@ linux/boot/
 
 The committed `fsbl.elf` is built from `matmul_bd.xsa`. Standard Vitis flow (see
 AGENTS.md Key Decision #23, 2026-08-04 — SD0 must be enabled in the block design
-or the FSBL's SD boot path is compiled out):
+or the FSBL's SD boot path is compiled out).
+
+**Two gating pitfalls** (known wrong approaches):
+
+1. **Do NOT** `bsp setlib -name xilffs` on `standalone_domain` then hand-create
+   an FSBL app — the BSP lacks the `sdps` driver and xilffs fails to compile
+   (`xsdps.h: No such file`).
+2. **Do NOT** `app config -name "zynq_fsbl" define-compiler-symbols FSBL_DEBUG_INFO`
+   — `zynq_fsbl` is a platform boot component, not a workspace app; the command
+   fails with "project does not exist".
+
+**Correct flow:**
 
 ```tcl
 # linux/build_fsbl.tcl
@@ -303,8 +314,9 @@ copy /Y D:\Users\u\tmac-zynq-fpga\linux\boot\fsbl_platform\zynq_fsbl\fsbl.elf D:
 
 Optional debug output (`Boot mode is SD` banner for bring-up): edit
 `fsbl_platform/zynq_fsbl/Makefile` `CFLAGS := -DFSBL_DEBUG_INFO` and rebuild with
-`make_4.2.exe` (the `gnuwin` `make.exe` crashes on `SHELL=command.com`). The
-reference MicroPhase `03_dma` FSBL ships without FSBL_DEBUG — it is optional.
+`make_4.2.exe` (see pitfall #2 above; `gnuwin` `make.exe` crashes on
+`SHELL=command.com`). The reference MicroPhase `03_dma` FSBL ships without
+FSBL_DEBUG — debug output is optional.
 
 ### Step 3: Windows bootgen fallback (optional)
 
