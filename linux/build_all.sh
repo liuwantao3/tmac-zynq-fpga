@@ -141,6 +141,24 @@ static int debug_uart_init_wrap(void)
         s, flags=re.MULTILINE
     )
 with open(P,'w') as f: f.write(s)
+
+# 8. RAM-size mismatch: the zc702 DTB declares 1 GB memory@0, but the
+#    Z7-Lite has 512 MB DDR. U-Boot's dram_init() reads the DTB memory
+#    size via fdtdec_setup_mem_size_base() (CONFIG_SYS_SDRAM_BASE unset),
+#    so gd->ram_size=1 GB -> relocation lands at ~0x3FF00000 (unpopulated)
+#    -> crash. Set memory@0 to 512 MB (0x20000000).
+P = "arch/arm/dts/zynq-zc702.dts"
+with open(P) as f: s = f.read()
+s = re.sub(r'(memory@0\s*\{\s*device_type\s*=\s*"memory";\s*reg\s*=\s*<0x0\s+)0x40000000(\s*>;)',
+           r'\g<1>0x20000000\g<2>', s, flags=re.S)
+# 9. Console UART: zc702 routes serial0 to &uart1 (MIO 48/49, not wired on
+#    Z7-Lite). The CH340 USB-UART is on UART0 (MIO 14/15) -> route serial0
+#    to &uart0 and enable it (ps7_init already configures MIO 14/15).
+s = re.sub(r'(aliases\s*\{.*?\n\s*)serial0\s*=\s*&uart1;',
+           r'\g<1>serial0 = &uart0;', s, flags=re.S)
+s = re.sub(r'(&uart1\s*\{\s*u-boot,dm-pre-reloc;\s*status\s*=\s*"okay";\s*pinctrl-names\s*=\s*"default";\s*pinctrl-0\s*=\s*<&pinctrl_uart1_default>;\s*\}\s*;)',
+           '&uart0 {\n\tu-boot,dm-pre-reloc;\n\tstatus = "okay";\n};', s, flags=re.S)
+with open(P,'w') as f: f.write(s)
 PYEOF
 echo "  patches applied"
 

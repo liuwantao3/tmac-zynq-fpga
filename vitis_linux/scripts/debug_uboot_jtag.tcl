@@ -1,0 +1,84 @@
+# Debug U-Boot crash on MicroPhase Z7-Lite via JTAG.
+#
+# Run:  C:\Xilinx\Vivado\2023.1\bin\xsdb.bat D:/Users/u/tmac-zynq-fpga/vitis_linux/scripts/debug_uboot_jtag.tcl
+# Power-cycle the board first OR let the PLL-lock guard skip ps7_init.
+#
+# Flow: (ps7_init if PLLs not locked) -> mark BSS with 0xDEADBEEF
+#       -> dow u-boot.elf -> con -> stop -> dump PC/regs/BSS/UART0.
+
+set ELF  {D:/Users/u/tmac-zynq-fpga/linux/boot/u-boot.elf}
+set PS7  {D:/Users/u/tmac-zynq-fpga/vitis_linux/workspace/z7_linux/hw/ps7_init.tcl}
+
+set BSS_START 0x040da760
+
+proc r32 {a} {
+    set r [mrd $a 1]
+    set r [string trim $r]
+    if {[regexp {([0-9A-Fa-f]+)$} $r v]} { return [expr "0x$v"] }
+    return -1
+}
+
+puts "=== U-Boot JTAG debug ==="
+configparams force-mem-accesses 1
+connect; after 5000
+catch {targets -set -filter {name =~ "*Cortex-A9*#0*"}}; after 200
+catch {stop}; after 200
+
+set pll [r32 0xF800010C]
+puts "1. PLL_STATUS raw: [string trim [mrd 0xF800010C 1]]"
+puts "   PLL_STATUS=[format 0x%08x $pll]"
+
+if {($pll & 0x7) == 0x7} {
+    puts "   PLLs already locked -> skipping ps7_init (avoids re-lock hang)"
+} else {
+    puts "2. PS7 init..."
+    source $PS7
+    ps7_mio_init_data_3_0; after 20
+    ps7_pll_init_data_3_0; after 20
+    ps7_clock_init_data_3_0; after 20
+    ps7_ddr_init_data_3_0; after 200
+    ps7_peripherals_init_data_3_0; after 20
+    ps7_post_config_3_0; after 200
+    puts "   PLL_STATUS=[format 0x%08x [r32 0xF800010C]]"
+}
+
+puts "3. Mark BSS with 0xDEADBEEF..."
+mwr -force $BSS_START 0xDEADBEEF
+mwr -force [expr {$BSS_START + 4}] 0xDEADBEEF
+mwr -force [expr {$BSS_START + 8}] 0xDEADBEEF
+mwr -force [expr {$BSS_START + 0x400}] 0xDEADBEEF
+
+puts "4. Load u-boot.elf..."
+catch {stop}; after 200
+targets -set -filter {name =~ "*Cortex-A9*#0*"}; after 200
+dow $ELF; after 500
+catch {rrd pc} msg; puts "   after dow: $msg"
+
+puts "5. con, wait 3s..."
+con
+after 3000
+catch {targets -set -filter {name =~ "*Cortex-A9*#0*"}}; after 200
+catch {stop}; after 300
+
+puts "6. CPU state:"
+foreach reg {pc sp lr cpsr spsr r0 r1 r2 r3 r4 r5} {
+    catch {rrd $reg} msg; puts "   $msg"
+}
+
+puts "7. BSS marker (expect 0 if BSS cleared):"
+catch {mrd $BSS_START 4} msg; puts "$msg"
+catch {mrd [expr {$BSS_START + 0x400}] 4} msg; puts "$msg"
+
+puts "8. UART0 registers (0xE0000000, 16 words):"
+catch {mrd 0xE0000000 16} msg; puts "$msg"
+
+puts "9. Code at PC (16 words):"
+catch {rrd pc} msg
+if {[regexp {0x([0-9A-Fa-f]+)} $msg p]} {
+    set pca [expr "0x$p"]
+    set pca [format "0x%08x" [expr {$pca & ~3}]]
+    puts "   pc=$pca"
+    catch {mrd $pca 16} msg; puts "$msg"
+}
+
+puts "=== Done. Map PC to a symbol offline. ==="

@@ -69,6 +69,16 @@ set_property CONFIG.PCW_UART0_PERIPHERAL_ENABLE 1 [get_bd_cells ps7]
 set_property CONFIG.PCW_UART0_UART0_IO "MIO 14 .. 15" [get_bd_cells ps7]
 set_property CONFIG.PCW_UART1_PERIPHERAL_ENABLE 0 [get_bd_cells ps7]
 
+# SD0 (microSD) on MIO 40..45 — enables FSBL/U-Boot SD boot path.
+# CD/WP disabled (matches MicroPhase reference design; no card-detect pins).
+set_property CONFIG.PCW_EN_SDIO0 1 [get_bd_cells ps7]
+set_property CONFIG.PCW_SD0_PERIPHERAL_ENABLE 1 [get_bd_cells ps7]
+set_property CONFIG.PCW_SD0_SD0_IO "MIO 40 .. 45" [get_bd_cells ps7]
+set_property CONFIG.PCW_SD0_GRP_CD_ENABLE 0 [get_bd_cells ps7]
+set_property CONFIG.PCW_SD0_GRP_CD_IO "<Select>" [get_bd_cells ps7]
+set_property CONFIG.PCW_SD0_GRP_WP_ENABLE 0 [get_bd_cells ps7]
+set_property CONFIG.PCW_SD0_GRP_WP_IO "<Select>" [get_bd_cells ps7]
+
 # PL fabric clocks: FCLK_CLK0 = 100 MHz (fabric logic),
 # FCLK_CLK1 = 100 MHz (async domain for HP0, avoids FIFO bypass)
 set_property CONFIG.PCW_EN_CLK0_PORT 1 [get_bd_cells ps7]

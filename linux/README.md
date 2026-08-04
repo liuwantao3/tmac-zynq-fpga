@@ -284,13 +284,27 @@ linux/boot/
 
 ### Step 2: Rebuild FSBL (only if matmul_bd.xsa changes)
 
-The committed `fsbl.elf` is built from `matmul_bd.xsa`; regenerable via XSCT:
+The committed `fsbl.elf` is built from `matmul_bd.xsa`. Standard Vitis flow (see
+AGENTS.md Key Decision #23, 2026-08-04 — SD0 must be enabled in the block design
+or the FSBL's SD boot path is compiled out):
 
 ```tcl
-hsi::open_hw_design linux/boot/matmul_bd.xsa
-hsi::generate_app -hw linux/boot/matmul_bd.xsa -os standalone -proc ps7_cortexa9_0 -app zynq_fsbl
-# Copy fsbl.elf from the generated SDK project to linux/boot/
+# linux/build_fsbl.tcl
+setws linux/boot
+platform create -name fsbl_platform -hw linux/boot/matmul_bd.xsa -proc ps7_cortexa9_0 -os standalone
+platform generate
+# → auto-generates the zynq_fsbl boot domain; its BSP picks up sdps (from SD-enabled HW)
 ```
+
+```cmd
+:: copy the produced FSBL
+copy /Y D:\Users\u\tmac-zynq-fpga\linux\boot\fsbl_platform\zynq_fsbl\fsbl.elf D:\Users\u\tmac-zynq-fpga\linux\boot\fsbl.elf
+```
+
+Optional debug output (`Boot mode is SD` banner for bring-up): edit
+`fsbl_platform/zynq_fsbl/Makefile` `CFLAGS := -DFSBL_DEBUG_INFO` and rebuild with
+`make_4.2.exe` (the `gnuwin` `make.exe` crashes on `SHELL=command.com`). The
+reference MicroPhase `03_dma` FSBL ships without FSBL_DEBUG — it is optional.
 
 ### Step 3: Windows bootgen fallback (optional)
 

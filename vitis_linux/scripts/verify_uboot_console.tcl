@@ -1,0 +1,66 @@
+# Verify U-Boot console on UART0 (CH340) for MicroPhase Z7-Lite.
+#
+# Run:  C:\Xilinx\Vivado\2023.1\bin\xsdb.bat D:/Users/u/tmac-zynq-fpga/vitis_linux/scripts/verify_uboot_console.tcl
+#
+# PREP (do before running this):
+#   1. Power-cycle the board (PLL re-lock hang otherwise).
+#   2. Open the CH340 USB-UART terminal at 115200 8N1 (no flow control).
+#   3. Run this script. U-Boot loads via JTAG, runs ~25 s, then stops
+#      and dumps PC/regs/UART0 so we can confirm the console bound.
+#   During the run you should see on the terminal:
+#      "U-Boot 20xx.xx-... (xxx)" banner + "Hit any key to stop autoboot".
+
+set ELF  {D:/Users/u/tmac-zynq-fpga/linux/boot/u-boot.elf}
+set PS7  {D:/Users/u/tmac-zynq-fpga/vitis_linux/workspace/z7_linux/hw/ps7_init.tcl}
+
+set BSS_START 0x040da760
+
+proc r32 {a} {
+    set r [mrd $a 1]
+    set r [string trim $r]
+    if {[regexp {([0-9A-Fa-f]+)$} $r v]} { return [expr "0x$v"] }
+    return -1
+}
+
+puts "=== Verify U-Boot console on UART0 ==="
+configparams force-mem-accesses 1
+connect; after 5000
+catch {targets -set -filter {name =~ "*Cortex-A9*#0*"}}; after 200
+catch {stop}; after 200
+
+set pll [r32 0xF800010C]
+puts "1. PLL_STATUS=[format 0x%08x $pll]"
+if {($pll & 0x7) == 0x7} {
+    puts "   PLLs already locked -> skipping ps7_init (avoids re-lock hang)"
+} else {
+    puts "2. PS7 init..."
+    source $PS7
+    ps7_mio_init_data_3_0; after 20
+    ps7_pll_init_data_3_0; after 20
+    ps7_clock_init_data_3_0; after 20
+    ps7_ddr_init_data_3_0; after 200
+    ps7_peripherals_init_data_3_0; after 20
+    ps7_post_config_3_0; after 200
+    puts "   PLL_STATUS=[format 0x%08x [r32 0xF800010C]]"
+}
+
+puts "3. Load u-boot.elf..."
+catch {stop}; after 200
+targets -set -filter {name =~ "*Cortex-A9*#0*"}; after 200
+dow $ELF; after 500
+
+puts "4. con (CPU runs ~25 s so the terminal can show the banner)..."
+con
+after 25000
+catch {targets -set -filter {name =~ "*Cortex-A9*#0*"}}; after 200
+catch {stop}; after 300
+
+puts "5. CPU state:"
+foreach reg {pc sp lr cpsr} {
+    catch {rrd $reg} msg; puts "   $msg"
+}
+
+puts "6. UART0 registers (0xE0000000, 16 words) - expect CR TX/RX EN, BAUDGEN!=0:"
+catch {mrd 0xE0000000 16} msg; puts "$msg"
+
+puts "=== Done. If the banner printed on CH340, UART0 console works. ==="
