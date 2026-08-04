@@ -143,6 +143,18 @@ linux/boot/zImage
 linux/boot/boot.scr
 linux/boot/initramfs.cpio.gz
 linux/boot/devicetree-jtag.dtb
+linux/boot/fsbl_platform/
+linux/boot/fsbl_app/
+linux/boot/fsbl_app_system/
+linux/boot/ps7_init.c
+linux/boot/ps7_init.h
+linux/boot/ps7_init.tcl
+linux/boot/ps7_init_gpl.c
+linux/boot/ps7_init_gpl.h
+linux/boot/matmul_bd.bit
+linux/boot/devicetree-new.dtb
+linux/boot/.metadata/
+linux/boot/.analytics
 
 # Vitis Linux workspace (regenerable via XSCT — see vitis_linux/README.md)
 vitis_linux/workspace/
