@@ -1,357 +1,113 @@
 # FPGA Accelerator Linux-on-SD Boot
 
-**Single-machine flow (Mac):** the Lima VM builds U-Boot + kernel + initramfs
-**and** `BOOT.BIN` (via a buildroot-built Xilinx `bootgen`), so the whole
-SD-boot image is produced on the Mac. Windows (Vivado) is only needed to
-rebuild the bitstream/FSBL if the hardware design changes.
+**Single-machine flow (Windows WSL):** the Linux kernel + device tree +
+initramfs for the MicroPhase Z7-Lite SD boot are built inside WSL (Ubuntu
+24.04). `BOOT.BIN` is fused from the committed `fsbl.elf` + `system_wrapper.bit`
++ `u-boot.elf` with Vivado's `bootgen.bat` (all three inputs are committed, so
+`BOOT.BIN` only needs regenerating if the hardware changes).
 
-Hardware: MicroPhase Z7-Lite (xc7z010clg400-1), UART0 MIO14/15 (CH340 USB-UART, 115200 8N1). All console output (U-Boot + kernel) is on UART0.
+**The verified-working boot artifacts are committed** in `linux/boot/` (and
+mirrored to `vitis_linux/prebuilt/` for the JTAG script). Rebuilding is only
+needed when the kernel/DTB/initramfs sources change.
 
-## Quickstart: automated build (recommended)
+Hardware: MicroPhase Z7-Lite (xc7z010clg400-1), UART0 MIO14/15 (CH340 USB-UART,
+115200 8N1). All console output (U-Boot + kernel) is on UART0.
 
-Single-command flow that an automated agent (or the user) can run end-to-end.
+## Quickstart: build (WSL, Ubuntu 24.04)
 
-### One-time: Lima VM setup
+### 1. One-time toolchain setup (inside WSL)
 
 ```bash
-brew install lima
-limactl start --name=linux-build --cpus=8 --memory=16 template://ubuntu
-limactl shell linux-build
 sudo apt update && sudo apt install -y \
     gcc-arm-linux-gnueabihf build-essential flex bison bc libelf-dev libssl-dev \
-    busybox-static cpio git pkg-config
-exit   # back to the macOS host
+    u-boot-tools device-tree-compiler cpio wget
 ```
 
-`build_all.sh` auto-detects the host: inside the Lima VM it uses the apt
-cross-compiler + libssl-dev; on the macOS host it uses the clang wrapper
-(`setup_toolchain.sh`) + Homebrew binutils/openssl. **The Lima VM is the
-recommended environment.**
-
-### 1. Clone the repo (macOS host — the VM shares the host home dir)
+### 2. Clone the sources (kernel for DTB + uImage; U-Boot only for mkimage/dts)
 
 ```bash
 cd ~
 git clone https://github.com/liuwantao3/tmac-zynq-fpga.git
 cd ~/tmac-zynq-fpga
+bash linux/clone_repos.sh        # clones into ~/linux-xlnx + ~/u-boot-xlnx
 ```
 
-The committed `linux/boot/` already contains the Windows-built
-`system_wrapper.bit`, `matmul_bd.xsa`, `boot.bif`, `boot.cmd`, and the `tmac`
-ARM binary. Everything else is built below.
-
-### 2. Clone U-Boot / kernel / buildroot (inside the VM: `limactl shell linux-build`)
+### 3. Build the boot artifacts
 
 ```bash
 cd ~/tmac-zynq-fpga
-bash linux/clone_repos.sh
-# clones into /tmp/arm-build/{u-boot-xlnx,linux-xlnx,buildroot} (VM-local tmp)
+bash linux/build_wsl.sh          # from the repo root; artifacts land in linux/boot/
 ```
 
-### 3. Build everything (inside the VM)
-
-```bash
-cd ~/tmac-zynq-fpga
-bash linux/build_all.sh          # from the repo root; artifacts land in linux/boot/
-# or with explicit paths:
-# bash linux/build_all.sh /tmp/arm-build ~/tmac-zynq-fpga
-```
-
-Build time ~5-15 min. Outputs in `linux/boot/` (shared with the host):
-`u-boot.elf`, `boot.scr`, `uImage`, `devicetree.dtb`, `uramdisk.image.gz`,
-`devicetree-jtag.dtb`, `initramfs.cpio.gz`, and — via `build_bootbin.sh`
-(buildroot `host-bootgen`) — `BOOT.BIN`. `build_all.sh` does all of it; no
-Windows step is needed for the SD flow.
+`build_wsl.sh` does, in order:
+1. Configures the kernel (`xilinx_zynq_defconfig` + UART0 console + `DEBUG_LL`
+   for early boot serial — see below).
+2. Patches the zc702 DTS for Z7-Lite hardware (SDHCI CD/WP, GPIO pinctrl,
+   gpio-keys/leds — see `docs/z7lite-vs-zc702.md`).
+3. Builds `uImage` + `devicetree.dtb`.
+4. Builds a 32-bit ARM static busybox from source.
+5. Assembles the initramfs (with `/dev/console` nodes + `setsid`/`cttyhack`).
+6. Wraps it as `uramdisk.image.gz`; emits raw `initramfs.cpio.gz`.
+7. Builds `devicetree-jtag.dtb` (JTAG hand-boot variant).
+8. Mirrors everything to `vitis_linux/prebuilt/`.
 
 ### 4. Verify the artifacts
 
 ```bash
 cd ~/tmac-zynq-fpga/linux/boot
 ls -la
-file uImage boot.scr uramdisk.image.gz devicetree.dtb u-boot.elf
+file uImage boot.scr uramdisk.image.gz devicetree.dtb
 ```
 
-Expected (approximate, from the last build):
+Expected (verified 2026-08-11):
 
 | file | size | check |
 |------|------|-------|
-| `u-boot.elf` | ~1.1 MB | ARM ELF |
-| `boot.scr` | ~500 B | mkimage legacy script (magic `0x27051956`) |
-| `uImage` | ~4.9 MB | mkimage legacy kernel (magic `0x27051956`) |
-| `devicetree.dtb` | ~17 KB | DTB |
-| `uramdisk.image.gz` | ~1.3 MB | gzip (`1F 8B`) — raw gzipped cpio, no mkimage header |
-| `devicetree-jtag.dtb` | ~17 KB | patched DTB (JTAG fallback only) |
-| `initramfs.cpio.gz` | ~1.3 MB | gzip — same content as `uramdisk.image.gz` |
-| `BOOT.BIN` | ~3.2 MB | FSBL + bitstream + U-Boot fused by buildroot `bootgen` |
-| `fsbl.elf` | ~228 KB | committed (see below) — only regenerated if HW changes |
+| `u-boot.elf` | 1,063,480 B | ARM ELF, UART0 console (committed) |
+| `boot.scr` | 543 B | mkimage legacy script, loads uImage @ 0x03000000 |
+| `uImage` | 4,892,736 B | mkimage legacy kernel (debug build, `DEBUG_LL`) |
+| `devicetree.dtb` | 16,619 B | Z7-Lite patched DTB (see `docs/z7lite-vs-zc702.md`) |
+| `devicetree-jtag.dtb` | 16,688 B | Z7-Lite DTB + `/chosen/linux,initrd-*` |
+| `uramdisk.image.gz` | 1,327,882 B | U-Boot ramdisk (32-bit busybox initramfs) |
+| `initramfs.cpio.gz` | 1,327,818 B | raw gzipped cpio (JTAG hand-boot) |
+| `BOOT.BIN` | 3,168,704 B | FSBL + bitstream + U-Boot (from `bootgen.bat`) |
+| `fsbl.elf` | 437,552 B | committed (SD-capable, `-DFSBL_DEBUG_INFO`) |
 
-### 5. Prepare the SD card (macOS host)
+### 5. Prepare the SD card (Windows)
 
-```bash
-diskutil list                     # find the SD disk, e.g. /dev/disk4
-diskutil partitionDisk /dev/disk4 MBR FAT32 SD_BOOT 128M FAT32 SD_DATA R
-```
+The SD card is a **single FAT32 partition** (label `SD_BOOT`):
 
-| Partition | Type | Size | Contents |
-|-----------|------|------|----------|
-| 1 (`SD_BOOT`) | FAT32 | ~128 MB | `BOOT.BIN`, `uImage`, `devicetree.dtb`, `uramdisk.image.gz`, `boot.scr` |
-| 2 (`SD_DATA`) | FAT32 (vfat) | Rest | `model.tmac` (~374 MB), `tmac` |
+| File | Purpose |
+|------|---------|
+| `BOOT.BIN` | FSBL + bitstream + U-Boot |
+| `uImage` | Linux kernel |
+| `devicetree.dtb` | Z7-Lite device tree |
+| `uramdisk.image.gz` | initramfs (U-Boot ramdisk) |
+| `boot.scr` | auto-boot script |
+| `uEnv.txt` | `boot_targets=mmc0` (skip Ethernet polling) |
+| `tmac` | FPGA test binary |
+| `model.tmac` | model weights (NOT in repo; on the Windows machine) |
 
-**`model.tmac` is NOT in the repo** (gitignored, ~374 MB). Ask the user for it
-(it lives on the Windows machine at `models/model.tmac`) and copy it onto the
-SD p2 — everything else can be built and verified without it.
-
-### 6. Copy the SD card contents
-
-`BOOT.BIN` was already created in step 3 by `build_bootbin.sh` (buildroot
-`host-bootgen` inside the Lima VM — no Windows/Vivado needed). Copy:
-
-| → SD p1 (`SD_BOOT`) | → SD p2 (`SD_DATA`) |
-|---------------------|---------------------|
-| `BOOT.BIN`, `uImage`, `devicetree.dtb`, `uramdisk.image.gz`, `boot.scr` | `model.tmac`, `tmac` |
-
-The only reason to touch Windows is a hardware-design change: rebuild the
-bitstream/FSBL there and update `linux/boot/` (see "Regenerating BOOT.BIN").
+Copy these to the SD root, insert, set boot jumper **J1** to SD, power on.
+U-Boot auto-runs `boot.scr`; no typing needed.
 
 ---
 
-## Manual Build (reference — what `build_all.sh` automates)
-
-### 1. Build U-Boot (console on UART0)
-
-```bash
-cd ~
-git clone --depth=1 --branch xilinx-v2022.1 \
-    https://github.com/Xilinx/u-boot-xlnx.git
-cd ~/u-boot-xlnx
-export CROSS_COMPILE=arm-linux-gnueabihf-
-
-# The stock defconfig uses zynq-zc706 DTB (console on UART1, MIO 48/49).
-# Switch to zynq-zc702 which routes the console to UART0 (MIO 14/15) —
-# this matches the Z7-Lite CH340 USB-UART. CONFIG_OF_EMBED=y bakes the
-# DTB into the ELF so JTAG-booted U-Boot has its device tree.
-# CONFIG_DEBUG_UART_ZYNQ enables early boot output before DM init.
-make xilinx_zynq_virt_defconfig
-echo 'CONFIG_DEFAULT_DEVICE_TREE="zynq-zc702"' >> .config
-echo 'CONFIG_OF_EMBED=y' >> .config
-echo 'CONFIG_DEBUG_UART=y' >> .config
-echo 'CONFIG_DEBUG_UART_ZYNQ=y' >> .config
-echo 'CONFIG_DEBUG_UART_BASE=0xE0000000' >> .config
-echo 'CONFIG_DEBUG_UART_CLOCK=100000000' >> .config
-echo 'CONFIG_SYS_L2CACHE_OFF=y' >> .config
-make olddefconfig
-# Fix SPL build for Zynq 7010
-sed -i 's|@dd if=$$< of=$$@ conv=block,sync bs=4 2>/dev/null;|@cp $$< $$@|' scripts/Makefile.spl
-make -j$(nproc)
-cp u-boot u-boot.elf
-cp u-boot-spl.bin ~/tmac-zynq-fpga/linux/boot/
-```
-
-### 2. Build Linux kernel (console on UART0)
-
-```bash
-cd ~
-git clone --depth=1 --branch xilinx-v2024.1 \
-    https://github.com/Xilinx/linux-xlnx.git
-cd ~/linux-xlnx
-export CROSS_COMPILE=arm-linux-gnueabihf-
-
-make ARCH=arm xilinx_zynq_defconfig
-# UART0 console: the defconfig already enables SERIAL_XILINX_PS_UART(_CONSOLE)=y.
-# Bake the command line so the console lands on ttyPS0 (used when the DT
-# /chosen/bootargs is empty, e.g. the JTAG boot flow). `earlycon` (bare, no
-# "=dcc") enables early boot messages on UART0 via the DT stdout-path — same
-# console setup as the reference MicroPhase project (03_dma/linux/smir-top.dts:
-# bootargs "earlycon, ...", stdout-path "serial0:115200n8").
-./scripts/config --enable SERIAL_XILINX_PS_UART_CONSOLE
-./scripts/config --set-str CMDLINE "earlycon console=ttyPS0,115200 root=/dev/ram0 rw iomem=relaxed"
-make -j$(nproc) ARCH=arm olddefconfig
-make -j$(nproc) ARCH=arm UIMAGE_LOADADDR=0x8000 uImage dtbs
-cp arch/arm/boot/uImage ~/tmac-zynq-fpga/linux/boot/
-cp arch/arm/boot/dts/zynq-zc702.dtb ~/tmac-zynq-fpga/linux/boot/devicetree.dtb
-```
-
-### 3. Build initramfs with tmac
-
-```bash
-cd ~/tmac-zynq-fpga/linux
-# Build tmac-static ARM binary
-arm-linux-gnueabihf-gcc -static -O2 -o tmac tmac_linux.c -lm
-cp tmac boot/
-
-# Create initramfs
-mkdir -p /tmp/initramfs/{bin,dev,proc,sys,root,tmp,etc}
-cp /bin/busybox /tmp/initramfs/bin/
-cd /tmp/initramfs
-for cmd in sh mount umount ls cat echo mknod sleep dmesg cp mv rm \
-    grep sed awk hexdump md5sum devmem ps kill top free vi \
-    fdisk mkfs.ext2 blkid ifconfig ping wget modprobe sync \
-    reboot poweroff halt; do
-    ln -sf /bin/busybox bin/$cmd
-done
-cp ~/tmac-zynq-fpga/linux/boot/tmac bin/
-
-cat > init << 'INIT'
-#!/bin/sh
-mount -t proc none /proc
-mount -t sysfs none /sys
-mount -t devtmpfs none /dev
-echo "=== FPGA Linux Boot — Zynq 7010 (UART0 console) ==="
-echo "Console: USB-UART0 (CH340), 115200 8N1 — see docs/infrastructure.md"
-echo ""
-# Mount SD data partition if present (vfat or ext4, auto-detected)
-mount /dev/mmcblk0p2 /root 2>/dev/null && echo "SD data mounted at /root"
-echo "Ready. Run /root/tmac for FPGA test."
-exec /bin/sh
-INIT
-chmod +x init
-find . | cpio -o -H newc | gzip > ~/tmac-zynq-fpga/linux/boot/uramdisk.image.gz
-```
-
-### 4. Deploy U-Boot files
-
-```bash
-cp ~/u-boot-xlnx/u-boot.elf ~/tmac-zynq-fpga/linux/boot/
-cp ~/u-boot-xlnx/u-boot-spl.bin ~/tmac-zynq-fpga/linux/boot/
-```
-
-### 5. Build boot.scr (auto-boot script)
-
-`xilinx_zynq_virt_defconfig` sets `CONFIG_DISTRO_DEFAULTS=y`, so U-Boot
-automatically runs `boot.scr` from the FAT32 partition — no interactive prompt
-needed. Generate it from the committed `linux/boot/boot.cmd` with U-Boot's own
-`mkimage` (do **not** use kernel u-boot-tools):
-
-```bash
-cd ~/u-boot-xlnx
-./tools/mkimage -A arm -T script -C none -n "Boot" \
-    -d ~/tmac-zynq-fpga/linux/boot/boot.cmd \
-    ~/tmac-zynq-fpga/linux/boot/boot.scr
-```
-
-(`linux/build_all.sh` does this automatically.)
-
-### 6. Build BOOT.BIN (Mac, buildroot bootgen — no Windows)
-
-`build_all.sh` runs `linux/build_bootbin.sh` automatically. It builds Xilinx
-`bootgen` with buildroot's `host-bootgen` package (into
-`/tmp/arm-build/buildroot/output/host/bin/bootgen`) and fuses:
+## Boot flow (verified 2026-08-11)
 
 ```
-the_ROM_image:
-{
-    [bootloader] fsbl.elf
-    system_wrapper.bit
-    u-boot.elf
-}
+BootROM (MIO[8:6]=110=SD) → FSBL InitSD("BOOT.BIN") → PCAP loads bitstream
+→ U-Boot (UART0 console) → distro boot → boot.scr → fatload uImage/dtb/ramdisk
+→ bootm → Linux 6.6.0 → initramfs → /bin/sh shell
 ```
 
-To run it standalone:
-
-```bash
-bash linux/build_bootbin.sh /tmp/arm-build ~/tmac-zynq-fpga
-```
-
-`fsbl.elf` is committed in `linux/boot/` (built from `matmul_bd.xsa`); it only
-needs regenerating if the hardware design changes (see the next section).
-
----
-
-## Windows (only if the hardware design changes)
-
-The Mac/Lima-VM flow above produces `BOOT.BIN` itself, so Windows/Vivado is only
-needed to rebuild `system_wrapper.bit` + `fsbl.elf` when the PL design changes
-(and then re-run `build_bootbin.sh` on the Mac).
-
-**Prerequisites:** Vivado 2023.1.
-
-### Step 1: Ensure boot files
-
-```
-linux/boot/
-├── system_wrapper.bit   ← committed (built in Vivado on Windows)
-├── matmul_bd.xsa        ← committed (hardware handoff)
-├── boot.bif             ← committed (bootgen config)
-├── boot.cmd             ← committed (U-Boot auto-boot script source)
-├── fsbl.elf             ← committed (built from matmul_bd.xsa)
-├── u-boot.elf           ← Mac build (from build_all.sh)
-├── boot.scr             ← generated by mkimage from boot.cmd (Mac build)
-├── uImage               ← Mac build
-├── devicetree.dtb        ← Mac build
-├── uramdisk.image.gz     ← Mac build
-└── tmac                 ← Mac build
-```
-
-### Step 2: Rebuild FSBL (only if matmul_bd.xsa changes)
-
-The committed `fsbl.elf` is built from `matmul_bd.xsa`. Standard Vitis flow (see
-AGENTS.md Key Decision #23, 2026-08-04 — SD0 must be enabled in the block design
-or the FSBL's SD boot path is compiled out).
-
-**Two gating pitfalls** (known wrong approaches):
-
-1. **Do NOT** `bsp setlib -name xilffs` on `standalone_domain` then hand-create
-   an FSBL app — the BSP lacks the `sdps` driver and xilffs fails to compile
-   (`xsdps.h: No such file`).
-2. **Do NOT** `app config -name "zynq_fsbl" define-compiler-symbols FSBL_DEBUG_INFO`
-   — `zynq_fsbl` is a platform boot component, not a workspace app; the command
-   fails with "project does not exist".
-
-**Correct flow:**
-
-```tcl
-# linux/build_fsbl.tcl
-setws linux/boot
-platform create -name fsbl_platform -hw linux/boot/matmul_bd.xsa -proc ps7_cortexa9_0 -os standalone
-platform generate
-# → auto-generates the zynq_fsbl boot domain; its BSP picks up sdps (from SD-enabled HW)
-```
-
-```cmd
-:: copy the produced FSBL
-copy /Y D:\Users\u\tmac-zynq-fpga\linux\boot\fsbl_platform\zynq_fsbl\fsbl.elf D:\Users\u\tmac-zynq-fpga\linux\boot\fsbl.elf
-```
-
-Optional debug output (`Boot mode is SD` banner for bring-up): edit
-`fsbl_platform/zynq_fsbl/Makefile` `CFLAGS := -DFSBL_DEBUG_INFO` and rebuild with
-`make_4.2.exe` (see pitfall #2 above; `gnuwin` `make.exe` crashes on
-`SHELL=command.com`). The reference MicroPhase `03_dma` FSBL ships without
-FSBL_DEBUG — debug output is optional.
-
-### Step 3: Windows bootgen fallback (optional)
-
-`build_bootbin.sh` on the Mac is the primary path. If you prefer, the same
-command works on Windows:
-
-```cmd
-cd D:\Users\u\tmac-zynq-fpga\linux\boot
-C:\Xilinx\Vivado\2023.1\bin\bootgen.bat -image boot.bif -o BOOT.BIN -w
-```
-
-`boot.bif` contents (FSBL path — SPL is **not** used; U-Boot is loaded from
-`u-boot.elf` by the FSBL):
-```
-the_ROM_image:
-{
-    [bootloader] fsbl.elf
-    system_wrapper.bit
-    u-boot.elf
-}
-```
-
-### Step 4: Boot the SD
-
-1. Power-cycle the board (required — PLL re-init hangs on warm reset)
-2. Insert SD, set boot mode jumper **J1** to SD
-3. Connect the USB-UART cable and open a 115200 8N1 serial terminal (PuTTY,
-   COM port of the CH340). All U-Boot + kernel console output appears here.
-4. Power on — U-Boot (distro boot) auto-runs `boot.scr` from the FAT32
-   partition, loads Linux, runs initramfs
-5. Login shell at the initramfs prompt (see U-Boot manual boot below if auto-boot fails)
+The kernel boots to an interactive shell (`~ #`) on the CH340 USB-UART.
+FPGA registers are at `0x43C00000` (test with `devmem 0x43C0002C` for the
+free-running clock counter).
 
 ### U-Boot Manual Boot (if auto-boot fails)
 
-These are exactly the commands embedded in `linux/boot/boot.cmd`:
+Exactly what `linux/boot/boot.cmd` runs:
 
 ```
 U-Boot> fatload mmc 0 0x3000000 uImage
@@ -363,50 +119,66 @@ U-Boot> bootm 0x3000000 0x2000000 0x2A00000
 
 ---
 
-## JTAG Boot (no SD card, fallback for bring-up)
+## Regenerating BOOT.BIN (Windows, only if HW changes)
 
-SD boot (above) is the primary path. This JTAG hand-boot is the fallback for
-FPGA/DDR bring-up without shuffling SD cards. Direct JTAG boot (bitstream →
-PS7 init → AFI → kernel/DTB/initrd → Linux) is handled by the Vitis Linux
-workspace:
+`BOOT.BIN` is **not committed** (it is fused from the three committed inputs).
 
-```tcl
-# From the Vitis GUI XSCT console (power-cycle the board first):
-source D:/Users/u/tmac-zynq-fpga/vitis_linux/scripts/boot_linux_jtag.tcl
+```cmd
+cd D:\Users\u\tmac-zynq-fpga\linux\boot
+C:\Xilinx\Vivado\2023.1\bin\bootgen.bat -image boot.bif -o BOOT.BIN -w
 ```
 
-Or standalone:
+`boot.bif` contents (FSBL path — SPL is **not** used):
 
-```powershell
-C:\Xilinx\Vivado\2023.1\bin\xsdb.bat D:\Users\u\tmac-zynq-fpga\vitis_linux\scripts\boot_linux_jtag.tcl
+```
+the_ROM_image:
+{
+    [bootloader] fsbl.elf
+    system_wrapper.bit
+    u-boot.elf
+}
 ```
 
-This loads the bitstream from `vitis_linux/workspace/z7_linux/hw/`, runs
-ps7_init, programs AFI (HP0), loads zImage/DTB/initramfs from
-`vitis_linux/prebuilt/` to DDR, and boots the kernel (r0=0 r1=~0 r2=dtb pc=zImage).
-
-Because this is a U-Boot-less hand boot, the kernel finds the initramfs through
-the DTB: `devicetree-jtag.dtb` (built by `patch_dtb_initrd.py`) carries
-`/chosen/linux,initrd-start/end` pointing at the raw gzipped cpio
-(`initramfs.cpio.gz`, no U-Boot legacy header) loaded at 0x03000000.
-Kernel console is on the USB-UART0 (the DTB `/chosen/bootargs` is empty, so the
-kernel uses the baked-in `CONFIG_CMDLINE=console=ttyPS0,115200 ...`). Open a
-115200 8N1 terminal (PuTTY) on the CH340 COM port to see it.
+The committed `fsbl.elf` is built from `matmul_bd.xsa` via the standard Vitis
+`platform create` + `platform generate` flow (see AGENTS.md Key Decision #23;
+two gating pitfalls documented there and in `docs/`).
 
 ---
 
-## Console: UART0 (default) vs JTAG DCC (removed)
+## U-Boot rebuild (only if the console/boot behavior changes)
 
-| Feature | UART0 (used) | DCC (removed) |
-|---------|--------------|---------------|
-| Hardware | CH340 USB-UART (works) | JTAG (Digilent HS-2) |
-| Speed | 115200 baud (~11 KB/s) | ~200-500 KB/s |
-| Console | `ttyPS0` (kernel) / U-Boot serial | `hvc0` |
-| Config | kernel `CONFIG_CMDLINE=console=ttyPS0,115200`; U-Boot `xilinx_zynq_virt_defconfig` with `CONFIG_DEFAULT_DEVICE_TREE="zynq-zc702"` (stdout-path=serial0 on UART0) | kernel `earlycon=dcc console=hvc0`; U-Boot `CONFIG_ARM_DCC=y` |
-| Capture | Serial terminal (PuTTY) | `readjtaguart -start` in XSDB |
+The committed `u-boot.elf` already has the UART0 console, `CONFIG_OF_EMBED=y`,
+`DEBUG_UART_ZYNQ` early output, and `CONFIG_SYS_L2CACHE_OFF=y` (the zc702 DTB
+routes `serial0` to UART0). To rebuild:
 
-The CH340 USB-UART works (UART0, MIO 14/15, 115200 8N1) — see AGENTS.md Key
-Decision #16 and `docs/infrastructure.md`. The DCC console was adopted on
-2026-07-30 while the UART was wrongly believed broken; it is capped (~544 B/session)
-and the `readjtaguart` drain dies after ~4 sessions, so it has been removed from
-the build. All console output is now on the USB-UART.
+```bash
+cd ~/u-boot-xlnx
+export CROSS_COMPILE=arm-linux-gnueabihf-
+make xilinx_zynq_virt_defconfig
+echo 'CONFIG_DEFAULT_DEVICE_TREE="zynq-zc702"' >> .config
+echo 'CONFIG_OF_EMBED=y' >> .config
+echo 'CONFIG_DEBUG_UART=y' >> .config
+echo 'CONFIG_DEBUG_UART_ZYNQ=y' >> .config
+echo 'CONFIG_DEBUG_UART_BASE=0xE0000000' >> .config
+echo 'CONFIG_DEBUG_UART_CLOCK=100000000' >> .config
+echo 'CONFIG_SYS_L2CACHE_OFF=y' >> .config
+make olddefconfig
+make -j$(nproc) u-boot
+cp u-boot ~/tmac-zynq-fpga/linux/boot/u-boot.elf
+```
+
+## About the DEBUG_LL kernel
+
+The committed `uImage` is built with `CONFIG_DEBUG_LL=y` + `EARLY_PRINTK=y` +
+`DEBUG_ZYNQ_UART0=y`. These make the kernel print to UART0 *before* the console
+driver exists — essential for diagnosing the 2026-08-11 "Starting kernel..."
+hang (which turned out to be a DTB problem, see `docs/z7lite-vs-zc702.md`).
+They are harmless at runtime; keep them on for future bring-up.
+
+## JTAG boot note
+
+`vitis_linux/scripts/boot_linux_jtag.tcl` (U-Boot-less hand boot) has **never
+been verified on hardware** — all bring-up was done via SD boot (either the SD
+auto-boot or U-Boot loaded over JTAG via `boot_kernel_via_uboot_jtag.tcl`).
+The `devicetree-jtag.dtb` + `initramfs.cpio.gz` artifacts are generated for it
+and kept consistent, but treat SD boot as the only proven path.

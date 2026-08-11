@@ -6,6 +6,12 @@
 # Flow: connect -> bitstream -> ps7_init (always, after power-cycle) -> AFI ->
 #       load zImage/dtb/initramfs -> boot kernel (r0=0 r1=~0 r2=dtb pc=zImage)
 #
+# NOTE (2026-08-11): this U-Boot-less hand boot has NEVER been verified to reach
+# a Linux shell on hardware. All successful kernel boots used the SD path (SD
+# auto-boot, or U-Boot loaded over JTAG via boot_kernel_via_uboot_jtag.tcl).
+# The artifacts it loads (devicetree-jtag.dtb + initramfs.cpio.gz) are kept
+# consistent, but treat SD boot as the only proven path.
+#
 # NOTES:
 # - A physical power-cycle is REQUIRED before ps7_init (PLL re-lock hang), and
 #   also clears a wedged CPU / DAP AP-error state from a prior crashed run.

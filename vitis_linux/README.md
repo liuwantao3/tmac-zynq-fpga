@@ -19,7 +19,7 @@ https://xilinx.github.io/Embedded-Design-Tutorials/docs/2023.1/build/html/docs/I
 
 | EDT step | Standard | Here |
 |----------|----------|------|
-| Linux images | PetaLinux → `BOOT.BIN` + `image.ub` + `boot.scr` | Prebuilt uImage/uramdisk/dtb from the Lima VM U-Boot/kernel build (functionally equivalent; JTAG boot instead of SD) |
+| Linux images | PetaLinux → `BOOT.BIN` + `image.ub` + `boot.scr` | Prebuilt uImage/uramdisk/dtb from the WSL U-Boot/kernel build (functionally equivalent; JTAG boot instead of SD) |
 | Linux domain | OS=Linux, Processor=`ps7_cortexa9` | Same (this processor name is mandatory for Linux domains) |
 | App | "Linux Hello World" template, SYSROOT optional | Same; built without external SYSROOT (Vitis ships the aarch32 Linux sysroot) |
 | Run app from GUI | Requires **TCF agent over Ethernet** + UART login | **Not possible on this board** — no Ethernet. Verified via JTAG + DDR markers instead |
@@ -37,7 +37,7 @@ https://xilinx.github.io/Embedded-Design-Tutorials/docs/2023.1/build/html/docs/I
    ~544 B/session and has been removed. For a GUI-verifiable serial flow on this
    same hardware, use the bare-metal workspace `../vitis_bm/` (Vitis GUI → Run
    As → Launch Hardware, console on UART0).
-3. **No SD reader on Windows** → SD-card boot images are built on the Lima VM.
+3. **SD-card boot images are built in WSL** (Ubuntu 24.04, see `../linux/README.md`).
 
 ## Open the workspace in the Vitis GUI
 
@@ -65,12 +65,17 @@ The board must be **power-cycled** first (PLL re-lock hang in ps7_init).
    CH340 COM port to watch it).
 4. Verify the kernel is alive: `pc` will have advanced, CLK_CNT keeps counting.
 
+> **NOTE:** this U-Boot-less hand boot has **never been verified on hardware** —
+> all successful Linux boots used the **SD boot** path (SD auto-boot, or U-Boot
+> loaded over JTAG via `scripts/boot_kernel_via_uboot_jtag.tcl`). Treat SD boot
+> as the only proven path; this script is kept as a bring-up fallback.
+
 ## Running hello_linux on the target
 
 The compiled ELF is at `workspace/hello_linux/Debug/hello_linux.elf` (dynamic,
 needs the rootfs libc). To actually execute it on Linux:
 
-- **On the Lima VM**: add `hello_linux.elf` to the BusyBox initramfs
+- **In WSL**: add `hello_linux.elf` to the BusyBox initramfs
   (`uramdisk.image.gz`) or the ext4 partition, then reboot. When it runs it
   writes:
   - `0x1F000000 = 0x4F4C4848` ("HLLO")

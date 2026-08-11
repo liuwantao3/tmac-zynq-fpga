@@ -128,24 +128,21 @@ docker/licenses/xilinx.lic
 gguf-tools-main/gguf-tools
 gguf-tools-main/*.o
 
-# Linux boot files (rebuilt on Mac by the user)
-linux/boot/*.elf
-# fsbl.elf is committed: it is only regenerated on Windows if the HW changes
-!linux/boot/fsbl.elf
-linux/boot/*.bin
-linux/boot/*.img
-linux/boot/uImage
-linux/boot/devicetree.dtb
-linux/boot/uramdisk.image.gz
-linux/boot/u-boot-spl.bin
+# Linux boot files. The verified-working SD boot artifacts are COMMITTED
+# (matching vitis_linux/prebuilt, which also tracks binaries). Only things
+# that are trivially regenerated are ignored:
+#   - BOOT.BIN        : fused from fsbl.elf + system_wrapper.bit + u-boot.elf
+#                       by Vivado bootgen.bat (from linux/boot/)
+#   - *.img, *.bin    : SPL/u-boot.img (not used; FSBL loads u-boot.elf)
+#   - u-boot-spl.bin  : not used in the FSBL boot path
+#   - zImage          : raw kernel (uImage is committed; zImage derives from it)
+#   - ps7_init*       : regenerated from matmul_bd.xsa by Vivado
+#   - fsbl_platform/  : XSCT platform build output
 linux/boot/BOOT.BIN
+linux/boot/*.img
+linux/boot/*.bin
+linux/boot/u-boot-spl.bin
 linux/boot/zImage
-linux/boot/boot.scr
-linux/boot/initramfs.cpio.gz
-linux/boot/devicetree-jtag.dtb
-linux/boot/fsbl_platform/
-linux/boot/fsbl_app/
-linux/boot/fsbl_app_system/
 linux/boot/ps7_init.c
 linux/boot/ps7_init.h
 linux/boot/ps7_init.tcl
@@ -153,6 +150,9 @@ linux/boot/ps7_init_gpl.c
 linux/boot/ps7_init_gpl.h
 linux/boot/matmul_bd.bit
 linux/boot/devicetree-new.dtb
+linux/boot/fsbl_platform/
+linux/boot/fsbl_app/
+linux/boot/fsbl_app_system/
 linux/boot/.metadata/
 linux/boot/.analytics
 

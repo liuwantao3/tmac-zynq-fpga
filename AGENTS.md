@@ -327,7 +327,7 @@ All 4 Q5_0 HP FSM tests now PASS (previously all 4 FAILED with X in acc). No mor
     
     **Result:** Q8 core BRAM drops from 17→8 (wmem only). Total system BRAM ~10 (Q8 8 + Q5_0 2). LUTRAM increases ~128 (smem) + 16 (act) = +144 LUTRAM (3.3% of 4,400 capacity, well within budget). All 123 core simulation tests PASS: Q8 6/6, Q4K 4/4, Q6_K 97/97, HP FSM 7/7, HP FSM Q5_0 9/9. INT16 smoke pre-existing fail (unrelated wmem addressing). Q5_0 standalone testbench pre-existing compile error (old port interface, not updated for per-block rewrite).
 
-## Current Status (2026-08-04) — All 10 comprehensive HW tests PASS + SD boot verified
+## Current Status (2026-08-11) — All 10 comprehensive HW tests PASS + Linux SD boot fully working
 
 | Resource | Used | Available | % | Notes |
 |----------|------|-----------|---|-------|
@@ -626,6 +626,16 @@ xsdb.bat vitis_bm\scripts\run_serial.tcl                   # headless serial tes
 # Boot Linux on HW from Vitis GUI XSCT console:
 source vitis_linux/scripts/boot_linux_jtag.tcl
 
+# Linux kernel + DTB + initramfs build (WSL Ubuntu 24.04 — see linux/README.md)
+wsl -d Ubuntu-24.04 -- bash /home/u/tmac-zynq-fpga/linux/build_wsl.sh
+#   Requires: arm-linux-gnueabihf-gcc, u-boot-tools, device-tree-compiler,
+#             busybox source (auto-downloaded), linux-xlnx clone.
+#   Outputs to linux/boot/: uImage, devicetree.dtb, devicetree-jtag.dtb,
+#             uramdisk.image.gz, initramfs.cpio.gz
+# SD card prep: copy BOOT.BIN + uImage + devicetree.dtb + uramdisk.image.gz
+#               + boot.scr + uEnv.txt + tmac (+ model.tmac) to FAT32 root.
+# Boot: J1=SD, power-cycle. U-Boot auto-runs boot.scr.
+
 # C++ integration test
 g++ -std=c++14 -O2 -I sim -I gguf -I . sim/test_integration.cpp -lpthread -o /tmp/ti
 /tmp/ti
@@ -698,7 +708,8 @@ python3 scripts/extract_tmac.py models/qwen2-0_5b-instruct-q4_k_m.gguf /tmp/mode
 - `verilog/DESIGN.md` — Architecture, timing
 - `docs/architecture.md` — Model, quantization formats
 - `docs/Q4_K_IMPLEMENTATION_PLAN.md` — Original plan (outdated, kept as archive)
-- `linux/README.md` — Linux-on-SD build guide (U-Boot + kernel on Lima VM)
+- `linux/README.md` — Linux-on-SD boot guide (WSL-only build + verified boot flow)
+- `docs/z7lite-vs-zc702.md` — Z7-Lite vs zc702 reference board hardware differences
 - `vitis_linux/README.md` — Vitis 2023.1 Linux platform + app workflow
 - `vitis_bm/README.md` — Vitis 2023.1 bare-metal workspace (UART serial console app)
 
@@ -920,6 +931,13 @@ mwr -force 0xF800900C 0x00000001  ;# read channel enable
 |---|---------|----------------|---------|
 | 25 | **devicetree-jtag.dtb for hand boot** | U-Boot-less JTAG boot (boot_linux_jtag.tcl) needs initramfs location → otherwise kernel panics with "no root". | Python FDT patcher bakes `/chosen/linux,initrd-start/end` into DTB copy. Raw gzipped cpio (strip mkimage header). |
 | 26 | Ethernet PHY errors on boot | Z7-Lite uses RTL8201F PHY, but zc702 DTB expects MARVELL PHY. Kernel prints "Failed to read eth PHY id". | Cosmetic only — no functional impact. Can be silenced by switching to a custom DTB matching the board's PHY. |
+| 29 | **"Starting kernel..." hang, no output** | Kernel died before the console driver; silent on UART. Multiple false suspects (load address, ramdisk). | Rebuild with `CONFIG_DEBUG_LL=y` + `DEBUG_ZYNQ_UART0` + `EARLY_PRINTK` → early serial reveals the true fault (it was the DTB, not the kernel). |
+| 30 | **SDHCI probe hang (`sdhci-pltfm`)** | zc702 `&sdhci0` pinctrl remuxed MIO 15 → sdio0_wp + MIO 0 → sdio0_cd. On Z7-Lite CD/WP are off and MIO 15 is UART0 RX. | Remove sdhci pinctrl; add `xlnx,has-cd/power/wp = <0>`. See `docs/z7lite-vs-zc702.md`. |
+| 31 | **Dead UART RX (prompt shows, no input)** | zc702 `gpio@e000a000` pinctrl remuxed MIO 14 (UART0 TX) → gpio0; `gpio-keys` used GPIO 14. U-Boot RX worked, kernel RX dead. | Remove GPIO node pinctrl; delete gpio-keys/leds nodes referencing MIO 14. Verify `devmem 0xE000002C` bit1 clears while typing. |
+| 32 | **`Failed to execute /init (error -8)` = ENOEXEC** | initramfs busybox was AArch64 (64-bit); Zynq-7010 is ARMv7 32-bit. | Rebuild busybox from source with `arm-linux-gnueabihf-gcc`, `CONFIG_STATIC=y`, `CONFIG_TC=n` (new kernel headers dropped `TCA_CBQ_*`). |
+| 33 | **Shell prompt but no keyboard input (initramfs)** | `/dev` dir empty in cpio → kernel can't open `/dev/console` for init → stdin=/dev/null. | Add `dev/console` (5,1), `dev/null` (1,3), `dev/tty` (5,0) to cpio via `gen_init_cpio` (no root needed). |
+| 34 | **`setsid: not found` → `Attempted to kill init!`** | busybox applets `setsid`/`cttyhack` had no `/bin` symlinks. | Add symlinks; run `setsid cttyhack sh` to give the shell its controlling tty (fixes "can't access tty; job control off"). |
+| 35 | **`boot.scr` loaded stale/hanging kernel** | auto-boot script referenced the old uImage; load address (0x00200000) differed from the proven 0x03000000. | Regenerate boot.scr from boot.cmd with `fatload uImage 0x03000000`; keep `uEnv.txt` `boot_targets=mmc0`. |
 
 ### SD Card
 
@@ -1011,60 +1029,56 @@ Three bugs fixed — see **Key Decision #5** above for details (q8_wt_din unregi
 - `vivado_integration/proj_bd/matmul_bd.runs/impl_1/system_wrapper.bit`: Synthesized bitstream (reordered PS7 config)
 - `D:/Users/u/workspace/tmac/Debug/tmac.elf`: Vitis ELF loaded by XSDB
 - `docs/debug_log.md`: Full debug history
-- `linux/README.md`: Linux-on-SD boot build guide (U-Boot + kernel on Lima VM; BOOT.BIN via buildroot bootgen — no Windows)
+- `linux/README.md`: Linux-on-SD boot build guide (WSL-only build + verified boot flow)
 - `linux/tmac_linux.c`: Linux userspace FPGA test program (uses /dev/mem mmap)
 - `linux/boot/boot.bif`: Bootgen config (FSBL + bitstream + U-Boot)
 - `linux/boot/system_wrapper.bit`: FPGA bitstream for Linux boot
-- `linux/setup_toolchain.sh`: Creates clang-based ARM cross-compiler wrappers for macOS
-- `linux/build_all.sh`: Full build script for U-Boot + kernel + initramfs (Lima VM)
-- `linux/clone_repos.sh`: Clones u-boot-xlnx + linux-xlnx + buildroot in parallel
+- `linux/build_wsl.sh`: WSL build of kernel + DTB + initramfs (reproduces the committed boot artifacts)
+- `linux/clone_repos.sh`: Clones u-boot-xlnx + linux-xlnx (WSL)
 
-## Linux-on-SD Card Boot ✅ BUILT (2026-07-18)
+## Linux-on-SD Card Boot ✅ VERIFIED (2026-08-11)
 
-U-Boot + Linux kernel + BusyBox initramfs + FPGA test program built in
-a Lima ARM64 Ubuntu VM on macOS. No macOS cross-compilation hacks needed.
+U-Boot + Linux kernel + BusyBox initramfs + FPGA test program, built **in
+Windows WSL (Ubuntu 24.04)** and booting **end-to-end on hardware**: BootROM →
+FSBL InitSD → PCAP bitstream → U-Boot (UART0 console) → distro boot → boot.scr
+→ bootm → Linux 6.6.0 → initramfs → interactive `/bin/sh` shell.
 
-**Build output at `~/arm-build/`:**
+**The verified-working boot artifacts are COMMITTED** in `linux/boot/` (and
+mirrored to `vitis_linux/prebuilt/`). Rebuild only when sources change.
 
 | File | Size | Description |
 |------|------|-------------|
-| `u-boot.img` | 1.2 MB | U-Boot image (loaded by SPL from SD FAT32) |
-| `u-boot-spl.bin` | 121 KB | SPL (in BOOT.BIN, runs from OCM) |
-| `uImage` | 4.6 MB | Linux 6.6.0-xilinx (CONFIG_DEVMEM=y) |
-| `devicetree.dtb` | 17 KB | zynq-zc702 (prebuilt in kernel tree) |
-| `devicetree-jtag.dtb` | 17 KB | Same DTB + `/chosen/linux,initrd-start/end` for the U-Boot-less JTAG boot |
-| `uramdisk.image.gz` | 1.3 MB | BusyBox initramfs (79 tools + tmac) |
-| `initramfs.cpio.gz` | 1.3 MB | Raw gzipped cpio (no U-Boot header) for the JTAG boot |
-| `tmac` | 483 KB | Static ARM32 (mmaps FPGA at 0x43C00000) |
+| `u-boot.elf` | 1,063,480 B | U-Boot, UART0 console, `CONFIG_OF_EMBED`, `DEBUG_UART_ZYNQ` |
+| `uImage` | 4,892,736 B | Linux 6.6.0-xilinx (debug build: `DEBUG_LL`+`EARLY_PRINTK`) |
+| `devicetree.dtb` | 16,619 B | **Z7-Lite patched** zc702 DTB (see `docs/z7lite-vs-zc702.md`) |
+| `devicetree-jtag.dtb` | 16,688 B | Z7-Lite DTB + `/chosen/linux,initrd-start/end` (JTAG hand-boot) |
+| `uramdisk.image.gz` | 1,327,882 B | U-Boot ramdisk (32-bit ARM static busybox initramfs) |
+| `initramfs.cpio.gz` | 1,327,818 B | raw gzipped cpio (JTAG hand-boot) |
+| `BOOT.BIN` | 3,168,704 B | FSBL + bitstream + U-Boot (fused by Vivado `bootgen.bat`) |
+| `fsbl.elf` | 437,552 B | SD-capable, `-DFSBL_DEBUG_INFO` |
+| `tmac` | 494,252 B | Static ARM32 (mmaps FPGA at 0x43C00000) |
 
-**Tools in initramfs:** devmem, hexdump, xxd, devmem, md5sum, vi, grep, awk,
-ifconfig, ping, wget, fdisk, mkfs.ext2, blkid, tar, modprobe, + BusyBox shell.
+**Tools in initramfs:** sh, mount, ls, cat, devmem, setsid, cttyhack, + busybox
+core set. `setsid cttyhack sh` gives the shell its controlling terminal.
 
 **Kernel:** CONFIG_DEVMEM=y — FPGA registers accessible via `/dev/mem`.
-Use `iomem=relaxed` bootarg if STRICT_DEVMEM blocks 0x43C00000 range.
+Bootargs `console=ttyPS0,115200 root=/dev/ram0 rw iomem=relaxed`.
 
-**To reproduce:** See `linux/README.md` for full build instructions.
-The Lima VM approach eliminates all macOS SDK conflicts — builds take
-~5 min for U-Boot + kernel, no patches needed.
+**To reproduce:** See `linux/README.md` + `linux/build_wsl.sh` (WSL-only).
 
-### Windows (Vivado) — bitstream/FSBL only; Mac — everything else
+### Windows — everything (Vivado + WSL); no Mac/Lima
 
-**Pre-built files** in `linux/boot/`:
-- `system_wrapper.bit` — FPGA bitstream (prebuilt)
-- `matmul_bd.xsa` — hardware handoff
-- `boot.bif` — bootgen config (FSBL + bitstream + U-Boot)
-- `boot.cmd` — U-Boot auto-boot script source (committed; `boot.scr` generated from it by `mkimage` in `linux/build_all.sh`)
-- `fsbl.elf` — **committed** (built from `matmul_bd.xsa`; regenerable via XSCT, at `vitis_linux/workspace/z7_linux/export/z7_linux/sw/z7_linux/boot/fsbl.elf`)
+- `linux/build_wsl.sh` — kernel + DTB + initramfs build (WSL)
+- `linux/clone_repos.sh` — clone linux-xlnx + u-boot-xlnx (WSL)
+- Vivado `bootgen.bat` — fuses `BOOT.BIN` from committed `fsbl.elf` +
+  `system_wrapper.bit` + `u-boot.elf`
+- `linux/build_fsbl.tcl` — regenerates `fsbl.elf` from `matmul_bd.xsa` (only if HW changes)
 
-**Mac steps** (user has an SD writer; SD boot is the primary path, JTAG hand-boot is the fallback):
-1. Build `u-boot.elf`, `uImage`, `devicetree.dtb`, `uramdisk.image.gz`, `boot.scr` via `linux/build_all.sh` in the Lima VM
-2. **`linux/build_all.sh` also runs `linux/build_bootbin.sh`** — builds Xilinx `bootgen` via buildroot's `host-bootgen` package (into `/tmp/arm-build/buildroot/output/host/bin/bootgen`) and fuses `BOOT.BIN` from the committed `fsbl.elf` + `system_wrapper.bit` + `u-boot.elf`. No Windows step needed for the SD flow.
-3. Format SD with `diskutil partitionDisk /dev/diskX MBR FAT32 SD_BOOT 128M FAT32 SD_DATA R` (two FAT32 partitions — no ext4 tools needed on macOS)
-4. Copy `BOOT.BIN` + `uImage` + `devicetree.dtb` + `uramdisk.image.gz` + `boot.scr` → FAT32 p1
-5. Copy `model.tmac` + `tmac` → FAT32 p2 (initramfs mounts `/dev/mmcblk0p2` on `/root`)
-6. **Power-cycle** board, insert SD, set boot mode jumper **J1** to SD, connect UART (115200 baud) — U-Boot distro boot (`CONFIG_DISTRO_DEFAULTS=y`) auto-runs `boot.scr`
+**SD card** (single FAT32 partition, label `SD_BOOT`):
+`BOOT.BIN`, `uImage`, `devicetree.dtb`, `uramdisk.image.gz`, `boot.scr`,
+`uEnv.txt` (`boot_targets=mmc0`), `tmac`, `model.tmac`.
 
-**Windows is only needed if the hardware changes:** rebuild `system_wrapper.bit` (Vivado) + `fsbl.elf` (XSCT), commit them, then re-run `build_bootbin.sh` on the Mac. Windows `bootgen.bat` (`C:\Xilinx\Vivado\2023.1\bin\bootgen.bat`) remains a working fallback.
+**Boot:** set jumper **J1** to SD, power-cycle. U-Boot auto-runs `boot.scr`.
 
 **U-Boot bootargs** for FPGA access:
 ```
@@ -1106,11 +1120,11 @@ Full workflow: `vitis_linux/README.md`.
 
 17. **vitis_bm — bare-metal Vitis GUI workspace (2026-07-31):** Created `vitis_bm/` — a Vitis 2023.1 bare-metal (standalone) workspace mirroring the reference MicroPhase `03_dma` project layout, so the GUI can Program-FPGA + run FSBL + run the app over JTAG with console on the USB-UART. The workspace IS `vitis_bm/` itself (like `03_dma/arm`); `build.tcl` regenerates the platform `z7_bm` (from `vitis_linux/matmul_bd.xsa`, `ps7_cortexa9_0`, standalone) + app `tmac_serial` (imports `vitis_bm/app/src/tmac_serial.c`). The app exercises both UART paths: direct xuartps register programming (identical to the fixed `uart_init()`) and the BSP `xil_printf` driver, then prints live FPGA registers (CLK_CNT/STATUS/DEBUG/Q8DBG) over AXI4-Lite and a 1 Hz tick loop. Verified headless: `xsct.bat build.tcl` → EXIT=0, `tmac_serial.elf` built, app disassembly shows correct UART registers (BAUDGEN=124, CR=0x14, FIFO=0x30). `scripts/run_serial.tcl` is the XSDB headless runner (loads `sw/uart_test.elf`). Added standalone `sw/uart_test.c` + `uart_test.elf` to the clang Makefile flow (serial smoke test without a model); removed dead `hp_baremetal.elf`/`test_int16.elf` Makefile targets whose sources were deleted in the cleanup. **Next increment: Linux** — migrate the kernel console from JTAG DCC capture to UART0 (ttyPS0): rebuilt kernel with `CONFIG_CMDLINE=console=ttyPS0,115200 ...` and U-Boot with stock defconfig (no DCC additions); `boot_linux_jtag.tcl` no longer captures via `readjtaguart` (see `linux/README.md`).
 
-18. **JTAG initrd mechanism — `devicetree-jtag.dtb` via `linux/patch_dtb_initrd.py` (2026-07-31):** The U-Boot-less hand boot (`boot_linux_jtag.tcl`) needs the initramfs to reach a login shell, and U-Boot `bootm` isn't in that path. Added a dependency-free Python FDT rewriter `linux/patch_dtb_initrd.py` that bakes `/chosen/linux,initrd-start/end` (u32 physical addresses) into a copy of `devicetree.dtb`, plus a raw gzipped cpio `initramfs.cpio.gz` (strips any 64-byte mkimage header if buildroot ever adds one). The kernel then locates the initrd loaded at 0x03000000 entirely from the DTB. Patch script validated: algorithm first prototyped in PowerShell and verified by re-walk + canonical prop diff (only the two new `/chosen` props differ among 557); then the shipped Python produced a **byte-identical** 17216-byte `devicetree-jtag.dtb` (SHA256 `E385FE92…`). `linux/build_all.sh` now generates both artifacts after buildroot and mirrors them to `vitis_linux/prebuilt/`; `boot_linux_jtag.tcl` loads `devicetree-jtag.dtb` + `initramfs.cpio.gz`. Console stays on ttyPS0 (`/chosen/bootargs` empty → baked-in `CONFIG_CMDLINE`). Note: the Python closure trap (`strings_new +=` inside `add_string` shadowed the outer name → `UnboundLocalError`) was fixed with `nonlocal`. Pending: Mac-side rebuild + on-hardware boot verification.
+18. **JTAG initrd mechanism — `devicetree-jtag.dtb` via `linux/patch_dtb_initrd.py` (2026-07-31):** The U-Boot-less hand boot (`boot_linux_jtag.tcl`) needs the initramfs to reach a login shell, and U-Boot `bootm` isn't in that path. Added a dependency-free Python FDT rewriter `linux/patch_dtb_initrd.py` that bakes `/chosen/linux,initrd-start/end` (u32 physical addresses) into a copy of `devicetree.dtb`, plus a raw gzipped cpio `initramfs.cpio.gz` (strips any 64-byte mkimage header if buildroot ever adds one). The kernel then locates the initrd loaded at 0x03000000 entirely from the DTB. Patch script validated: algorithm first prototyped in PowerShell and verified by re-walk + canonical prop diff (only the two new `/chosen` props differ among 557); then the shipped Python produced a **byte-identical** 17216-byte `devicetree-jtag.dtb` (SHA256 `E385FE92…`). `linux/build_all.sh` now generates both artifacts after buildroot and mirrors them to `vitis_linux/prebuilt/`; `boot_linux_jtag.tcl` loads `devicetree-jtag.dtb` + `initramfs.cpio.gz`. Console stays on ttyPS0 (`/chosen/bootargs` empty → baked-in `CONFIG_CMDLINE`). Note: the Python closure trap (`strings_new +=` inside `add_string` shadowed the outer name → `UnboundLocalError`) was fixed with `nonlocal`. **Status: the U-Boot-less JTAG boot was NEVER verified on hardware (see KD #26); SD boot is the only proven path — the artifacts are kept for consistency only.**
 
 19. **SD boot is primary — auto-run `boot.scr`, JTAG stays as fallback (2026-07-31):** User has an SD writer on the Mac, so the natural Zynq boot path is FSBL → U-Boot → `bootm` from SD (exactly what the MicroPhase reference repo assumes; `xilinx_zynq_virt_defconfig` has `CONFIG_DISTRO_DEFAULTS=y`, so U-Boot auto-runs `boot.scr` from the FAT32 partition — no interactive prompt). Added committed `linux/boot/boot.cmd` (the source; fatloads uImage@0x03000000, dtb@0x02A00000, uramdisk@0x02000000, then `bootm` — matching the README manual boot) and `linux/build_all.sh` now generates `boot.scr` from it with U-Boot's own `./tools/mkimage` (NOT kernel u-boot-tools) right after the U-Boot build. `.gitignore` covers `linux/boot/boot.scr` + the already-untracked `initramfs.cpio.gz`/`devicetree-jtag.dtb`. SD card is now two FAT32 partitions (p1 boot: BOOT.BIN/uImage/devicetree.dtb/uramdisk.image.gz/boot.scr; p2 data: model.tmac + tmac — vfat keeps macOS tools sufficient, no ext4 needed; the initramfs `mount /dev/mmcblk0p2 /root` auto-detects) written on the Mac with `diskutil partitionDisk /dev/diskX MBR FAT32 SD_BOOT 128M FAT32 SD_DATA R`. Boot mode jumper is **J1** (not a DIP). The JTAG initrd mechanism (#18) is kept as the bring-up fallback. Docs updated: `linux/README.md` (manual-flow mkimage step, corrected `boot.bif` contents — FSBL path `fsbl.elf`+`system_wrapper.bit`+`u-boot.elf`, not the stale SPL snippet), `AGENTS.md` SD section, `linux/build_all.sh` summary. **Mac-agent clarity:** `build_all.sh` is now host-agnostic (guards `HOSTCC=clang`/brew openssl and the `/tmp/arm-toolchain/elf.h` requirement behind `uname -s = Darwin`), so it runs in the Lima Ubuntu VM (apt gcc-arm-linux-gnueabihf) or on the macOS host (clang wrapper); the README opens with a step-by-step "Quickstart: automated build" (`clone` → `clone_repos.sh` → `build_all.sh` → artifact verification table → SD card prep) plus a note that `model.tmac` is NOT in the repo (gitignored, ask the user / copy from Windows `models/`).
 
-20. **BOOT.BIN produced on the Mac — buildroot `host-bootgen` (2026-07-31):** The last Windows-only step in the SD flow — fusing `BOOT.BIN` — was removed. Buildroot (already cloned by `clone_repos.sh`) ships a `host-bootgen` package (package `bootgen`, Xilinx/bootgen `xilinx_v2026.1`, deps host-openssl + host-pkgconf auto-built) that installs `bootgen` into `/tmp/arm-build/buildroot/output/host/bin/bootgen` via `make host-bootgen`. Added `linux/build_bootbin.sh`: builds bootgen via buildroot (fallback: direct clone of `Xilinx/bootgen` + `make LIBS=$(pkg-config --libs libssl libcrypto)`), then fuses `BOOT.BIN` from `fsbl.elf` + `system_wrapper.bit` + `u-boot.elf` using the committed `boot.bif` (`bootgen -image boot.bif -o BOOT.BIN -w`, run in `linux/boot/` so the relative BIF paths resolve — same invocation as the old Windows step). Committed `linux/boot/fsbl.elf` (227784 B, built from `matmul_bd.xsa` via the z7_linux workspace — un-ignored in `.gitignore` with a `!linux/boot/fsbl.elf` override); it only changes if the HW design does. `linux/build_all.sh` step [4/4] now calls `build_bootbin.sh`, so a single VM command produces `u-boot.elf` + `boot.scr` + `uImage` + dtb + initramfs **and** `BOOT.BIN`. README + AGENTS.md updated: the flow is now single-machine (Mac/Lima VM), Windows/Vivado only to rebuild bitstream/FSBL on HW changes; Windows `bootgen.bat` kept as a documented fallback. Note: `bootgen` on the Mac produces a Zynq-7000 image with the same `boot.bif` (FSBL path) — SPL is not used.
+20. **BOOT.BIN produced on the Mac — buildroot `host-bootgen` (2026-07-31, SUPERSEDED by #27):** The last Windows-only step in the SD flow — fusing `BOOT.BIN` — was removed. Buildroot (already cloned by `clone_repos.sh`) ships a `host-bootgen` package (package `bootgen`, Xilinx/bootgen `xilinx_v2026.1`, deps host-openssl + host-pkgconf auto-built) that installs `bootgen` into `/tmp/arm-build/buildroot/output/host/bin/bootgen` via `make host-bootgen`. Added `linux/build_bootbin.sh`: builds bootgen via buildroot (fallback: direct clone of `Xilinx/bootgen` + `make LIBS=$(pkg-config --libs libssl libcrypto)`), then fuses `BOOT.BIN` from `fsbl.elf` + `system_wrapper.bit` + `u-boot.elf` using the committed `boot.bif` (`bootgen -image boot.bif -o BOOT.BIN -w`, run in `linux/boot/` so the relative BIF paths resolve — same invocation as the old Windows step). Committed `linux/boot/fsbl.elf` (227784 B, built from `matmul_bd.xsa` via the z7_linux workspace — un-ignored in `.gitignore` with a `!linux/boot/fsbl.elf` override); it only changes if the HW design does. `linux/build_all.sh` step [4/4] now calls `build_bootbin.sh`, so a single VM command produces `u-boot.elf` + `boot.scr` + `uImage` + dtb + initramfs **and** `BOOT.BIN`. README + AGENTS.md updated: the flow is now single-machine (Mac/Lima VM), Windows/Vivado only to rebuild bitstream/FSBL on HW changes; Windows `bootgen.bat` kept as a documented fallback. Note: `bootgen` on the Mac produces a Zynq-7000 image with the same `boot.bif` (FSBL path) — SPL is not used.
 
 21. **U-Boot DTB switched to `zynq-zc702` + `CONFIG_OF_EMBED=y` + `CONFIG_DEBUG_UART_ZYNQ` (2026-07-31):** The stock `xilinx_zynq_virt_defconfig` uses `zynq-zc706` DTB by default, which routes the console to UART1 (MIO 48/49). The Z7-Lite board has the CH340 USB-UART on UART0 (MIO 14/15), so U-Boot with the zc706 DTB prints to a dead serial port — confirmed via JTAG: U-Boot loaded and started but produced no output on UART0, while a bare-metal test (`uart_test.elf`) and raw DAP FIFO writes both produced visible output on UART0. **Second bug:** `xilinx_zynq_virt_defconfig` uses `CONFIG_OF_SEPARATE`, so the DTB is a separate file and `u-boot.elf` has no device tree. Without the DTB the U-Boot driver model can't enumerate the serial port, so even with the zc702 switch the banner never prints (UART0 FIFO still works after boot — U-Boot simply never touches it). **Third bug:** Even with zc702 + OF_EMBED, the DTB-vs-hardware mismatch (ps7_init from Z7-Lite XSA vs. zc702 board DTB) can cause the driver model serial probe to fail silently. Fix: after `make xilinx_zynq_virt_defconfig`, `echo 'CONFIG_DEFAULT_DEVICE_TREE="zynq-zc702"' >> .config && echo 'CONFIG_OF_EMBED=y' >> .config && echo 'CONFIG_DEBUG_UART=y' >> .config && echo 'CONFIG_DEBUG_UART_ZYNQ=y' >> .config && echo 'CONFIG_DEBUG_UART_BASE=0xE0000000' >> .config && echo 'CONFIG_DEBUG_UART_CLOCK=100000000' >> .config && make olddefconfig` (1) switches to zc702 DTB for UART0/serial0 on MIO 14/15, (2) embeds it in the ELF, and (3) enables early boot output via DEBUG_UART_ZYNQ which writes directly to UART0 registers before the driver model initializes — no clocks, pinctrl, or DTB dependencies. **Fourth bug:** Even with DEBUG_UART enabled, `debug_uart_init` runs AFTER `initf_dm` in the init sequence, so the DM serial probe (which probes the zc702 UART via clock/reset/pinctrl drivers) hangs before debug output is reached. Fix: Python patch in `build_all.sh` inserts `debug_uart_init_wrap` (an `int`-returning wrapper around the `void` `debug_uart_init`) before `initf_dm,` in `common/board_f.c` via regex substitution, plus adds `#include <debug_uart.h>` to `board_f.c`, guaranteeing output before any DM init. (The Windows agent's original patch inserted `debug_uart_init,` directly, which fails to compile: `init_sequence_f` entries are `int (*)(void)` but `debug_uart_init` returns `void` — `-Werror=incompatible-pointer-types`. Fixed 2026-08-01 on the Mac side with the wrapper approach.) Applied to `linux/build_all.sh` (automated build) + `linux/README.md` (manual build section + console table). **Note: #21's console was still bound to UART1 — the DTS `serial0=uart0` reroute is the definitive fix in #22 (2026-08-02).**
 
@@ -1119,3 +1133,15 @@ Full workflow: `vitis_linux/README.md`.
 23. **SD-capable FSBL rebuild — the "official" build method is `platform create` + `platform generate` only (2026-08-04, gating):** The old `linux/boot/fsbl.elf` (227,784 B) had the SD boot path compiled OUT because it was built from a block design with `PCW_EN_SDIO0=0`. **Root cause at BD level:** our `matmul_bd` XSA lacked the SD0 config that the MicroPhase reference (`03_dma`) has. Fix chain: (1) added SDIO0 to `vivado_integration/build_bd.tcl` (`PCW_EN_SDIO0=1`, `PCW_SD0_PERIPHERAL_ENABLE=1`, `PCW_SD0_SD0_IO="MIO 40 .. 45"`, CD/WP off — matches `03_dma`), (2) rebuilt bitstream + XSA (write_hw_platform at line ~184; MIO 40-45 verified in generated ps7_init: `EMIT_MASKWRITE(0XF80007A0..B4, ..., 0x00001680)` = SDIO function 3), (3) rebuilt FSBL. **The correct, standard XSCT flow (proven by studying `03_dma/arm/platform_dma`):** do NOT hand-create an FSBL app on `standalone_domain` with `bsp setlib -name xilffs` — that BSP lacks the `sdps` driver and fails with `xsdps.h: No such file` when xilffs builds. Instead `platform create -name fsbl_platform -hw matmul_bd.xsa -proc ps7_cortexa9_0 -os standalone` auto-generates a **`zynq_fsbl` boot domain** (BSP `zynq_fsbl_bsp`, libs xilffs + xilrsa); a plain `platform generate` then auto-selects the **`sdps` driver** (bound to `ps7_sd_0`, version v4_1 in our install) from the SD-enabled hardware and builds the FSBL. Results: `fsbl_platform/zynq_fsbl/fsbl.elf` (437,552 B) contains `InitSD`/`SDAccess`/`f_mount`/`f_open` in `sd.o` and the SD branch is live because the guard `#if defined(XPAR_PS7_SD_0_S_AXI_BASEADDR) || defined(XPAR_XSDPS_0_BASEADDR)` (main.c:430) is now satisfied. **FSBL_DEBUG_INFO caveat:** `app config -name "zynq_fsbl"` FAILS (`zynq_fsbl` is a platform boot component, not a workspace app). To add debug output, edit `fsbl_platform/zynq_fsbl/Makefile` `CFLAGS := -DFSBL_DEBUG_INFO` and rebuild with `make_4.2.exe` (the `gnuwin` `make.exe` crashes with `0xc0000005` on the CMD `SHELL=command.com`; `make_4.2.exe` works when `SHELL` resolves to an sh.exe). New `linux/boot/fsbl.elf` (437,552 B) verified: strings `Boot mode is SD`, `Boot mode is JTAG`, `InitSD`, `BOOT.BIN` present. **BOOT.BIN rebuilt** (3,168,704 B, gitignored) from new `fsbl.elf` + new `system_wrapper.bit` (SHA256 `F5FC70B4...`, SD-config PS7) + `u-boot.elf` via `bootgen -image boot.bif -o BOOT.BIN -w` run in `linux/boot/`; first 8 bytes `FE FF FF EA` = ARM boot header, FSBL partition at offset ~0x11000. Note: the reference `03_dma` shipped FSBL has **no** FSBL_DEBUG either — debug output is optional (bring-up aid only). Next: JTAG-verify the FSBL takes the SD branch (`vitis_linux/scripts/debug_fsbl_sdmode_jtag.tcl`), then U-Boot `mmc list`/`fatls`, then flip the board to SD boot.
 
 24. **SD boot VERIFIED on hardware (2026-08-04):** After updating the SD card with the new BOOT.BIN (3,168,704 B, containing the SD-capable FSBL + new SD-config bitstream + U-Boot), the Z7-Lite board boots Linux from SD. Full chain: BootROM (MIO[8:6]=110 = SD mode) �� FSBL InitSD("BOOT.BIN") �� PCAP loads bitstream �� U-Boot loaded from SD �� U-Boot distro boot (oot.scr) �� Linux kernel 6.6.0 �� initramfs shell. Kernel output confirmed on CH340 USB-UART at 115200 8N1 (Ethernet PHY errors are cosmetic �� Z7-Lite's RTL8201F PHY doesn't match the zc702 DTB's MARVELL PHY). **FSBL frozen:** linux/boot/fsbl.elf = 437,552 B, built 2026-08-04 11:50 �� SD-capable with -DFSBL_DEBUG_INFO, strings Boot mode is SD, InitSD, BOOT.BIN, SDAccess, _mount, _open present. **U-Boot frozen:** linux/boot/u-boot.elf = 1,063,480 B (u-boot.img = 1,165,456 B), built 2026-08-02 16:26 �� UART0 console via zc702 DTB + DEBUG_UART_ZYNQ + DTS serial0=uart0 patch, CONFIG_OF_EMBED=y. **Bitstream frozen:** linux/boot/system_wrapper.bit = 2,083,850 B, SHA256 F5FC70B4DDB03540446A702D340828FC121D959CEAC566FE5BAB391BEFF2819 �� SD-config PS7 (MIO40-45 SDIO function 3 with pull-ups). **XSA frozen:** linux/boot/matmul_bd.xsa = 659,139 B �� PCW_EN_SDIO0=1, SD0 on MIO 40..45, CD/WP off. **BOOT.BIN** (3,168,704 B, gitignored) = fsbl.elf + system_wrapper.bit + u-boot.elf fused via ootgen -image boot.bif -o BOOT.BIN -w. **SD card:** single FAT32 partition, 8 files (BOOT.BIN + uImage + devicetree.dtb + uramdisk.image.gz + boot.scr + tmac + model.tmac). **Build pipeline:** (1) Vivado uild_bd.tcl �� XSA+bit, (2) XSCT platform create + platform generate �� auto SD-capable zynq_fsbl.elf, (3) optional make_4.2 -DFSBL_DEBUG_INFO for debug banner, (4) bootgen fuse oot.bif �� BOOT.BIN, (5) copy to FAT32 SD card. **JTAG debug breakpoints** (valid for current FSBL): InitSD=0x3908, FsblFallback=0x16A4, FsblHookFallback=0x5AC �� addresses stable across builds (lscript.ld places FSBL app code at fixed offsets). BootModeReg (0xF800025C) reads 0x05 (SD) on this board.
+
+25. **Linux kernel + DTB + initramfs rebuilt in WSL; SD boot now reaches interactive shell (2026-08-11):** The previously-committed kernel ("Starting kernel..." hang), DTB (SDHCI/UART broken) and initramfs (AArch64 busybox) were all rebuilt/fixed in WSL and the SD boot now runs end-to-end to an interactive `~ #` shell with working keyboard input. Three independent root causes, each fixed:
+    - **DTB (SDHCI hang):** zc702 `&sdhci0` carried a CD/WP pinctrl that remuxed MIO 15 �� sdio0_wp + MIO 0 �� sdio0_cd; SDHCI probe hung at `sdhci-pltfm`. Fixed with `xlnx,has-cd/power/wp = <0>` (matching `smir-top.dts`).
+    - **DTB (dead UART RX):** zc702 `gpio@e000a000` pinctrl remuxed MIO 14 (UART0 TX) �� gpio0, and `gpio-keys` used GPIO 14. Shell showed `~ #` but keyboard input did nothing. Fixed by removing the GPIO pinctrl + deleting gpio-keys/leds nodes.
+    - **initramfs (3 bugs):** (a) stock buildroot busybox was AArch64 �� `Failed to execute /init (error -8)`; rebuilt 32-bit static busybox from source. (b) empty `/dev` in cpio �� no `/dev/console` �� stdin=/dev/null (shell prompt, no input); added dev nodes via `gen_init_cpio`. (c) missing `setsid`/`cttyhack` applet symlinks �� `Attempted to kill init!`; added them and use `setsid cttyhack sh`.
+    New WSL build script `linux/build_wsl.sh` reproduces kernel+DTB+initramfs. Full delta documented in `docs/z7lite-vs-zc702.md`.
+
+26. **All Linux boot verification was via SD �� direct JTAG hand-boot NEVER verified (2026-08-11):** Audit confirmed `vitis_linux/scripts/boot_linux_jtag.tcl` (U-Boot-less r0/r1/r2/pc hand-boot) was never run to a login shell on hardware �� KD #18's "Pending: Mac-side rebuild + on-hardware boot verification" was never completed. Every successful kernel boot used the SD path (SD auto-boot, or U-Boot loaded over JTAG via `boot_kernel_via_uboot_jtag.tcl` then SD distro boot). The `devicetree-jtag.dtb` + `initramfs.cpio.gz` artifacts are generated for the JTAG path and kept consistent, but SD boot is the only verified boot path.
+
+27. **Lima/macOS build flow removed �� Windows WSL is the only build environment (2026-08-11):** Deleted `linux/build_all.sh` (Lima host-agnostic), `linux/build_bootbin.sh` (Lima bootgen), `linux/setup_toolchain.sh` (macOS clang wrappers). `clone_repos.sh` rewritten for WSL (clones linux-xlnx + u-boot-xlnx; no buildroot �� initramfs is a busybox source build). `linux/README.md` + AGENTS.md rewritten for the WSL-only flow. `BOOT.BIN` is now fused by Vivado `bootgen.bat` from the committed `fsbl.elf` + `system_wrapper.bit` + `u-boot.elf`.
+
+28. **Verified boot artifacts are now committed (2026-08-11):** `linux/boot/` previously ignored `uImage`/`devicetree.dtb`/`uramdisk.image.gz`/`boot.scr`/`u-boot.elf` as "rebuilt on Mac". Since the WSL build is the only environment and the artifacts are verified, they are now committed (consistent with `vitis_linux/prebuilt/` which always tracked binaries). `.gitignore` updated: only truly-regenerable files stay ignored (`BOOT.BIN`, `*.img`, `*.bin`, `u-boot-spl.bin`, `zImage`, `ps7_init*`, `fsbl_platform/`).

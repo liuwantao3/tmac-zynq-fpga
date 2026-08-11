@@ -1,41 +1,36 @@
 #!/bin/bash
-# Clone all required repos for Linux-on-SD boot build
+# Clone the Linux kernel + U-Boot sources needed to rebuild the Z7-Lite
+# SD-boot artifacts inside WSL (see linux/build_wsl.sh). No buildroot — the
+# initramfs is assembled from a busybox source build + gen_init_cpio.
 # Usage: bash linux/clone_repos.sh [workdir]
-# Default workdir: /tmp/arm-build
+# Default workdir: /home/u  (the WSL user home)
 
 set -euo pipefail
 
-WORKDIR="${1:-/tmp/arm-build}"
+WORKDIR="${1:-/home/u}"
 mkdir -p "$WORKDIR"
 cd "$WORKDIR"
 
-echo "=== Cloning Linux kernel (Xilinx, ~1.5GB shallow) ==="
-git clone --depth=1 --single-branch --branch xilinx-v2024.1 \
-    https://github.com/Xilinx/linux-xlnx.git "$WORKDIR/linux-xlnx" &
-PID_KERNEL=$!
+echo "=== Cloning Linux kernel (Xilinx, shallow) ==="
+if [ ! -d linux-xlnx ]; then
+    git clone --depth=1 --single-branch --branch xilinx-v2024.1 \
+        https://github.com/Xilinx/linux-xlnx.git "$WORKDIR/linux-xlnx"
+else
+    echo "  linux-xlnx already present"
+fi
 
-echo "=== Cloning U-Boot (Xilinx, ~200MB shallow) ==="
-git clone --depth=1 --single-branch --branch xilinx-v2022.1 \
-    https://github.com/Xilinx/u-boot-xlnx.git "$WORKDIR/u-boot-xlnx" &
-PID_UBOOT=$!
-
-echo "=== Cloning Buildroot (~100MB shallow) ==="
-git clone --depth=1 \
-    https://github.com/buildroot/buildroot.git "$WORKDIR/buildroot" &
-PID_BR=$!
-
-echo ""
-echo "Downloads running in parallel (PIDs: kernel=$PID_KERNEL u-boot=$PID_UBOOT buildroot=$PID_BR)"
-echo "Waiting for completion..."
-
-wait $PID_KERNEL && echo "  ✓ linux-xlnx cloned" || echo "  ✗ linux-xlnx FAILED"
-wait $PID_UBOOT  && echo "  ✓ u-boot-xlnx cloned"  || echo "  ✗ u-boot-xlnx FAILED"
-wait $PID_BR     && echo "  ✓ buildroot cloned"    || echo "  ✗ buildroot FAILED"
+echo "=== Cloning U-Boot (Xilinx, shallow — only for its tools/mkimage + dts) ==="
+if [ ! -d u-boot-xlnx ]; then
+    git clone --depth=1 --single-branch --branch xilinx-v2022.1 \
+        https://github.com/Xilinx/u-boot-xlnx.git "$WORKDIR/u-boot-xlnx"
+else
+    echo "  u-boot-xlnx already present"
+fi
 
 echo ""
-echo "=== Repo sizes ==="
-du -sh "$WORKDIR"/linux-xlnx "$WORKDIR"/u-boot-xlnx "$WORKDIR"/buildroot 2>/dev/null
-
+echo "=== Package deps (Ubuntu 24.04 WSL) ==="
+echo "  sudo apt install gcc-arm-linux-gnueabihf build-essential bison flex bc"
+echo "    libssl-dev libelf-dev u-boot-tools device-tree-compiler cpio wget"
 echo ""
-echo "All repos in: $WORKDIR"
-echo "Next: run linux/build_all.sh"
+echo "All sources in: $WORKDIR"
+echo "Next: bash linux/build_wsl.sh"
