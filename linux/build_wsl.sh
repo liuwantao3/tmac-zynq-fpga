@@ -236,4 +236,11 @@ cp "$LINUX_DIR/arch/arm/boot/zImage" "$BOOT_DIR/zImage"
 
 echo ""
 echo "=== Done. Boot artifacts in $BOOT_DIR: ==="
-ls -la "$BOOT_DIR"/{uImage,zImage,devicetree.dtb,devicetree-jtag.dtb,uramdisk.image.gz,initramfs.cpio.gz} 2>/dev/null
+ls -la "$BOOT_DIR"/{uImage,zImage,devicetree.dtb,devicetree-jtag.dtb,uramdisk.image.gz,initramfs.cpio.gz,tmac-debug} 2>/dev/null
+echo ""
+echo "To load a rebuilt tmac-debug onto a running board via JTAG (no SD swap):"
+echo "  xsdb.bat linux/scripts/load_tmac_jtag.tcl"
+echo "  # then on the board UART:"
+echo "  dd if=/dev/mem of=/root/tmac-debug bs=4096 skip=519680 count=$(python3 -c \"import os; f=os.path.getsize('$BOOT_DIR/tmac-debug'); print((f+4095)//4096)\" 2>/dev/null || echo 115)"
+echo "  chmod +x /root/tmac-debug"
+echo "  /root/tmac-debug --selftest"

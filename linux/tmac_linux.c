@@ -96,6 +96,13 @@ typedef struct {
 static Tensor* g_tensors = NULL;
 static int g_ntensors = 0;
 
+static Tensor* get_tensor(const char* name); /* fwd decl (used by load_model) */
+
+/* --cpu flag: force the pure-CPU matmul path for A/B comparison */
+static int g_use_cpu = 0;
+/* --compare flag: run BOTH CPU + FPGA paths per matmul and print the diff */
+static int g_compare = 0;
+
 /* F32 scratch for forward_layer (avoids stack overflow) */
 static float* g_scratch = NULL;
 
@@ -105,6 +112,21 @@ static float g_kcache[NUM_LAYERS][MAX_SEQ_LEN][K_DIM];
 static float g_vcache[NUM_LAYERS][MAX_SEQ_LEN][V_DIM];
 
 // ===== /dev/mem Access =====
+#include <sys/syscall.h>   /* cacheflush syscall (ARM) */
+
+/* Flush/invalidate a DDR range so the PL (FPGA) sees CPU writes and the CPU
+ * sees PL writes. /dev/mem on ARM maps DDR cacheable; without this the CPU
+ * writes sit in L1/L2 (PL reads stale DDR -> garbage/zeros) and result reads
+ * return stale cache. ARM cacheflush syscall: cacheflush(addr, end, flags)
+ * CACHEFLUSH_DL1=1 flush (clean+invalidate) dcache, CACHEFLUSH_DL2=2,
+ * CACHEFLUSH_DI=4 flush icache. NOTE flags=0 does NOTHING on ARM. */
+#define CACHEFLUSH_DL1 1
+static inline void dcache_range(void* addr, size_t size) {
+    syscall(__ARM_NR_cacheflush, (long)addr, (long)addr + size, CACHEFLUSH_DL1);
+}
+static inline void dcache_flush(void* addr, size_t size) { dcache_range(addr, size); }
+static inline void dcache_inval(void* addr, size_t size) { dcache_range(addr, size); }
+
 static volatile uint32_t* map_mem(uint32_t base, size_t size) {
     int fd = open("/dev/mem", O_RDWR | O_SYNC);
     if (fd < 0) { perror("/dev/mem"); return NULL; }
@@ -113,6 +135,27 @@ static volatile uint32_t* map_mem(uint32_t base, size_t size) {
     close(fd);
     if (p == MAP_FAILED) { perror("mmap"); return NULL; }
     return p;
+}
+
+/* DDR window used by the FPGA chain (weights/acts/descriptors/results).
+ * Under Linux the MMU is ON, so physical DDR addresses MUST be mapped via
+ * /dev/mem before dereferencing them — the original code dereferenced the
+ * raw physical constants as virtual pointers, which segfaulted immediately. */
+#define DDR_MAP_BASE 0x1F000000UL
+#define DDR_MAP_SIZE 0x40000UL   /* 256 KB covers OUTPUT_BUF..FPGA_WEIGHT_REFMT+stride */
+static volatile uint32_t* g_ddr = NULL;   /* mapped virtual base */
+
+static int map_ddr(void) {
+    g_ddr = map_mem(DDR_MAP_BASE, DDR_MAP_SIZE);
+    if (!g_ddr) { fprintf(stderr, "Failed to map DDR window 0x%08lx\n", (unsigned long)DDR_MAP_BASE); return -1; }
+    printf("DDR window mapped: 0x%08lx +%lu -> %p\n", (unsigned long)DDR_MAP_BASE,
+           (unsigned long)DDR_MAP_SIZE, (void*)g_ddr);
+    return 0;
+}
+
+/* translate a physical DDR address to its mapped virtual address */
+static inline void* ddr(uint32_t phys) {
+    return (void*)((uintptr_t)g_ddr + (phys - DDR_MAP_BASE));
 }
 
 static inline uint32_t reg_read(int off) { return g_gp0[off/4]; }
@@ -183,7 +226,11 @@ static float dequant(const Tensor* t, uint64_t idx) {
         uint32_t qh = *(uint32_t*)(d+bo+2);
         uint64_t j = (idx%32) < 16 ? (idx%32) : (idx%32)-16;
         uint8_t ql = ((idx%32) < 16) ? (d[bo+6+j]&0xF) : (d[bo+6+j]>>4);
-        return d_val * (float)((((qh>>(idx%32))&1)<<4)|ql - 16);
+        /* NOTE: `- 16` applies to the FULL (qh_bit<<4)|ql value. The original
+         * `...|ql - 16` parsed as `...|(ql-16)` (precedence bug), corrupting
+         * every Q5_0 value with the qh bit set. Matches sim/tmac_gguf.cpp:322. */
+        int q = (int)((((qh>>(idx%32))&1)<<4) | ql) - 16;
+        return d_val * (float)q;
     }
     if (t->type == TENSOR_Q6_K) {
         uint64_t bo = (idx/256)*210;
@@ -193,7 +240,9 @@ static float dequant(const Tensor* t, uint64_t idx) {
         int lo = half*64 + l + (sub%2)*32;
         int ql = (d[lo]>>((sub<2)?0:4)) & 0xF;
         int qh = (d[128+half*32+l]>>(sub*2)) & 3;
-        return super * (float)(int8_t)d[192+half*8+(l/16)+sub*2] * (float)((qh<<4)|ql-32);
+        /* `-32` applies to the FULL (qh<<4)|ql value (fixes | vs - precedence) */
+        int q = (int)((qh<<4)|ql) - 32;
+        return super * (float)(int8_t)d[192+half*8+(l/16)+sub*2] * (float)q;
     }
     if (t->type == TENSOR_Q4_K) {
         uint64_t bo = (idx/256)*144;
@@ -227,6 +276,7 @@ static void desc_write(Descriptor* d, uint32_t next, uint32_t wt, uint32_t act,
 }
 
 static int chain_run(uint32_t base, int ndesc) {
+    dcache_flush(ddr(base), 32);
     reg_write(REG_DESC_BASE, base);
     reg_write(REG_DESC_TAIL, 1);
     __sync_synchronize();
@@ -236,8 +286,8 @@ static int chain_run(uint32_t base, int ndesc) {
         if (!(reg_read(REG_STATUS) & 0x8000)) return 0;
         for (volatile int i = 0; i < 10; i++);
     }
-    fprintf(stderr, "TIMEOUT: DEBUG=0x%08x Q8=0x%08x\n",
-            reg_read(REG_DEBUG), reg_read(REG_Q8_DEBUG));
+    fprintf(stderr, "TIMEOUT: STATUS=0x%08x DEBUG=0x%08x\n",
+            reg_read(REG_STATUS), reg_read(REG_DEBUG));
     return -1;
 }
 
@@ -287,7 +337,7 @@ static int q5_preprocess_tile(const Tensor* A, int row0, uint32_t wt_addr, float
 
     for (int bi = 0; bi < Q5_TILE_BLOCKS; bi++) {
         int group = bi / 28, blk_in_row = bi % 28;
-        uint8_t* blk = (uint8_t*)(uintptr_t)(wt_addr + bi * Q5_BLOCK_SIZE);
+        uint8_t* blk = (uint8_t*)ddr(wt_addr + bi * Q5_BLOCK_SIZE);
         for (int c = 0; c < 2; c++) {
             int mr = row0 + group + c * 2;
             if (mr < (int)A->rows) {
@@ -315,7 +365,7 @@ static int q5_preprocess_tile(const Tensor* A, int row0, uint32_t wt_addr, float
         ri[r] = (m < 1e-10f) ? 1.0f : 32767.0f / m;
     }
     for (int r = 0; r < 4; r++) {
-        *(uint16_t*)(uintptr_t)(wt_addr + Q5_TILE_NORM_OFFSET + r*2) =
+        *(uint16_t*)ddr(wt_addr + Q5_TILE_NORM_OFFSET + r*2) =
             (uint16_t)(ri[r < nrows ? r : 0] * 256.0f + 0.5f);
     }
     return nrows;
@@ -338,20 +388,25 @@ static float quantize(const float* x, int16_t* xq, int n) {
 static int fpga_q8_tile(const uint8_t* wt, const int16_t* xq, float* y,
     int row0, float x_scale, int nrows)
 {
-    memcpy((void*)(uintptr_t)FPGA_WEIGHT_REFMT, wt, Q8_TILE_STRIDE);
-    memcpy((void*)(uintptr_t)FPGA_WEIGHT_REFMT, xq, Q8_TILE_COLS*2);
+    memcpy(ddr(FPGA_WEIGHT_REFMT), wt, Q8_TILE_STRIDE);
+    memcpy(ddr(FPGA_WEIGHT_REFMT + Q8_TILE_STRIDE), xq, Q8_TILE_COLS*2);
+    dcache_flush(ddr(FPGA_WEIGHT_REFMT), Q8_TILE_STRIDE + Q8_TILE_COLS*2);
 
-    Descriptor* d = (Descriptor*)(uintptr_t)DESC_CHAIN_BASE;
+    Descriptor* d = (Descriptor*)ddr(DESC_CHAIN_BASE);
     desc_write(d, 0, FPGA_WEIGHT_REFMT, FPGA_WEIGHT_REFMT+Q8_TILE_STRIDE,
                FPGA_WEIGHT_REFMT+Q8_TILE_STRIDE+0x10000, DESC_Q8,
                Q8_NUM_GROUPS, 1, Q8_TILE_COLS*2);
 
     if (chain_run(DESC_CHAIN_BASE, 1) < 0) return -1;
 
-    uint32_t* r = (uint32_t*)(uintptr_t)(FPGA_WEIGHT_REFMT+Q8_TILE_STRIDE+0x10000);
+    uint32_t* r = (uint32_t*)ddr(FPGA_WEIGHT_REFMT+Q8_TILE_STRIDE+0x10000);
+    dcache_inval(r, nrows*8);
     for (int i=0; i<nrows; i++) {
         uint64_t raw = (uint64_t)r[i*2] | ((uint64_t)r[i*2+1]<<32);
         if (raw & (1ULL<<47)) raw |= 0xFFFF000000000000ULL;
+        if (g_compare && i == 0 && row0 == 0)
+            printf("    [q8 r0=%d] acc=%lld  xs=%.6f\n",
+                   row0, (long long)(int64_t)raw, (double)x_scale);
         y[row0+i] += (float)(int32_t)(int64_t)raw * x_scale;
     }
     return 0;
@@ -362,20 +417,25 @@ static int fpga_q5_tile(const Tensor* A, int row0, const int16_t* xq,
 {
     float ri[4];
     uint32_t wt = FPGA_WEIGHT_REFMT;
+    uint32_t res = 0x1F003000;  /* known-working address (proven by CPU_OP selftest) */
     int nrows = q5_preprocess_tile(A, row0, wt, ri);
-    memcpy((void*)(uintptr_t)(wt+Q5_TILE_TOTAL), xq, (int)A->cols*2);
+    memcpy(ddr(wt+Q5_TILE_TOTAL), xq, (int)A->cols*2);
+    dcache_flush(ddr(wt), Q5_TILE_TOTAL + (int)A->cols*2);
 
-    Descriptor* d = (Descriptor*)(uintptr_t)DESC_CHAIN_BASE;
-    desc_write(d, 0, wt, wt+Q5_TILE_TOTAL, wt+Q5_TILE_TOTAL+0x800,
-               DESC_Q5_0, 0, 1, (int)A->cols*2);
+    Descriptor* d = (Descriptor*)ddr(DESC_CHAIN_BASE);
+    desc_write(d, 0, wt, wt+Q5_TILE_TOTAL, res, DESC_Q5_0, 0, 1, (int)A->cols*2);
 
     if (chain_run(DESC_CHAIN_BASE, 1) < 0) return -1;
 
-    uint32_t* r = (uint32_t*)(uintptr_t)(wt+Q5_TILE_TOTAL+0x800);
+    uint32_t* r = (uint32_t*)ddr(res);
+    dcache_inval(r, nrows*8);
     for (int i=0; i<nrows; i++) {
         uint64_t raw = (uint64_t)r[i*2] | ((uint64_t)r[i*2+1]<<32);
         if (raw & (1ULL<<47)) raw |= 0xFFFF000000000000ULL;
-        y[row0+i] += (float)(int32_t)(int64_t)raw * x_scale / ri[i];
+        if (g_compare && i == 0 && row0 == 0)
+            printf("    [q5 r0=%d] acc=%lld  xs=%.6f  ri=%.1f\n",
+                   row0, (long long)(int64_t)raw, (double)x_scale, (double)ri[i]);
+        y[row0+i] += (float)(int32_t)(int64_t)raw * x_scale / (256.0f * ri[i]);
     }
     return 0;
 }
@@ -390,7 +450,8 @@ static void cpu_matmul(const Tensor* A, const float* x, float* y, int rows, int 
     }
 }
 
-static void matmul(const Tensor* A, const float* x, float* y, int rows, int cols) {
+/* one matmul via the FPGA core (or CPU for Q6_K/Q4_K/cols>2048) */
+static void matmul_impl(const Tensor* A, const float* x, float* y, int rows, int cols) {
     int16_t xq[2048];
     if (cols > 2048) { cpu_matmul(A,x,y,rows,cols); return; }
     float xs = quantize(x, xq, cols);
@@ -399,14 +460,41 @@ static void matmul(const Tensor* A, const float* x, float* y, int rows, int cols
     if (A->type == TENSOR_Q8_0) {
         for (int r0=0; r0<rows; r0+=Q8_TILE_ROWS) {
             int nr = (rows-r0 < Q8_TILE_ROWS) ? rows-r0 : Q8_TILE_ROWS;
-            q8_preprocess_tile(A, r0, (uint8_t*)(uintptr_t)FPGA_WEIGHT_REFMT);
-            fpga_q8_tile((uint8_t*)(uintptr_t)FPGA_WEIGHT_REFMT, xq, y, r0, xs, nr);
+            q8_preprocess_tile(A, r0, (uint8_t*)ddr(FPGA_WEIGHT_REFMT));
+            fpga_q8_tile((uint8_t*)ddr(FPGA_WEIGHT_REFMT), xq, y, r0, xs, nr);
         }
     } else if (A->type == TENSOR_Q5_0) {
         for (int r0=0; r0<rows; r0+=Q5_TILE_ROWS) fpga_q5_tile(A, r0, xq, y, xs);
     } else {
         cpu_matmul(A, x, y, rows, cols);
     }
+}
+
+static void matmul(const Tensor* A, const float* x, float* y, int rows, int cols) {
+    if (g_compare) {
+        /* run both paths into separate buffers and report the difference */
+        static float y_cpu[16384];  /* enough for INTER_DIM 4864 */
+        static float y_fpga[16384];
+        matmul_impl(A, x, y_fpga, rows, cols);   /* FPGA path */
+        cpu_matmul(A, x, y_cpu, rows, cols);     /* CPU reference */
+        float md = 0;
+        for (int i = 0; i < rows; i++) {
+            float d = y_fpga[i] - y_cpu[i]; if (d < 0) d = -d;
+            if (d > md) md = d;
+        }
+        printf("  cmp %-28s %5dx%-5d %-6s cpu[0]=%12.4f fpga[0]=%12.4f maxdiff=%12.5f\n",
+               A->name, rows, cols,
+               (cols > 2048 || (A->type!=TENSOR_Q8_0 && A->type!=TENSOR_Q5_0)) ? "cpu" : "fpga",
+               y_cpu[0], y_fpga[0], md);
+        memcpy(y, y_fpga, rows*4);   /* keep FPGA result for downstream */
+        return;
+    }
+    if (g_use_cpu) {
+        /* --cpu: pure-CPU fallback for A/B comparison */
+        cpu_matmul(A, x, y, rows, cols);
+        return;
+    }
+    matmul_impl(A, x, y, rows, cols);
 }
 
 // ===== CPU Ops =====
@@ -478,18 +566,20 @@ static void forward_layer(float* hidden, int layer, int pos) {
     float* safe = hidden; /* used for original_hidden (small, OK on stack) */
     float orig_hid[HIDDEN_DIM];
     memcpy(orig_hid, hidden, HIDDEN_DIM*4);
-
-    float* norm_out = scratch;
-    float* qv = scratch;
-    float* kv = scratch + 896;
-    float* vv = scratch + 1024;
-    float* ctx = scratch;
-    float* attn_out = scratch;
-    float* fnorm = scratch;
-    float* gate = scratch;
-    float* up = scratch + 5000;
-    float* fout = scratch;
-    (void)fout;
+    /* Distinct scratch regions (g_scratch is 65536 floats = 256 KB).
+     * WARNING: the original code aliased norm_out/qv/ctx/attn_out/fnorm/gate
+     * all at scratch[0], so each stage overwrote the previous input/output —
+     * that collapsed the hidden state and every logit became equal (token 0). */
+    float* norm_out = scratch;              /* 0        .. 896   */
+    float* qv       = scratch + 1024;       /* 1024     .. 1920  */
+    float* kv       = scratch + 2048;       /* 2048     .. 2176  */
+    float* vv       = scratch + 2304;       /* 2304     .. 2432  */
+    float* ctx      = scratch + 2560;       /* 2560     .. 3456  */
+    float* attn_out = scratch + 3584;       /* 3584     .. 4480  */
+    float* fnorm    = scratch + 4608;       /* 4608     .. 5504  */
+    float* gate     = scratch + 5632;       /* 5632     .. 10496 */
+    float* up       = scratch + 10752;      /* 10752    .. 15616 */
+    float* fout     = scratch + 15872;      /* 15872    .. 16768 */
 
     /* Attn norm */
     if ((t = get_tensor((fmt_name(name,layer,"attn_norm.weight"),name))))
@@ -538,8 +628,8 @@ static void forward_layer(float* hidden, int layer, int pos) {
     for (int i=0;i<INTER_DIM;i++) gate[i] *= up[i];
 
     if ((t = get_tensor((fmt_name(name,layer,"ffn_down.weight"),name))))
-        matmul(t, gate, scratch, HIDDEN_DIM, INTER_DIM); // reuse scratch as fout
-    for (int i=0;i<HIDDEN_DIM;i++) hidden[i] += scratch[i];
+        matmul(t, gate, fout, HIDDEN_DIM, INTER_DIM);
+    for (int i=0;i<HIDDEN_DIM;i++) hidden[i] += fout[i];
 }
 
 // ===== Inference Loop =====
@@ -605,8 +695,31 @@ static int run_inference(const int* prompt, int np) {
 int main(int argc, char** argv) {
     printf("T-MAC Linux Inference\n");
 
+    /* --cpu flag: run every matmul on the CPU (no FPGA) for A/B comparison */
+    /* --compare flag: run both CPU+FPGA per matmul and print the diff */
+    /* --selftest: minimal CPU_OP DDR copy (isolates PL DDR path from compute) */
+    const char* model_path = NULL;
+    int prompt_token = 151646;
+    int do_selftest = 0;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--cpu") == 0) {
+            g_use_cpu = 1;
+        } else if (strcmp(argv[i], "--compare") == 0) {
+            g_compare = 1;
+        } else if (strcmp(argv[i], "--selftest") == 0) {
+            do_selftest = 1;
+        } else if (model_path == NULL) {
+            model_path = argv[i];          /* first non-flag arg = model */
+        } else {
+            prompt_token = atoi(argv[i]);  /* optional token id */
+        }
+    }
+    if (g_use_cpu) printf("CPU-only mode (--cpu): FPGA matmuls forced to CPU\n");
+    if (g_compare) printf("Compare mode (--compare): CPU vs FPGA per matmul\n");
+
     g_gp0 = map_mem(IP_BASE, 0x10000);
     if (!g_gp0) return 1;
+    if (map_ddr() < 0) return 1;
 
     g_scratch = (float*)malloc(0x40000); /* 256KB scratch */
     if (!g_scratch) { fprintf(stderr,"No memory\n"); return 1; }
@@ -618,10 +731,54 @@ int main(int argc, char** argv) {
     reg_write(REG_ISR, 1);
     printf("FPGA initialized: CHAIN_CTRL=0x%08x\n", reg_read(REG_CHAIN_CTRL));
 
-    if (argc < 2) { fprintf(stderr,"Usage: %s model.tmac [token]\n", argv[0]); return 1; }
-    if (load_model(argv[1]) < 0) return 1;
+    /* Enable AFI0 HP0 slave port (both read and write channels). SD boot
+     * does not configure AFI — only bare-metal JTAG scripts do. Without
+     * this the PL's HP0 port cannot reach DDR at all.
+     * NOTE: AFI0 registers are at SLCR offset 0x8000-0x8008 — the SLCR
+     * map must cover 0x10000 (64KB) to reach them (not just 0x1000!). */
+    {
+        volatile uint32_t* slcr = map_mem(0xF8000000, 0x10000);
+        if (!slcr) { fprintf(stderr,"Cannot map SLCR\n"); return 1; }
+        slcr[0x0008/4] = 0x0000DF0D;      /* unlock SLCR (SLCR_UNLOCK) */
+        slcr[0x8000/4] = 0x00000005;      /* AFI0_CTRL: enable + SLVERR */
+        slcr[0x8008/4] = 0x00000001;      /* AFI0_WRCHAN: write enable */
+        slcr[0x0004/4] = 0x0000767B;      /* lock SLCR (SLCR_LOCK) */
+        printf("AFI0 enabled (CTRL=0x%08lx WRCHAN=0x%08lx)\n",
+               (unsigned long)slcr[0x8000/4], (unsigned long)slcr[0x8008/4]);
+    }
 
-    int prompt_token = (argc > 2) ? atoi(argv[2]) : 151646;
+    if (do_selftest) {
+        /* passthrough mode: clear intr-enable so CPU_OP does plain copy */
+        reg_write(REG_CHAIN_CTRL, 0);
+        uint32_t act  = 0x1F002000;
+        uint32_t res  = 0x1F003000;
+        /* write 8 known words to act */
+        for (int i = 0; i < 8; i++) *(uint32_t*)ddr(act + i*4) = 0x11110000 + i;
+        /* sentinel in result */
+        for (int i = 0; i < 8; i++) *(uint32_t*)ddr(res + i*4) = 0xDEADBEEF;
+        dcache_flush(ddr(act), 32);
+        dcache_flush(ddr(res), 32);
+
+        Descriptor* d = (Descriptor*)ddr(DESC_CHAIN_BASE);
+        desc_write(d, 0, 0, act, res, DESC_CPU_OP, 0, 1, 32);
+        if (chain_run(DESC_CHAIN_BASE, 1) < 0) return 1;
+        dcache_inval(ddr(res), 32);
+        int ok = 1;
+        printf("CPU_OP selftest: act[0..7] -> res[0..7]\n");
+        for (int i = 0; i < 8; i++) {
+            uint32_t a = *(uint32_t*)ddr(act + i*4);
+            uint32_t r = *(uint32_t*)ddr(res + i*4);
+            printf("  [%d] act=0x%08x res=0x%08x %s\n", i, a, r,
+                   (a == r) ? "OK" : "** MISMATCH **");
+            if (a != r) ok = 0;
+        }
+        printf("CPU_OP selftest: %s\n", ok ? "PASS" : "FAIL");
+        return ok ? 0 : 1;
+    }
+
+    if (!model_path) { fprintf(stderr,"Usage: %s [--cpu|--compare|--selftest] model.tmac [token]\n", argv[0]); return 1; }
+    if (load_model(model_path) < 0) return 1;
+
     int tokens = run_inference(&prompt_token, 1);
     printf("\nGenerated %d tokens\n", tokens);
     return 0;
