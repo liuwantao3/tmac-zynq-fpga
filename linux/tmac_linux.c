@@ -292,8 +292,22 @@ static int chain_run(uint32_t base, int ndesc) {
 }
 
 // ===== Q8 Preprocessing =====
-static void q8_preprocess_tile(const Tensor* A, int row0, uint8_t* fpga_wt) {
+static void q8_preprocess_tile(const Tensor* A, int row0, uint8_t* fpga_wt, float* row_scale) {
     int cols = (int)A->cols;
+    // Compute per-row normalization scales (match C++ sim: max_abs/32767)
+    for (int r = 0; r < Q8_TILE_ROWS; r++) {
+        int row = row0 + r; float max_abs = 0.0f;
+        if (row >= (int)A->rows) { row_scale[r] = 1.0f; continue; }
+        for (int j = 0; j < cols; j++) {
+            uint64_t flat = (uint64_t)row * cols + j;
+            uint64_t bo = (flat / 32) * 34;
+            int8_t v = (int8_t)A->data[bo + 2 + (flat % 32)];
+            float d = f16_to_f32(*(uint16_t*)(A->data + bo));
+            float a = (float)v * d; if (a < 0) a = -a;
+            if (a > max_abs) max_abs = a;
+        }
+        row_scale[r] = (max_abs < 1e-10f) ? 1.0f : max_abs / 32767.0f;
+    }
     for (int g = 0; g < Q8_NUM_GROUPS; g++) {
         int col0 = g * Q8_GROUP_COLS;
         uint8_t* go = fpga_wt + g * Q8_GROUP_BYTES;
@@ -303,11 +317,11 @@ static void q8_preprocess_tile(const Tensor* A, int row0, uint8_t* fpga_wt) {
             for (int c = 0; c < Q8_GROUP_COLS; c++) {
                 uint64_t flat = (uint64_t)row * cols + col0 + c;
                 uint64_t bo = (flat / 32) * 34;
-                go[c * Q8_TILE_ROWS + r] = A->data[bo + 2 + (flat % 32)];
+                go[(r >> 3) * 512 + c * 8 + (r & 7)] = A->data[bo + 2 + (flat % 32)];
             }
         }
     }
-    // Scales with real Q8_0 block d values
+    // Scales with real Q8_0 block d values, normalized by row_scale
     uint8_t* scale_out = fpga_wt + Q8_TILE_WEIGHT_BYTES;
     for (int g = 0; g < Q8_NUM_GROUPS; g++) {
         int col0 = g * Q8_GROUP_COLS;
@@ -320,7 +334,10 @@ static void q8_preprocess_tile(const Tensor* A, int row0, uint8_t* fpga_wt) {
                 uint64_t flat = (uint64_t)row * cols + col0 + h * 32;
                 uint64_t bo = (flat / 32) * 34;
                 float d_float = f16_to_f32(*(uint16_t*)(A->data + bo));
-                uint32_t uq = (uint32_t)(d_float * 256.0f + 0.5f);
+                float row_s = row_scale[r];
+                float row_inv = (row_s < 1e-10f) ? 1.0f : (1.0f / row_s);
+                float combined = d_float * row_inv;
+                uint32_t uq = (uint32_t)(combined * 256.0f + 0.5f);
                 if (uq > 65535) uq = 65535;
                 int sc_addr = ((r>>3)<<4) | ((r&7)<<1) | h;
                 *(uint16_t*)(gs + sc_addr*2) = (uint16_t)uq;
@@ -348,25 +365,18 @@ static int q5_preprocess_tile(const Tensor* A, int row0, uint32_t wt_addr, float
         memset(blk + 44, 0, 4);
     }
 
-    for (int r = 0; r < nrows; r++) {
-        float m = 0; int row = row0 + r;
-        for (int bi = 0; bi < stride; bi++) {
-            uint64_t bo = ((uint64_t)row * stride + bi) * 22;
-            float d = f16_to_f32(*(uint16_t*)(A->data + bo));
-            uint32_t qh = *(uint32_t*)(A->data + bo + 2);
-            for (int wi = 0; wi < 32; wi++) {
-                uint64_t j = wi < 16 ? wi : wi - 16;
-                int q5 = (((qh>>wi)&1)<<4) | ((A->data[bo+6+j]>>((wi<16)?0:4))&0xF);
-                q5 -= 16;
-                float a = fabsf(d * q5);
-                if (a > m) m = a;
-            }
-        }
-        ri[r] = (m < 1e-10f) ? 1.0f : 32767.0f / m;
-    }
+    /* Row normalization set to 1.0 (UQ8.8 = 0x0100) — NOT 32767/max_abs.
+     * The Q5 core computes d_pre = f16_decode(d)·norm>>8 with d_pre S16
+     * (±32767). With real model data, max_abs is small so ri = 32767/max_abs
+     * is huge (50k-2M) → d_pre = f16_decode(d)·ri saturates at ±32767,
+     * losing all weight variation (verified: bare-metal test uses ri=1.0
+     * and passes; Linux with large ri gives near-zero results).
+     * With ri=1.0: d_pre = f16_decode(d) = 256·d (no saturation for d<128),
+     * raw = Σ 256·d·q5·act, and the 48-bit S24.8 accumulator handles the
+     * full 896-element dot product. Correct scaling: y = raw·x_scale/256. */
     for (int r = 0; r < 4; r++) {
-        *(uint16_t*)ddr(wt_addr + Q5_TILE_NORM_OFFSET + r*2) =
-            (uint16_t)(ri[r < nrows ? r : 0] * 256.0f + 0.5f);
+        ri[r] = 1.0f;
+        *(uint16_t*)ddr(wt_addr + Q5_TILE_NORM_OFFSET + r*2) = 0x0100; /* UQ8.8 1.0 */
     }
     return nrows;
 }
@@ -386,7 +396,7 @@ static float quantize(const float* x, int16_t* xq, int n) {
 
 // ===== FPGA Matmuls =====
 static int fpga_q8_tile(const uint8_t* wt, const int16_t* xq, float* y,
-    int row0, float x_scale, int nrows)
+    int row0, float x_scale, int nrows, const float* row_scale)
 {
     memcpy(ddr(FPGA_WEIGHT_REFMT), wt, Q8_TILE_STRIDE);
     memcpy(ddr(FPGA_WEIGHT_REFMT + Q8_TILE_STRIDE), xq, Q8_TILE_COLS*2);
@@ -405,9 +415,13 @@ static int fpga_q8_tile(const uint8_t* wt, const int16_t* xq, float* y,
         uint64_t raw = (uint64_t)r[i*2] | ((uint64_t)r[i*2+1]<<32);
         if (raw & (1ULL<<47)) raw |= 0xFFFF000000000000ULL;
         if (g_compare && i == 0 && row0 == 0)
-            printf("    [q8 r0=%d] acc=%lld  xs=%.6f\n",
-                   row0, (long long)(int64_t)raw, (double)x_scale);
-        y[row0+i] += (float)(int32_t)(int64_t)raw * x_scale;
+            printf("    [q8 r0=%d] acc=%lld  xs=%.6f  rs=%.6f\n",
+                   row0, (long long)(int64_t)raw, (double)x_scale,
+                   (double)row_scale[i]);
+        /* raw = dequant*act sum. scales include row_inv normalization.
+         * dequant = (q8 * sc) >> 8 already removes the UQ8.8 factor,
+         * so no /256 needed (unlike Q5 which accumulates at 256x). */
+        y[row0+i] += (float)(int32_t)(int64_t)raw * x_scale * row_scale[i];
     }
     return 0;
 }
@@ -433,9 +447,12 @@ static int fpga_q5_tile(const Tensor* A, int row0, const int16_t* xq,
         uint64_t raw = (uint64_t)r[i*2] | ((uint64_t)r[i*2+1]<<32);
         if (raw & (1ULL<<47)) raw |= 0xFFFF000000000000ULL;
         if (g_compare && i == 0 && row0 == 0)
-            printf("    [q5 r0=%d] acc=%lld  xs=%.6f  ri=%.1f\n",
-                   row0, (long long)(int64_t)raw, (double)x_scale, (double)ri[i]);
-        y[row0+i] += (float)(int32_t)(int64_t)raw * x_scale / (256.0f * ri[i]);
+            printf("    [q5 r0=%d] acc=%lld  xs=%.6f\n",
+                   row0, (long long)(int64_t)raw, (double)x_scale);
+        /* d_pre = f16_decode(d) = 256·d (ri=1.0). raw = Σ 256·d·q5·act.
+         * y = raw·x_scale/256 = Σ d·q5·x. (ri removed — was 32767/max_abs
+         * which saturated d_pre at S16.) */
+        y[row0+i] += (float)(int32_t)(int64_t)raw * x_scale / 256.0f;
     }
     return 0;
 }
@@ -460,8 +477,9 @@ static void matmul_impl(const Tensor* A, const float* x, float* y, int rows, int
     if (A->type == TENSOR_Q8_0) {
         for (int r0=0; r0<rows; r0+=Q8_TILE_ROWS) {
             int nr = (rows-r0 < Q8_TILE_ROWS) ? rows-r0 : Q8_TILE_ROWS;
-            q8_preprocess_tile(A, r0, (uint8_t*)ddr(FPGA_WEIGHT_REFMT));
-            fpga_q8_tile((uint8_t*)ddr(FPGA_WEIGHT_REFMT), xq, y, r0, xs, nr);
+            float row_scale[Q8_TILE_ROWS];
+            q8_preprocess_tile(A, r0, (uint8_t*)ddr(FPGA_WEIGHT_REFMT), row_scale);
+            fpga_q8_tile((uint8_t*)ddr(FPGA_WEIGHT_REFMT), xq, y, r0, xs, nr, row_scale);
         }
     } else if (A->type == TENSOR_Q5_0) {
         for (int r0=0; r0<rows; r0+=Q5_TILE_ROWS) fpga_q5_tile(A, r0, xq, y, xs);

@@ -21,7 +21,7 @@ static inline int32_t read48(const uint32_t* base, int i) {
 static void gen_q8_weights(uint8_t* buf, int nrows, float (*fn)(int,int)) {
     for (int r = 0; r < nrows; r++)
         for (int c = 0; c < 64; c++)
-            buf[c * nrows + r] = (uint8_t)(int8_t)fn(r, c);
+            buf[(r >> 3) * 512 + c * 8 + (r & 7)] = (uint8_t)(int8_t)fn(r, c);
 }
 
 static void test_q8(const char* name, int idx, float (*w_fn)(int,int),
@@ -146,6 +146,151 @@ static void test_q5(const char* name, int idx, int8_t q5_val) {
     g_ntests++;
 }
 
+// ===== Q8 distinct-scale test: real weights/scales/acts =====
+// Layout follows the Linux port + co-sim reference EXACTLY:
+//   weights: column-major, byte at c*64+r = W[r][c]
+//   scales:  sc_addr = ((r>>3)<<4)|((r&7)<<1)|h  (= r*2+h, row-major), UQ8.8
+//   acts:    64 int16, sequential
+// Reference: y[r] = sum_c act[c] * ((int8)W[r][c] * sc[r][c/32] >> 8)
+
+static void test_q8_scales(const char* name, int idx) {
+    OUT(2, 0x80000000 | idx);
+    uint32_t wt = 0x1F004000, act_a = 0x1F002000, res = 0x1F003000, desc = 0x1F001000;
+    uint8_t* W = (uint8_t*)(uintptr_t)wt;
+    uint16_t* sc = (uint16_t*)(uintptr_t)(wt + 4096);
+    int16_t* aq = (int16_t*)(uintptr_t)act_a;
+    int r, c;
+
+    // Distinct weights: w[r][c] = ((r*3+c*5) % 33) - 16  (range -16..16)
+    for (r = 0; r < 64; r++)
+        for (c = 0; c < 64; c++)
+            W[(r >> 3) * 512 + c * 8 + (r & 7)] = (uint8_t)(int8_t)(((r * 3 + c * 5) % 33) - 16);
+
+    // Distinct scales: sc_addr = r*2+h, value = 0x0100 + (addr*7 % 1000)
+    for (r = 0; r < 64; r++) {
+        for (int h = 0; h < 2; h++) {
+            int addr = ((r >> 3) << 4) | ((r & 7) << 1) | h;
+            sc[addr] = (uint16_t)(0x0100 + ((addr * 7) % 1000));
+        }
+    }
+
+    // Distinct acts: a[c] = (c % 9) - 4   (range -4..4)
+    for (c = 0; c < 64; c++) aq[c] = (int16_t)((c % 9) - 4);
+
+    // Reference: y[r] = sum_c act[c] * ((int8)W[r][c] * sc[r][c/32] >> 8)
+    // sc value stored at addr = r*2+h via the formula above.
+    uint32_t* d = (uint32_t*)(uintptr_t)desc;
+    d[0]=0; d[1]=wt; d[2]=act_a; d[3]=res; d[4]=0; d[5]=0x00000100; d[6]=128; d[7]=0;
+    reg_write32(0x10, 1);
+    reg_write32(0x18, desc);
+    __asm__ volatile("dsb" ::: "memory");
+    reg_write32(0x00, 1);
+    uint32_t tout = 50000;
+    while (tout--) { if (!(reg_read32(0x14) & 0x8000)) break; }
+
+    uint32_t* r32 = (uint32_t*)(uintptr_t)res;
+    long long ref[64];
+    int ok = 1, firstbad = -1;
+    for (r = 0; r < 64; r++) {
+        long long sum = 0;
+        for (c = 0; c < 64; c++) {
+            int8_t w = (int8_t)W[(r >> 3) * 512 + c * 8 + (r & 7)];
+            int h = c / 32;
+            int addr = ((r >> 3) << 4) | ((r & 7) << 1) | h;
+            long long dq = ((long long)w * (long long)sc[addr]) >> 8;
+            sum += (long long)aq[c] * dq;
+        }
+        ref[r] = sum;
+        long long fpga = read48(r32, r);
+        if (fpga != ref[r]) { ok = 0; if (firstbad < 0) firstbad = r; }
+    }
+
+    // Dump fpga/ref for first 16 rows to OUT[32..63] for TCL decode
+    for (r = 0; r < 16; r++) {
+        OUT(32 + r, (uint32_t)(int32_t)read48(r32, r));
+        OUT(48 + r, (uint32_t)(int32_t)ref[r]);
+    }
+    OUT(12+idx, ok?1u:0u);
+    uart_init();
+    if (ok) {
+        uart_puts("\n[Q8_SCALES] ");
+        uart_puts(name);
+        uart_puts(" PASS (all 64 rows match)\n");
+    } else {
+        uart_puts("\n[Q8_SCALES] ");
+        uart_puts(name);
+        uart_puts(" FAIL first row=");
+        uart_putdec(firstbad);
+        uart_puts("\n  fpga | ref | delta\n");
+        for (r = 0; r < 8; r++) {
+            uart_puts("  r");
+            uart_putdec(r);
+            uart_puts(" fpga=");
+            uart_putdec((int)read48(r32, r));
+            uart_puts(" ref=");
+            uart_putdec((int)ref[r]);
+            uart_puts(" d=");
+            uart_putdec((int)(read48(r32, r) - ref[r]));
+            uart_puts("\n");
+        }
+    }
+    if (ok) g_npassed++; else g_nfailed++;
+    g_ntests++;
+}
+
+// ===== Q8 index-decoder tests: unit scales/acts, weights = pure function of row or col =====
+// Decodes how the core maps (row,col) -> acc bank. Reference assumes result[row]
+// accumulates W[row][col] over col with the standard matmul.
+static void test_q8_wpattern(const char* name, int idx, int mode) {
+    // mode 0: W[r][c] = r+1 (depends only on row)   -> correct result[row] = 64*(row+1)
+    // mode 1: W[r][c] = c+1 (depends only on col)   -> correct result[row] = sum_c (c+1) = 2080
+    OUT(2, 0x80000000 | idx);
+    uint32_t wt = 0x1F004000, act_a = 0x1F002000, res = 0x1F003000, desc = 0x1F001000;
+    uint8_t* W = (uint8_t*)(uintptr_t)wt;
+    uint16_t* sc = (uint16_t*)(uintptr_t)(wt + 4096);
+    int16_t* aq = (int16_t*)(uintptr_t)act_a;
+    int r, c;
+
+    for (r = 0; r < 64; r++)
+        for (c = 0; c < 64; c++) {
+            int v = (mode == 0) ? (r + 1) : (c + 1);
+            W[(r >> 3) * 512 + c * 8 + (r & 7)] = (uint8_t)(int8_t)v;
+        }
+    for (int i = 0; i < 128; i++) sc[i] = 0x0100;  // all scales 1.0
+    for (c = 0; c < 64; c++) aq[c] = 1;            // all acts 1
+
+    uint32_t* d = (uint32_t*)(uintptr_t)desc;
+    d[0]=0; d[1]=wt; d[2]=act_a; d[3]=res; d[4]=0; d[5]=0x00000100; d[6]=128; d[7]=0;
+    reg_write32(0x10, 1);
+    reg_write32(0x18, desc);
+    __asm__ volatile("dsb" ::: "memory");
+    reg_write32(0x00, 1);
+    uint32_t tout = 50000;
+    while (tout--) { if (!(reg_read32(0x14) & 0x8000)) break; }
+
+    uint32_t* r32 = (uint32_t*)(uintptr_t)res;
+    int ok = 1;
+    for (r = 0; r < 64; r++) {
+        long long ref = (mode == 0) ? 64LL * (r + 1) : 2080LL;
+        long long fpga = read48(r32, r);
+        if (fpga != ref) ok = 0;
+    }
+    // dump all 64 rows fpga to OUT[80..143]
+    for (r = 0; r < 64; r++) OUT(80 + r, (uint32_t)(int32_t)read48(r32, r));
+    OUT(12+idx, ok?1u:0u);
+    uart_init();
+    uart_puts("\n[Q8_WPATTERN] ");
+    uart_puts(name);
+    if (ok) uart_puts(" PASS\n");
+    else {
+        uart_puts(" FAIL  fpga[0..15]= ");
+        for (r = 0; r < 16; r++) { uart_putdec((int)read48(r32, r)); uart_putc(' '); }
+        uart_puts("\n");
+    }
+    if (ok) g_npassed++; else g_nfailed++;
+    g_ntests++;
+}
+
 static float p_all1(int r, int c) { (void)r; (void)c; return 1.0f; }
 static float p_allm1(int r, int c) { (void)r; (void)c; return -1.0f; }
 static float act1[64];
@@ -158,6 +303,9 @@ extern "C" int main(void) {
     for (int i = 0; i < 64; i++) act1[i] = 1.0f;
     test_q8("Q8 all-1s",  1, p_all1,  act1);
     test_q8("Q8 all(-1)s", 2, p_allm1, act1);
+    test_q8_scales("distinct-sc", 3);
+    test_q8_wpattern("row-weights", 4, 0);
+    test_q8_wpattern("col-weights", 8, 1);
     test_q5("Q5 val=1",  5, 1);
     test_q5("Q5 val=0",  6, 0);
     test_q5("Q5 val=-1", 7, -1);

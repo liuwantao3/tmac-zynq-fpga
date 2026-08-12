@@ -374,6 +374,20 @@ module matmul_q8_core (
                     end
                     pre_valid <= 1;
 
+                    // Set BRAM read addresses for the next iteration
+                    // Uses g/k from the current cycle (NBA reads old values,
+                    // same as the counter update below). Moved here from a
+                    // separate always block to avoid cross-block synthesis hazard.
+                    if (g == 7) begin
+                        pre_wmem_addr <= {3'd0, k + 6'd1};
+                        pre_smem_addr <= {3'd0, (k + 6'd1) >= 32};
+                        pre_act_addr <= k + 6'd1;
+                    end else begin
+                        pre_wmem_addr <= {g + 3'd1, k};
+                        pre_smem_addr <= {g + 3'd1, k[5]};
+                        pre_act_addr <= k;
+                    end
+
                     // Counter update
                     if (g == 7) begin
                         g <= 0;
@@ -531,26 +545,25 @@ module matmul_q8_core (
     // regardless of state (BRAM reads happen on every clock edge, even when
     // data is not valid — the outputs are simply not captured by pipeline
     // registers unless p1_valid/dq_valid etc. indicate valid data).
-    //
-    // However, to save power, we only update addresses when in COMPUTE/DRAIN.
     // ======================================================================
-
+    // NOTE: address anticipation moved into the COMPUTE state case of the
+    // main FSM to avoid cross-always-block synthesis hazard.
+    // ======================================================================
+    /*
     always @(posedge clk) begin
         if (state == COMPUTE) begin
-            // Anticipatory BRAM address registration: set address for the
-            // NEXT iteration's (g,k). The BRAM reads this address on the
-            // next cycle, by which time the counter has updated to (g_next,k_next).
             if (g == 7) begin
-                pre_wmem_addr <= {3'd0, k + 6'd1};  // g=0, k+1
-                pre_smem_addr <= {3'd0, (k + 6'd1) >= 32};  // (k+1)[5]
+                pre_wmem_addr <= {3'd0, k + 6'd1};
+                pre_smem_addr <= {3'd0, (k + 6'd1) >= 32};
                 pre_act_addr <= k + 6'd1;
             end else begin
-                pre_wmem_addr <= {g + 3'd1, k};  // g+1, k
+                pre_wmem_addr <= {g + 3'd1, k};
                 pre_smem_addr <= {g + 3'd1, k[5]};
                 pre_act_addr <= k;
             end
         end
     end
+    */
 
     // BRAM synchronous reads (1-cycle latency)
     // These run every cycle, but their outputs are only captured by pipeline

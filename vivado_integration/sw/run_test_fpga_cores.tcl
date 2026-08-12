@@ -149,6 +149,17 @@ set npassed [read32 [expr $OUTPUT_BUF + 40]]
 set nfailed [read32 [expr $OUTPUT_BUF + 44]]
 # Also dump raw buffer
 puts "Raw: [mrd $OUTPUT_BUF 20]"
+for {set i 0} {$i < 16} {incr i} {
+    set f [expr $OUTPUT_BUF + 128 + $i*4]
+    set e [expr $OUTPUT_BUF + 192 + $i*4]
+    puts [format "  row %2d fpga=0x%08X (%d)  ref=0x%08X (%d)" $i \
+        [read32 $f] [expr [read32 $f]] [read32 $e] [expr [read32 $e]]]
+}
+puts "  wpattern fpga[0..31]:"
+for {set i 0} {$i < 16} {incr i} {
+    set f [expr $OUTPUT_BUF + 320 + $i*4]
+    puts [format "    r%2d=%d" $i [expr [read32 $f]]]
+}
 
 puts ""
 puts "=============================================="

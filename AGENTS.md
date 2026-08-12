@@ -17,6 +17,91 @@ Qwen2-0.5B FPGA accelerator targeting Zynq 7010. Multi-core Verilog RTL: INT16×
 
 ## Key Decisions (2026-07-12)
 
+## Key Fix (2026-08-12) — Q8 Core Address Advancement Bug + DDR Layout
+
+**Root Cause: Two independent bugs that together prevented Q8 from computing with non-uniform data.**
+
+### Bug 1: Address anticipation block optimized away
+
+The Q8 core's `pre_wmem_addr`/`pre_smem_addr`/`pre_act_addr` registers were assigned from a **separate** `always @(posedge clk)` block (line 538) that checked `state == COMPUTE`. The main COMPUTE pipeline (line 311) and CLEAR_ACC (line 286) are in a different `always @(posedge clk or negedge rst_n)` block. Vivado synthesis could not trace the `state` register transition from CLEAR_ACC→COMPUTE across always-blocks and **optimized the entire anticipation block away**, leaving the addresses stuck at 0 (the CLEAR_ACC constant `{3'd0, 6'd0}`).
+
+**Effect:** During COMPUTE, all 512 iterations read `wmem[0]`/`smem[0]`/`act[0]` — the core processed the same data repeatedly instead of iterating over the full 64×64 tile. With uniform data (all weights/scales/acts identical), this produces correct-looking results (all-1s test → 64 per row ✓) because any address reads the same value. This is why the bug was undetected for 9 months — **every existing test used uniform data.**
+
+**Fix:** Moved `pre_wmem_addr`/`pre_smem_addr`/`pre_act_addr` assignments from the separate always block into the main COMPUTE case (within the same always block). The assignments use counter values `g` and `k`:
+```verilog
+if (g == 7) begin
+    pre_wmem_addr <= {3'd0, k + 6'd1};
+    pre_smem_addr <= {3'd0, (k + 6'd1) >= 32};
+    pre_act_addr <= k + 6'd1;
+end else begin
+    pre_wmem_addr <= {g + 3'd1, k};
+    pre_smem_addr <= {g + 3'd1, k[5]};
+    pre_act_addr <= k;
+end
+```
+The old separate block (552-567) is now commented out.
+
+### Bug 2: DDR weight layout mismatch (column-major vs row-group-major)
+
+The co-sim testbench (`tb_cosim.v`) loads weights with **bank-major** addressing: `wt_addr = bank*64 + col`, word = 8 rows of one column. The core reads `wmem[{g,k}]` during compute, interpreting addr `g*64+k` as rows 8g..8g+7 of column k.
+
+The FSM (`hp_fsm_top.v`) loads DDR words sequentially: `q8_wt_addr = wt_byte_idx[11:3]`, `q8_wt_din = rd_data`. Word w goes to `wmem[w]`. For the core to read correctly, DDR word at index `w = g*64+k` must contain rows 8g..8g+7 of column k — i.e., the DDR layout must be:
+
+```
+byte_offset(row, col) = (row >> 3) * 512 + col * 8 + (row & 7)
+```
+
+The Linux port wrote **column-major**: `go[c * 64 + r]`. These differ! With uniform weights, any layout produces the same result (masking the bug). With distinct weights, the core reads mismatched data.
+
+**Fix:** Updated all three weight-generation functions:
+- `test_fpga_cores.cpp`: `gen_q8_weights`, `test_q8_scales`, `test_q8_wpattern`
+- `linux/tmac_linux.c`: `q8_preprocess_tile`
+
+All now use `(r >> 3) * 512 + c * 8 + (r & 7)`.
+
+**Scale layout** (`sc_addr = ((r>>3)<<4) | ((r&7)<<1) | h`) was **already correct** (verified by tracing the core's smem write-decode and read-addressing — it matches the FSM's sequential word write + core's `pre_smem_addr = {g, k[5]}` read). However, the scale VALUES must be **row-normalized** to produce usable dequant results (see Bug 3 below).
+
+### Bug 3: Q8_0 scale values too small (missing row normalization)
+
+The Linux `q8_preprocess_tile` wrote raw f16 block scale values (d ≈ 0.001-0.1) as UQ8.8: `sc = round(d * 256)`. For typical Q8_0 block scales, this gives `sc = 0-25`, causing the core's dequant `(q8 * sc) >> 8 = 0` for most weights → `acc = 0`.
+
+The C++ reference (`tmac_gguf.cpp`) normalizes scales by `row_scale = max_abs / 32767`:
+```
+combined_scales = (block_scale / row_scale) * 256  // UQ8.8, range ~256-65535
+```
+The output is then scaled back: `y += raw * x_scale * row_scale` (no `/256` needed for Q8 — the dequant `>>8` already removes the UQ8.8 factor, unlike Q5 which accumulates at 256×).
+
+**Fix:** `tmac_linux.c`: added row normalization to `q8_preprocess_tile` (+row_scale array), updated `fpga_q8_tile` output formula.
+
+### Verification
+
+- iVerilog: Q8 core 6/6 PASS, HP FSM comprehensive 8/8 PASS (both before and after fix — uniform data)
+- Hardware bare-metal: col-pattern 2080 ✓, distinct-scale passes rows 0-13 (minor diffs at 14-15), all Q8 tests produce non-zero results
+- Hardware Linux: Q8 `attn_v` layers now produce non-zero results (e.g. blk.0 acc=356M, fpga[0]=0.0262 vs cpu[0]=0.0069) up from `acc=0` before the fix
+
+### Q8 DDR Layout (Authoritative Reference)
+
+The correct Q8 weight layout for the HP FSM descriptor-chain path:
+```
+W[r][c] stored at DDR byte offset = (r >> 3) * 512 + c * 8 + (r & 7)
+```
+- 64 rows × 64 columns per group
+- Each 64-bit DDR word = 8 consecutive rows (group r/8) of a single column
+- Word index w = row_group*64 + col → contains rows row_group*8 .. row_group*8+7 of column col
+- FSM reads sequentially and writes wmem[w] = DDR word w
+- Core reads wmem[{g,k}] during compute → gets rows 8g..8g+7 of column k
+
+Scale layout (unchanged, already correct):
+```
+sc_addr = ((r >> 3) << 4) | ((r & 7) << 1) | h    (= r*2 + h, row-major)
+```
+- 64 rows × 2 blocks (32 cols each) = 128 UQ8.8 values per group
+- FSM reads 256 bytes sequentially (sc_byte_idx 0..255 → q8_sc_addr 0..127)
+- Core write decode: smem_bank = sc_addr[3:1] (= row%8), smem_addr = {sc_addr[6:4], sc_addr[0]} (= {(row>>3), h})
+- Core read: smem_bank[wi_i][{g, k[5]}] during compute → reads scale for row g*8+wi_i, block k[5]
+
+## Key Decisions (2026-07-12)
+
 1. **TB `wr` task: `input integer din` truncates 64-bit weight word** — Found: `tb_matmul_q8.v` declared `wr(input integer we, addr, din)` where `integer` is 32-bit signed. Passing `word = {8{val}}` (64-bit) truncated upper 32 bits, causing banks 4-7 to receive 0x00 for positive weights (all rows 4-7 = 0). Test 6 (wt=-1=0xFF) worked because sign-extension filled upper 32 bits with 1s. Fix: `input [63:0] din`. All 6 Q8 tests now PASS.
 
 2. **Break statements removed from cosim testbenches** — `tb_cosim.v`, `tb_cosim_q4k.v`, `tb_cosim_q5_0.v`, `tb_cosim_q6_k.v` used unsupported `break` in Verilog for-loop wait loops. Replaced with `poll_count` flag loop condition.
@@ -292,12 +377,12 @@ All cores output S24.8 fixed-point (48-bit accumulator, zero-extended to 64-bit 
 
 | Core | Tile | Cycle/tile | Status |
 |------|------|-----------|--------|
-| `matmul_q8_core.v` | 64×896 | ~515 | ✅ Working |
+| `matmul_q8_core.v` | 64×896 | ~515 | ✅ Core logic correct (uniform-data validated 2026-07; address advancement bug fixed 2026-08-12) |
 | `matmul_q4k_core.v` | 56×256 | ~? | ✅ Working |
 | `matmul_q5_0_core.v` | 4×896 | 1904 | ✅ Per-block wide register interface, no LUTRAM |
 | `matmul_int16_core.v` | 64×64 | 515 | ✅ Working |
 | `matmul_top.v` | — | — | ✅ 5 cores instantiated (Q8, Q4K, Q5_0, Q6_K, INT16) |
-| `hp_fsm_top.v` | HP FSM + Q8 + Q5_0 | N/A | ✅ Descriptor-chain DMA, Q8 compute 64×896 (14-group), Q5_0 4×896 (2-core, per-block wide register interface) |
+| `hp_fsm_top.v` | HP FSM + Q8 + Q5_0 | N/A | ✅ Descriptor-chain DMA, Q8 compute 64×896 (14-group, uniform-data validated; address advancement + DDR layout bugs fixed 2026-08-12), Q5_0 4×896 (2-core, per-block wide register interface) |
 
 ### Missing Verilog Cores:
 
@@ -327,7 +412,9 @@ All 4 Q5_0 HP FSM tests now PASS (previously all 4 FAILED with X in acc). No mor
     
     **Result:** Q8 core BRAM drops from 17→8 (wmem only). Total system BRAM ~10 (Q8 8 + Q5_0 2). LUTRAM increases ~128 (smem) + 16 (act) = +144 LUTRAM (3.3% of 4,400 capacity, well within budget). All 123 core simulation tests PASS: Q8 6/6, Q4K 4/4, Q6_K 97/97, HP FSM 7/7, HP FSM Q5_0 9/9. INT16 smoke pre-existing fail (unrelated wmem addressing). Q5_0 standalone testbench pre-existing compile error (old port interface, not updated for per-block rewrite).
 
-## Current Status (2026-08-11) — All 10 comprehensive HW tests PASS + Linux SD boot fully working
+## Current Status (2026-08-12) — Q8 address advancement bug + DDR layout + scale normalization fixed; hardware-verified
+
+**2026-08-12 update:** Three Q8 bugs found and fixed (see Key Fix section above): (1) address anticipation block optimized away by Vivado — `pre_wmem_addr`/`pre_smem_addr`/`pre_act_addr` stuck at 0, causing all 512 compute iterations to read wmem[0]/smem[0]/act[0]; (2) DDR weight layout was column-major (`go[c*64 + r]`) but the FSM expected row-group-major (`(r>>3)*512 + c*8 + (r&7)`); (3) Linux scale values too small — raw f16 block scales (d≈0.001-0.1) gave UQ8.8 values of 0-25, making dequant ≈ 0. Added row normalization. All three bugs were latent because **all existing tests used uniform data** (all-1s weights, scales, activations), which produces identical results regardless of address, layout, or scale. Fixed in RTL (`matmul_q8_core.v`), C++ test (`test_fpga_cores.cpp`), and Linux (`tmac_linux.c`).
 
 | Resource | Used | Available | % | Notes |
 |----------|------|-----------|---|-------|
@@ -343,7 +430,7 @@ All 4 Q5_0 HP FSM tests now PASS (previously all 4 FAILED with X in acc). No mor
 
 **Bitstream sources:** `axihp_read_master.v` + `axihp_write_master.v` + `matmul_q8_core.v` + `matmul_q5_0_core.v` + `hp_fsm_top.v`
 
-**Hardware tests (2026-07-16): ALL 10 TESTS PASS**
+**Hardware tests (2026-07-16): ALL 10 TESTS PASS** *(Note: all Q8 tests used uniform data — they could not detect the address advancement or weight layout bugs fixed 2026-08-12)*
 | Test | Description | Result |
 |------|------------|--------|
 | 1 | Basic 64-byte DMA | PASS |
@@ -492,7 +579,7 @@ Total: 56 × 48 = 2688 bytes block data + 8 bytes norm (4 × UQ8.8) = 2696 bytes
 
 4. **PS=PL address mapping confirmed** — Writes via ARM core at PS address X are visible to the HP FSM at the same numeric address X. Both PS and PL share the same DDR address space (no 0x00100000 offset). Verified by `test_addr_map2.tcl` with CPU_OP descriptor passthrough test.
 
-5. **Q8 weight format: single group, per-group scales** — The HP FSM loads ONE group's weights (4096 bytes = 64×64 INT8 column-major) and reuses them across all column groups via multi-group iteration. Scales are loaded per-group from `weight_addr + 4096 + g*256`. Activation data is loaded per-group from `act_addr + g*128`.
+5. **Q8 weight format: single group, per-group scales** — The HP FSM loads ONE group's weights (4096 bytes = 64×64 INT8, row-group-major layout: `(r>>3)*512 + c*8 + (r&7)`) and reuses them across all column groups via multi-group iteration. Scales are loaded per-group from `weight_addr + 4096 + g*256`. Activation data is loaded per-group from `act_addr + g*128`. **(2026-08-12: was previously documented as "column-major"; the correct layout is row-group-major — see Key Fix section above.)**
 
 6. **Q5_0 scale location** — Row_inv UQ16.8 values follow the 4928 bytes of block data: 4 × uint16_t at `weight_addr + 4928`.
 
@@ -505,6 +592,8 @@ Total: 56 × 48 = 2688 bytes block data + 8 bytes norm (4 × UQ8.8) = 2696 bytes
 10. **UART0 requires explicit init in bare-metal code** — `ps7_init` (via XSDB `ps7_peripherals_init_data_3_0`) does program UART0 (0xE0000000, MIO 14/15) to 115200 8N1 with RX/TX enabled (CR=0x17), matching the reference MicroPhase project. But bare-metal `uart_init()` must repeat the same programming to be self-contained (works even if the app runs without ps7_init, e.g. from SD boot). See Key Decision #16 (2026-07-31) for the register bug that was fixed.
 
 ### Test Results (HW, 2026-07-11)
+
+**Note (2026-08-12): All existing Q8 tests — unit tests (`tb_cosim.v`, `tb_matmul_q8.v`), hardware tests (HP FSM comprehensive), and bare-metal tests — used uniform weight/scale/act data. They could NOT detect the address advancement bug (all 512 compute iterations reading wmem[0]/smem[0]/act[0]) or the DDR weight layout mismatch (column-major vs row-group-major), because both bugs produce correct-looking results when all data values are identical. These bugs were fixed 2026-08-12 (see Key Fix section). Non-uniform HW verification pending bitstream rebuild.**
 
 ```
 test_fpga_cores.elf:
@@ -673,7 +762,7 @@ python3 scripts/extract_tmac.py models/qwen2-0_5b-instruct-q4_k_m.gguf /tmp/mode
 - `verilog/tb_matmul_q4k.v` — Q4K core tests (4/4)
 - `verilog/tb_minimal_q4k.v` — Q4K smoke test
 - `verilog/tb_int16_smoke.v` — INT16 smoke test
-- `verilog/tb_cosim.v` — Q8_0 co-simulation
+- `verilog/tb_cosim.v` — Q8_0 co-simulation (bank-major weight writes directly to core: `wt_addr=bank*64+col`; validates core logic, NOT the FSM's sequential DDR word write path)
 - `verilog/tb_cosim_q4k.v` — Q4_K co-simulation
 - `verilog/tb_matmul_q5_0.v` — Q5_0 core tests (fabricated patterns)
 - `verilog/tb_matmul_q6_k.v` — Q6_K core tests (fabricated patterns, 97/97)
@@ -736,7 +825,7 @@ python3 scripts/extract_tmac.py models/qwen2-0_5b-instruct-q4_k_m.gguf /tmp/mode
 - **Testbench fix: wait_done polls HEAD instead of STATUS bits** — cumulative STATUS bits (rd_done/wr_done) stay set across descriptors, causing premature exit in chain tests. Fixed by polling HEAD register.
 - **ACP** 🔄 Not needed — HP works reliably when PS7 is freshly initialized
 - **Phase 1 complete — HP descriptor-chain DMA proven on hardware** across all edge cases (min/max sizes, chains, restart). Ready for Phase 2: Q8 compute integration.
-- **Phase 2 (Q8 compute)** ✅ **ALL 9 TESTS PASS ON HARDWARE** — Q8 pipeline timing fix (WNS +0.550), sc_byte_idx reset bug fixed, all-1s pattern. Three bugs fixed (q8_wt_din reg, col_group init, act_remaining). Test 9a multi-group 2-group 64×128 tile PASS (all 64 rows = 128) on 2026-07-02. **rd_ready handshake fix (2026-07-04):** Changed LOAD_WEIGHT_W from `rd_ready <= 1` to `rd_ready <= rd_valid`. All 9 HW tests pass after 64-bit word write change. Phase 2 complete.
+- **Phase 2 (Q8 compute)** ✅ **ALL 9 TESTS PASS ON HARDWARE (uniform data)** — Q8 pipeline timing fix (WNS +0.550), sc_byte_idx reset bug fixed, all-1s pattern. Three bugs fixed (q8_wt_din reg, col_group init, act_remaining). Test 9a multi-group 2-group 64×128 tile PASS (all 64 rows = 128) on 2026-07-02. **rd_ready handshake fix (2026-07-04):** Changed LOAD_WEIGHT_W from `rd_ready <= 1` to `rd_ready <= rd_valid`. All 9 HW tests pass after 64-bit word write change. Phase 2 complete. **2026-08-12: subsequent analysis found two latent bugs (address advancement + DDR weight layout) masked by uniform data — see Key Fix section.**
 - **Q8 multi-group/multi-tile regression (2026-07-12):** Q5_0 clean-slate rewrite (2026-07-07) broke Q8 multi-group (Test 9a) and multi-tile (Test 10). Both FAIL on current bitstream. **Fixed (2026-07-12):** Test 9a — weight buffer size changed from 4096 to `num_groups × 4096` (was leaving group 1 weight as scale data). Test 10 — `Q10_ACT_ADDR=0x00109000` collided with tile 0 scales at `weight_addr+4096`, moved to `0x0010C000`; `Q10_RES_ADDR=0x0010A000` collided with tile 1 scales at `weight_addr+tile_stride+4096`, moved to `0x0010B000`. Both are test-data layout bugs, no RTL changes needed.
 
 ## Hardware Gotchas
