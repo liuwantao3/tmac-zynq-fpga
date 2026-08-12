@@ -128,9 +128,8 @@ docker/licenses/xilinx.lic
 gguf-tools-main/gguf-tools
 gguf-tools-main/*.o
 
-# Linux boot files. The verified-working SD boot artifacts are COMMITTED
-# (matching vitis_linux/prebuilt, which also tracks binaries). Only things
-# that are trivially regenerated are ignored:
+# Linux boot files. The verified-working SD boot artifacts are COMMITTED.
+# Only things that are trivially regenerated are ignored:
 #   - BOOT.BIN        : fused from fsbl.elf + system_wrapper.bit + u-boot.elf
 #                       by Vivado bootgen.bat (from linux/boot/)
 #   - *.img, *.bin    : SPL/u-boot.img (not used; FSBL loads u-boot.elf)
@@ -156,5 +155,5 @@ linux/boot/fsbl_app_system/
 linux/boot/.metadata/
 linux/boot/.analytics
 
-# Vitis Linux workspace (regenerable via XSCT — see vitis_linux/README.md)
+# Vitis Linux workspace (regenerable via XSCT — see linux/README.md "Vitis GUI")
 vitis_linux/workspace/

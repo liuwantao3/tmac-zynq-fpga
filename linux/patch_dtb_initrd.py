@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Add /chosen/linux,initrd-start|end to a flattened device-tree blob.
 
-The JTAG boot flow (vitis_linux/scripts/boot_linux_jtag.tcl) hand-boots the
+The JTAG boot flow (linux/scripts/boot_linux_jtag.tcl) hand-boots the
 kernel with no U-Boot (r0=0 r1=~0 r2=dtb pc=zImage), so the kernel locates the
 initramfs already loaded in DDR via the /chosen/linux,initrd-start and
 /chosen/linux,initrd-end properties (u32 physical addresses; the raw gzipped

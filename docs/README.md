@@ -21,8 +21,7 @@
 | `verilog/` | Verilog RTL accelerator (primary implementation) + testbenches |
 | `scripts/` | Python ground truth, verification, conversion tools |
 | `vivado_integration/` | Active Vivado/Vitis integration: build script, bare-metal ARM port |
-| `linux/` | Linux-on-SD build guide + boot files (WSL build, verified SD boot) |
-| `vitis_linux/` | Vitis 2023.1 Linux platform + app (GUI workflow) |
+| `linux/` | Linux-on-SD build guide + boot files + JTAG bring-up scripts (WSL build, verified SD boot) |
 | `models/` | GGUF source + TMAC model files |
 | `hls/` | HLS kernel source (legacy, archived) |
 | `firmware/` | ARM runtime skeleton (aspirational, archived) |

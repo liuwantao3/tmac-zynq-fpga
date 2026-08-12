@@ -619,12 +619,12 @@ xsdb.bat vivado_integration\sw\run_tmac_baremetal.tcl    # full inference
 xsct.bat vitis_bm\build.tcl                                # regenerate z7_bm + tmac_serial
 xsdb.bat vitis_bm\scripts\run_serial.tcl                   # headless serial test (UART0)
 
-# Vitis Linux platform + app (headless XSCT — see vitis_linux/README.md)
+# Vitis Linux platform + app (headless XSCT — see linux/README.md "Vitis GUI")
 #   xsct.bat; then:
-#   platform create -name z7_linux -hw matmul_bd.xsa -proc ps7_cortexa9 -os linux -out workspace
-#   domain config -boot prebuilt; platform generate; app create ... -template "Linux Hello World"; app build
-# Boot Linux on HW from Vitis GUI XSCT console:
-source vitis_linux/scripts/boot_linux_jtag.tcl
+#   platform create -name z7_linux -hw linux/boot/matmul_bd.xsa -proc ps7_cortexa9 -os linux -out workspace
+#   domain config -boot linux/boot; platform generate; app create ... -template "Linux Hello World"; app build
+# JTAG bring-up helpers (SD boot is the proven path; U-Boot-less hand boot unverified):
+source linux/scripts/boot_linux_jtag.tcl
 
 # Linux kernel + DTB + initramfs build (WSL Ubuntu 24.04 — see linux/README.md)
 wsl -d Ubuntu-24.04 -- bash /home/u/tmac-zynq-fpga/linux/build_wsl.sh
@@ -710,7 +710,7 @@ python3 scripts/extract_tmac.py models/qwen2-0_5b-instruct-q4_k_m.gguf /tmp/mode
 - `docs/Q4_K_IMPLEMENTATION_PLAN.md` — Original plan (outdated, kept as archive)
 - `linux/README.md` — Linux-on-SD boot guide (WSL-only build + verified boot flow)
 - `docs/z7lite-vs-zc702.md` — Z7-Lite vs zc702 reference board hardware differences
-- `vitis_linux/README.md` — Vitis 2023.1 Linux platform + app workflow
+- `linux/scripts/` — JTAG bring-up helpers (boot/debug/verify U-Boot + kernel)
 - `vitis_bm/README.md` — Vitis 2023.1 bare-metal workspace (UART serial console app)
 
 ## Target Board: MicroPhase Z7-Lite
@@ -1043,8 +1043,8 @@ Windows WSL (Ubuntu 24.04)** and booting **end-to-end on hardware**: BootROM →
 FSBL InitSD → PCAP bitstream → U-Boot (UART0 console) → distro boot → boot.scr
 → bootm → Linux 6.6.0 → initramfs → interactive `/bin/sh` shell.
 
-**The verified-working boot artifacts are COMMITTED** in `linux/boot/` (and
-mirrored to `vitis_linux/prebuilt/`). Rebuild only when sources change.
+**The verified-working boot artifacts are COMMITTED** in `linux/boot/` (JTAG
+bring-up helpers live in `linux/scripts/`). Rebuild only when sources change.
 
 | File | Size | Description |
 |------|------|-------------|
@@ -1085,28 +1085,26 @@ Bootargs `console=ttyPS0,115200 root=/dev/ram0 rw iomem=relaxed`.
 setenv bootargs "console=ttyPS0,115200 root=/dev/ram0 rw iomem=relaxed"
 ```
 
-## Vitis Linux Workspace (2026-07-31)
+## Vitis Linux Workspace (2026-07-31, regenerable — not committed)
 
-Standard Vitis 2023.1 Linux project in `vitis_linux/`, GUI-operable, independent of
-the bare-metal effort. Because the board has no Ethernet, the standard GUI **Run**
-flow (TCF agent over Ethernet + UART login) is impossible — execution is verified
-via JTAG boot + DDR markers instead. The USB-UART works (UART0, MIO 14/15,
-115200 8N1) — see Key Decision #16 (2026-07-31).
+The Vitis 2023.1 Linux platform + app (`z7_linux` + `hello_linux`) was built
+GUI-style and used for cross-compiling a Linux userspace app against the
+aarch32 sysroot. Because the board has no Ethernet, the standard GUI **Run**
+flow (TCF agent over Ethernet + UART login) is impossible — execution is
+verified via SD boot + DDR markers instead. The USB-UART works (UART0, MIO
+14/15, 115200 8N1) — see Key Decision #16 (2026-07-31).
 
-**Contents:**
-- `matmul_bd.xsa` — hardware handoff (bitstream + ps7_init)
-- `prebuilt/` — zImage, uImage, uramdisk.image.gz, devicetree.dtb, devicetree-jtag.dtb, initramfs.cpio.gz, u-boot.elf, system_wrapper.bit, boot.bif, tmac
-- `workspace/z7_linux/` — platform (Linux domain on `ps7_cortexa9`, boot dir → `prebuilt/`, FSBL built, `z7_linux.xpfm` exported) — **gitignored, regenerable via XSCT**
-- `workspace/hello_linux/` — "Linux Hello World" app, enhanced to write DDR markers + read FPGA regs via `/dev/mem` — **gitignored, regenerable**
-- `scripts/boot_linux_jtag.tcl` — JTAG boot (bitstream → ps7_init → AFI → zImage/dtb/initramfs → kernel)
+**2026-08-11: `vitis_linux/` was removed** (see KD #27/28). Its unique value —
+the JTAG bring-up scripts — moved to `linux/scripts/`; the boot artifacts it
+mirrored now live only in `linux/boot/`. The Vitis workspace itself is
+regenerable via XSCT (see `linux/README.md` → "Vitis GUI workspace") and is
+gitignored (`vitis_linux/workspace/`).
 
-**Key decisions:**
+**Key decisions (preserved from the original workspace):**
 - Linux domain **must** use `-proc ps7_cortexa9` (cluster), NOT `ps7_cortexa9_0` (fails for Linux domains)
-- `-boot <prebuilt dir>` + `isBuildFlow=false` skips PetaLinux/DTS generation (device-tree-xlnx not needed)
+- `-boot <boot dir>` + `isBuildFlow=false` skips PetaLinux/DTS generation (device-tree-xlnx not needed)
 - App template for Linux domain is **"Linux Hello World"** (bare-metal "Hello World" is invalid)
-- Open in GUI: `vitis.bat` → workspace `vitis_linux/workspace`; boot via XSCT console: `source vitis_linux/scripts/boot_linux_jtag.tcl` (power-cycle board first)
-
-Full workflow: `vitis_linux/README.md`.
+- JTAG bring-up: `source linux/scripts/boot_linux_jtag.tcl` (power-cycle board first; SD boot is the proven path)
 
 ## Key Decisions (2026-07-30)
 
@@ -1144,4 +1142,12 @@ Full workflow: `vitis_linux/README.md`.
 
 27. **Lima/macOS build flow removed �� Windows WSL is the only build environment (2026-08-11):** Deleted `linux/build_all.sh` (Lima host-agnostic), `linux/build_bootbin.sh` (Lima bootgen), `linux/setup_toolchain.sh` (macOS clang wrappers). `clone_repos.sh` rewritten for WSL (clones linux-xlnx + u-boot-xlnx; no buildroot �� initramfs is a busybox source build). `linux/README.md` + AGENTS.md rewritten for the WSL-only flow. `BOOT.BIN` is now fused by Vivado `bootgen.bat` from the committed `fsbl.elf` + `system_wrapper.bit` + `u-boot.elf`.
 
-28. **Verified boot artifacts are now committed (2026-08-11):** `linux/boot/` previously ignored `uImage`/`devicetree.dtb`/`uramdisk.image.gz`/`boot.scr`/`u-boot.elf` as "rebuilt on Mac". Since the WSL build is the only environment and the artifacts are verified, they are now committed (consistent with `vitis_linux/prebuilt/` which always tracked binaries). `.gitignore` updated: only truly-regenerable files stay ignored (`BOOT.BIN`, `*.img`, `*.bin`, `u-boot-spl.bin`, `zImage`, `ps7_init*`, `fsbl_platform/`).
+28. **Verified boot artifacts are now committed (2026-08-11):** `linux/boot/` previously ignored `uImage`/`devicetree.dtb`/`uramdisk.image.gz`/`boot.scr`/`u-boot.elf` as "rebuilt on Mac". Since the WSL build is the only environment and the artifacts are verified, they are now committed. `.gitignore` updated: only truly-regenerable files stay ignored (`BOOT.BIN`, `*.img`, `*.bin`, `u-boot-spl.bin`, `zImage`, `ps7_init*`, `fsbl_platform/`).
+
+29. **`vitis_linux/` merged into `linux/` — single source of truth (2026-08-11):** `vitis_linux/` had grown into a stale duplicate of `linux/boot/` (its `prebuilt/` + `matmul_bd.xsa` were byte-identical copies that drifted out of sync). Deleted the whole directory and consolidated:
+    - `vitis_linux/scripts/*.tcl` (7 JTAG bring-up helpers: boot/debug/verify U-Boot + kernel) → **`linux/scripts/`**, paths re-pointed to `linux/boot/`
+    - The Vitis GUI cross-compile workflow doc → folded into `linux/README.md` → "Vitis GUI workspace"
+    - `vitis_linux/prebuilt/` + `vitis_linux/matmul_bd.xsa` → deleted (were dupes of `linux/boot/`)
+    - The regenerable Vitis workspace is now created by XSCT into `vitis_linux/workspace/` (gitignored)
+    - Cross-references updated: root `README.md`, `docs/README.md`, `AGENTS.md`, `vitis_bm/build.tcl` (+ README), `vivado_integration/TOOLCHAIN.md`, `linux/patch_dtb_initrd.py`, `linux/build_wsl.sh`
+    One source of truth for Linux boot: `linux/boot/` (artifacts) + `linux/scripts/` (tools) + `linux/README.md` (docs).

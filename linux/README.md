@@ -7,8 +7,8 @@ initramfs for the MicroPhase Z7-Lite SD boot are built inside WSL (Ubuntu
 `BOOT.BIN` only needs regenerating if the hardware changes).
 
 **The verified-working boot artifacts are committed** in `linux/boot/` (and
-mirrored to `vitis_linux/prebuilt/` for the JTAG script). Rebuilding is only
-needed when the kernel/DTB/initramfs sources change.
+`linux/scripts/` holds the JTAG bring-up helpers). Rebuilding is only needed
+when the kernel/DTB/initramfs sources change.
 
 Hardware: MicroPhase Z7-Lite (xc7z010clg400-1), UART0 MIO14/15 (CH340 USB-UART,
 115200 8N1). All console output (U-Boot + kernel) is on UART0.
@@ -49,7 +49,7 @@ bash linux/build_wsl.sh          # from the repo root; artifacts land in linux/b
 5. Assembles the initramfs (with `/dev/console` nodes + `setsid`/`cttyhack`).
 6. Wraps it as `uramdisk.image.gz`; emits raw `initramfs.cpio.gz`.
 7. Builds `devicetree-jtag.dtb` (JTAG hand-boot variant).
-8. Mirrors everything to `vitis_linux/prebuilt/`.
+8. Copies the raw `zImage` to `linux/boot/` for the JTAG hand-boot script.
 
 ### 4. Verify the artifacts
 
@@ -177,8 +177,40 @@ They are harmless at runtime; keep them on for future bring-up.
 
 ## JTAG boot note
 
-`vitis_linux/scripts/boot_linux_jtag.tcl` (U-Boot-less hand boot) has **never
-been verified on hardware** — all bring-up was done via SD boot (either the SD
-auto-boot or U-Boot loaded over JTAG via `boot_kernel_via_uboot_jtag.tcl`).
+`linux/scripts/boot_linux_jtag.tcl` (U-Boot-less hand boot) has **never been
+verified on hardware** — all bring-up was done via SD boot (either the SD
+auto-boot or U-Boot loaded over JTAG via `linux/scripts/boot_kernel_via_uboot_jtag.tcl`).
 The `devicetree-jtag.dtb` + `initramfs.cpio.gz` artifacts are generated for it
 and kept consistent, but treat SD boot as the only proven path.
+
+## Vitis GUI workspace (optional, for cross-compiling Linux apps)
+
+The Vitis 2023.1 GUI can be used to cross-compile a Linux userspace app against
+the aarch32 sysroot, but the Z7-Lite has **no Ethernet**, so the standard
+"Run As → Linux Application Debug" (TCF agent) flow is impossible. The Linux
+domain/app is used for cross-compilation only; execution is done on the SD
+rootfs (see "initramfs with tmac" above) or via the bare-metal workspace
+`../vitis_bm/` (GUI console on UART0).
+
+The workspace is **regenerable** (never committed) and boots the committed
+`linux/boot/` artifacts. To recreate it headlessly:
+
+```tcl
+# C:\Xilinx\Vitis\2023.1\bin\xsct.bat
+setws {D:/Users/u/tmac-zynq-fpga/vitis_linux/workspace}
+platform create -name z7_linux -hw {D:/Users/u/tmac-zynq-fpga/linux/boot/matmul_bd.xsa} -proc ps7_cortexa9 -os linux -out {D:/Users/u/tmac-zynq-fpga/vitis_linux/workspace}
+platform active z7_linux
+domain active linux_domain
+domain config -boot {D:/Users/u/tmac-zynq-fpga/linux/boot}
+platform generate
+app create -name hello_linux -platform z7_linux -domain linux_domain -template "Linux Hello World"
+app build -name hello_linux
+```
+
+Notes:
+- `-proc ps7_cortexa9` (NOT `ps7_cortexa9_0`) is mandatory for a Linux domain.
+- device-tree-xlnx is NOT required: with a prebuilt boot image the platform
+  skips PetaLinux/DTS generation.
+- The `hello_linux` app template writes DDR markers (`0x1F000000 = "HLLO"`,
+  CLK_CNT at `0x1F000004`, STATUS at `0x1F000008`) readable via XSDB `mrd`.
+- JTAG bring-up helpers live in `linux/scripts/` (boot/debug/verify tools).

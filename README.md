@@ -16,7 +16,8 @@ unit tests PASS.
 | INT16 core (64×64 general) | Sim only (pre-existing wmem bug) |
 | Bare-metal ARM port (`vivado_integration/sw/tmac_baremetal`) | `test_fpga_cores` 5/5 HW PASS |
 | C++ inference engine (`sim/tmac_gguf`) | FP32 < 0.0003 vs ground truth |
-| Vitis Linux workspace (`vitis_linux/`) | Platform + app built, JTAG boot script |
+| Linux-on-SD boot (`linux/`) | SD boot verified on HW to interactive shell (2026-08-11) |
+| JTAG bring-up helpers (`linux/scripts/`) | U-Boot/kernel debug scripts (SD boot is the proven path) |
 
 ## Architecture
 
@@ -108,8 +109,10 @@ xsdb.bat vivado_integration\sw\run_test_fpga_cores.tcl
 │   ├── extract_tmac.py               ← GGUF → TMAC converter
 │   ├── test_integration.sh           ← Test suite runner
 │   └── verify_layers_fast.py         ← Layer verification
-├── linux/                            ← Linux-on-SD build guide + boot files (Lima VM)
-├── vitis_linux/                      ← Vitis 2023.1 Linux platform + app (GUI workflow)
+├── linux/                            ← Linux-on-SD boot guide + boot files + build scripts (WSL)
+│   ├── boot/                         ← committed verified boot artifacts (uImage, dtb, initramfs, ...)
+│   ├── scripts/                      ← JTAG bring-up helpers (boot/debug/verify U-Boot + kernel)
+│   └── build_wsl.sh                  ← kernel + DTB + initramfs build (WSL)
 ├── models/                           ← Model files (gitignored)
 ├── docs/                             ← Architecture docs + historical debug logs
 ├── hls/, firmware/, descriptor-orchestrator/, sim/Transaction Tracer/, vivado/
@@ -143,8 +146,8 @@ xsdb.bat vivado_integration\sw\run_test_fpga_cores.tcl
 - **[vivado_integration/API.md](vivado_integration/API.md)** — Hardware API reference: descriptors, DDR layouts, C++ usage
 - **[verilog/DESIGN.md](verilog/DESIGN.md)** — RTL architecture: pipelines, memory, testbenches
 - **[docs/architecture.md](docs/architecture.md)** — Model architecture, quantization formats
-- **[linux/README.md](linux/README.md)** — Linux-on-SD build guide (U-Boot + kernel on Lima VM)
-- **[vitis_linux/README.md](vitis_linux/README.md)** — Vitis 2023.1 Linux platform + app workflow
+- **[linux/README.md](linux/README.md)** — Linux-on-SD boot guide (WSL-only build + verified boot flow + Vitis GUI cross-compile)
+- **[docs/z7lite-vs-zc702.md](docs/z7lite-vs-zc702.md)** — Z7-Lite vs zc702 reference board hardware differences
 
 ## References
 

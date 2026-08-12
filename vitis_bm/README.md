@@ -19,7 +19,7 @@ cannot be used — the app is launched on hardware via JTAG (System Debugger /
 | `z7_bm/`, `tmac_serial/`, `.metadata/` | Generated — **gitignored**, regenerable |
 
 The Vitis workspace is `vitis_bm/` itself (same layout as the reference `03_dma/arm`).
-The hardware handoff is shared with the Linux workspace: `../vitis_linux/matmul_bd.xsa`.
+The hardware handoff is shared with the SD boot flow: `../linux/boot/matmul_bd.xsa`.
 
 ## Build (headless)
 

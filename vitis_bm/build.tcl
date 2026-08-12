@@ -5,7 +5,7 @@
 #
 # The Vitis workspace IS this directory (like the reference 03_dma project).
 # Regenerates (all gitignored):
-#   z7_bm/       — standalone platform from ../vitis_linux/matmul_bd.xsa (ps7_cortexa9_0)
+#   z7_bm/       — standalone platform from ../linux/boot/matmul_bd.xsa (ps7_cortexa9_0)
 #   tmac_serial/ — bare-metal C app (sources imported from app/src)
 #   .metadata/   — Vitis workspace metadata
 #
@@ -24,7 +24,7 @@ foreach p {z7_bm tmac_serial tmac_serial_system .metadata .Xil} {
 setws .
 
 platform create -name {z7_bm} \
-    -hw {../vitis_linux/matmul_bd.xsa} \
+    -hw {../linux/boot/matmul_bd.xsa} \
     -proc {ps7_cortexa9_0} -os {standalone} -out {.}
 
 platform active {z7_bm}

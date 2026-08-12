@@ -231,17 +231,9 @@ INITRD_SIZE=$(stat -c%s "$BOOT_DIR/initramfs.cpio.gz")
 python3 "$FPGA_ROOT/linux/patch_dtb_initrd.py" "$BOOT_DIR/devicetree.dtb" \
     0x03000000 "$INITRD_SIZE" "$BOOT_DIR/devicetree-jtag.dtb"
 
-# ── 9. Mirror to vitis_linux/prebuilt (JTAG boot script reads from there) ──
-VITIS_PREBUILT="$FPGA_ROOT/vitis_linux/prebuilt"
-if [ -d "$VITIS_PREBUILT" ]; then
-    cp "$BOOT_DIR/uImage"              "$VITIS_PREBUILT/uImage"
-    cp "$BOOT_DIR/devicetree.dtb"      "$VITIS_PREBUILT/devicetree.dtb"
-    cp "$BOOT_DIR/devicetree-jtag.dtb" "$VITIS_PREBUILT/devicetree-jtag.dtb"
-    cp "$BOOT_DIR/uramdisk.image.gz"   "$VITIS_PREBUILT/uramdisk.image.gz"
-    cp "$BOOT_DIR/initramfs.cpio.gz"   "$VITIS_PREBUILT/initramfs.cpio.gz"
-    cp "$LINUX_DIR/arch/arm/boot/zImage" "$VITIS_PREBUILT/zImage"
-fi
+# ── 9. Raw zImage for the JTAG hand-boot (linux/scripts/boot_linux_jtag.tcl) ──
+cp "$LINUX_DIR/arch/arm/boot/zImage" "$BOOT_DIR/zImage"
 
 echo ""
 echo "=== Done. Boot artifacts in $BOOT_DIR: ==="
-ls -la "$BOOT_DIR"/{uImage,devicetree.dtb,devicetree-jtag.dtb,uramdisk.image.gz,initramfs.cpio.gz} 2>/dev/null
+ls -la "$BOOT_DIR"/{uImage,zImage,devicetree.dtb,devicetree-jtag.dtb,uramdisk.image.gz,initramfs.cpio.gz} 2>/dev/null
