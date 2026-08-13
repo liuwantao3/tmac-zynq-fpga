@@ -155,10 +155,17 @@ for {set i 0} {$i < 16} {incr i} {
     puts [format "  row %2d fpga=0x%08X (%d)  ref=0x%08X (%d)" $i \
         [read32 $f] [expr [read32 $f]] [read32 $e] [expr [read32 $e]]]
 }
-puts "  wpattern fpga[0..31]:"
-for {set i 0} {$i < 16} {incr i} {
+puts "  row-pattern fpga (expect 64*(r+1)):"
+for {set i 0} {$i < 64} {incr i} {
     set f [expr $OUTPUT_BUF + 320 + $i*4]
     puts [format "    r%2d=%d" $i [expr [read32 $f]]]
+}
+puts "  q5_golden rows (fpga vs gold):"
+for {set i 0} {$i < 4} {incr i} {
+    set f [expr $OUTPUT_BUF + 576 + $i*4]
+    set g [expr $OUTPUT_BUF + 592 + $i*4]
+    puts [format "    r%d fpga=%d gold=%d %s" $i [expr [read32 $f]] [expr [read32 $g]] \
+        [expr {[read32 $f] == [read32 $g] ? "MATCH" : "DIFF"}]]
 }
 
 puts ""

@@ -1,6 +1,7 @@
 // FPGA Core Test Wrapper - Q8_0 and Q5_0 cores via HP descriptor chain
 // Block formats match API.md exactly.
 #include "tmac_baremetal.h"
+#include "../../sim/golden_model.hpp"
 
 static int g_ntests = 0, g_npassed = 0, g_nfailed = 0;
 
@@ -71,7 +72,8 @@ static void test_q8(const char* name, int idx, float (*w_fn)(int,int),
 
 static uint16_t f32_to_f16(float f) {
     uint32_t u; memcpy(&u, &f, 4);
-    uint32_t s=(u>>31)&1, e=((u>>23)&0xFF)-127, m=u&0x7FFFFF;
+    uint32_t s=(u>>31)&1, m=u&0x7FFFFF;
+    int32_t e=((int32_t)((u>>23)&0xFF))-127;   // SIGNED to avoid underflow for f<1.0
     if (e>=16) return (s<<15)|(0x1F<<10);
     if (e<-14) return s<<15;
     uint32_t f16_e=e+15, f16_m=m>>13;
@@ -142,6 +144,91 @@ static void test_q5(const char* name, int idx, int8_t q5_val) {
     for (int i = 0; i < 4 && ok; i++)
         if (fneq((float)read48(r32, i), expected)) ok = 0;
     OUT(12+idx, ok?1u:0u);
+    if (ok) g_npassed++; else g_nfailed++;
+    g_ntests++;
+}
+
+// ===== Q5 distinct-value test: real d/q5/acts, compared vs golden model =====
+static void test_q5_golden(const char* name, int idx) {
+    OUT(2, 0x90000000 | idx);
+    uint32_t wt = 0x1F004000, act_a = 0x1F002000, res = 0x1F003000, desc = 0x1F001000;
+    uint8_t logical[4 * 28 * 22];
+    uint8_t* lp = logical;
+    int r, blk, wi;
+
+    // Build 4 rows x 28 blocks of distinct Q5_0 blocks (22 bytes each)
+    for (r = 0; r < 4; r++) {
+        for (blk = 0; blk < 28; blk++) {
+            uint8_t* b = lp + (r * 28 + blk) * 22;
+            // distinct d: 0.25 + 0.02*(r*28+blk), range 0.25..2.47
+            uint16_t d_f16 = f32_to_f16(0.25f + 0.02f * (float)(r * 28 + blk));
+            b[0] = (uint8_t)(d_f16 & 0xFF); b[1] = (uint8_t)(d_f16 >> 8);
+            for (wi = 0; wi < 16; wi++) b[6 + wi] = 0;
+            uint32_t qh = 0;
+            for (wi = 0; wi < 32; wi++) {
+                int q5 = ((r * 31 + blk * 7 + wi * 5) % 31) - 15;  // -15..15
+                int enc = q5 + 16;                                 // 1..31
+                if (enc & 0x10) qh |= (1u << wi);
+                int nib = enc & 0xF;
+                int j = (wi < 16) ? wi : wi - 16;
+                if (wi < 16) b[6 + j] |= nib;
+                else         b[6 + j] |= (nib << 4);
+            }
+            b[2] = (uint8_t)(qh & 0xFF); b[3] = (uint8_t)((qh >> 8) & 0xFF);
+            b[4] = (uint8_t)((qh >> 16) & 0xFF); b[5] = (uint8_t)((qh >> 24) & 0xFF);
+        }
+    }
+
+    // Distinct activations
+    int16_t* aq = (int16_t*)(uintptr_t)act_a;
+    for (int i = 0; i < 896; i++) aq[i] = (int16_t)((i % 13) - 6);
+
+    // Golden reference (bit-exact)
+    uint16_t norm[4] = {256, 256, 256, 256};
+    int64_t gold[4];
+    golden::q5_tile_golden(logical, norm, aq, gold);
+
+    // Interleaved FPGA format: 56 blocks x 48 bytes (core0 + core1 + pad)
+    uint8_t* fpga = (uint8_t*)(uintptr_t)wt;
+    for (int bi = 0; bi < 56; bi++) {
+        int group = bi / 28, blk_in_row = bi % 28;
+        uint8_t* blk = fpga + bi * 48;
+        memcpy(blk,      lp + (group      * 28 + blk_in_row) * 22, 22);  // core0: row group
+        memcpy(blk + 22, lp + ((group + 2) * 28 + blk_in_row) * 22, 22); // core1: row group+2
+        blk[44] = blk[45] = blk[46] = blk[47] = 0;
+    }
+    for (r = 0; r < 4; r++) { fpga[2688 + r*2] = 0x00; fpga[2688 + r*2+1] = 0x01; }
+
+    uint32_t* d = (uint32_t*)(uintptr_t)desc;
+    d[0]=0; d[1]=wt; d[2]=act_a; d[3]=res; d[4]=0x00000001; d[5]=0x00000100; d[6]=1792; d[7]=0;
+    reg_write32(0x18, desc);
+    __asm__ volatile("dsb" ::: "memory");
+    reg_write32(0x00, 1);
+    uint32_t tout = 50000;
+    while (tout--) { if (!(reg_read32(0x14) & 0x8000)) break; }
+
+    uint32_t* r32 = (uint32_t*)(uintptr_t)res;
+    int ok = 1;
+    for (int i = 0; i < 4; i++) {
+        int64_t f = (int64_t)read48(r32, i);
+        OUT(144 + i, (uint32_t)(int32_t)f);        // fpga raw rows 0..3
+        OUT(148 + i, (uint32_t)(int32_t)gold[i]);  // golden raw rows 0..3
+        if (f != gold[i]) ok = 0;
+    }
+    OUT(12+idx, ok?1u:0u);
+    uart_init();
+    uart_puts("\n[Q5_GOLDEN] ");
+    uart_puts(name);
+    if (ok) uart_puts(" PASS\n");
+    else {
+        uart_puts(" FAIL: ");
+        for (int i = 0; i < 4; i++) {
+            uart_puts(" r"); uart_putdec(i);
+            uart_puts(" fpga="); uart_putdec((int)read48(r32, i));
+            uart_puts(" gold="); uart_putdec((int)gold[i]);
+        }
+        uart_puts("\n");
+    }
     if (ok) g_npassed++; else g_nfailed++;
     g_ntests++;
 }
@@ -305,10 +392,11 @@ extern "C" int main(void) {
     test_q8("Q8 all(-1)s", 2, p_allm1, act1);
     test_q8_scales("distinct-sc", 3);
     test_q8_wpattern("row-weights", 4, 0);
-    test_q8_wpattern("col-weights", 8, 1);
     test_q5("Q5 val=1",  5, 1);
     test_q5("Q5 val=0",  6, 0);
     test_q5("Q5 val=-1", 7, -1);
+    test_q8_wpattern("col-weights", 8, 1);
+    test_q5_golden("distinct", 9);
     OUT(0, 0xBAD1u);
     OUT(9, (uint32_t)g_ntests);
     OUT(10, (uint32_t)g_npassed);

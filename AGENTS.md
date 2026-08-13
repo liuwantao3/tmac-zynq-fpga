@@ -79,6 +79,22 @@ The output is then scaled back: `y += raw * x_scale * row_scale` (no `/256` need
 - Hardware bare-metal: col-pattern 2080 ✓, distinct-scale passes rows 0-13 (minor diffs at 14-15), all Q8 tests produce non-zero results
 - Hardware Linux: Q8 `attn_v` layers now produce non-zero results (e.g. blk.0 acc=356M, fpga[0]=0.0262 vs cpu[0]=0.0069) up from `acc=0` before the fix
 
+### Bug 4: Q8 result readback off-by-one (registered `res_dout`)
+
+The Q8 core's `res_dout` was a **registered** output (`res_dout_r <= acc_bX[res_addr]` in an `always @(posedge clk)` block), introducing a 1-cycle latency. The FSM's `READ_RES` captures `act_buf[idx] <= res_dout` in the same cycle it advances `res_addr`, so the readback was systematically shifted by one row: `result[0]` = stale, `result[i]` = `acc_bX[i-1]` for i≥1.
+
+This was masked by the all-1s/all(-1)s/col-pattern tests (all rows identical → shift invisible), but exposed by the row-pattern test (`result[r] = 64*r` instead of `64*(r+1)`).
+
+**Fix:** Made `res_dout` **combinational** (`always @(*)`, blocking assignments) since the acc banks are distributed RAM with async read.
+
+### Bit-exact golden model (`sim/golden_model.hpp`) + core verification (2026-08-13)
+
+Added `sim/golden_model.hpp` — bit-exact C++ models of the Q8/Q5 cores' fixed-point arithmetic (see `docs/maths.md` for notation), plus `sim/test_golden_model.cpp` self-test. Wired the golden model into the bare-metal `test_fpga_cores.cpp` (`test_q5_golden` distinct-value test) and Linux `tmac_linux.c` (`gold=` vs `acc=` per-tile comparison).
+
+**Verification on hardware (bare-metal, distinct data):**
+- **Q5 core: bit-exact** — `test_q5_golden` all 4 rows match (37563, 80518, 123895, 166672). Confirms the Q5 arithmetic is correct; the Linux Q5 `maxdiff` (5-22) is the `d_pre` S16 precision bottleneck, not a bug.
+- **Q8 core: bit-exact after res_dout fix** — row-pattern now gives `64*(r+1)` for all 64 rows; col-pattern 2080 ✓.
+
 ### Q8 DDR Layout (Authoritative Reference)
 
 The correct Q8 weight layout for the HP FSM descriptor-chain path:

@@ -394,9 +394,85 @@ static float quantize(const float* x, int16_t* xq, int n) {
     return s;
 }
 
+// ===== Bit-exact golden models (see docs/maths.md, sim/golden_model.hpp) =====
+// These replicate the exact integer/fixed-point arithmetic of the Q8/Q5 cores,
+// so FPGA raw accumulators can be compared against a float-free reference.
+
+// f16 -> S24.8 (1.0 -> 256), sign-agnostic, bit-exact port of the Verilog.
+static inline int32_t f16_decode_s248(uint16_t f16) {
+    int32_t exp  = (f16 >> 10) & 0x1F;
+    int32_t mant = f16 & 0x3FF;
+    if (exp == 0 || exp == 31) return 0;
+    if (exp >= 17) return (1024 + mant) << (exp - 17);
+    return ((1024 + mant) + (1 << (16 - exp))) >> (17 - exp);
+}
+
+// Q8 combined scale for weight (row, col): UQ8.8 = round(block_scale/row_scale*256).
+// Must match q8_preprocess_tile's computation bit-for-bit.
+static inline uint16_t q8_combined_scale(const Tensor* A, int row, int col,
+                                         float row_scale) {
+    uint64_t bo = ((uint64_t)row * A->cols + col) / 32 * 34;
+    float d_float = f16_to_f32((uint16_t)A->data[bo] | ((uint16_t)A->data[bo+1] << 8));
+    float row_inv = (row_scale < 1e-10f) ? 1.0f : (1.0f / row_scale);
+    float combined = d_float * row_inv;
+    uint32_t uq = (uint32_t)(combined * 256.0f + 0.5f);
+    if (uq > 65535) uq = 65535;
+    return (uint16_t)uq;
+}
+
+// Q8 golden raw accumulator for one tile: deq = (q8*sc)>>8, acc = SUM(deq*act).
+static void q8_golden_raw(const Tensor* A, int row0, int nrows, int cols,
+                          const int16_t* xq, const float* row_scale, int64_t* gold) {
+    for (int i = 0; i < nrows; i++) {
+        int row = row0 + i;
+        int64_t acc = 0;
+        for (int c = 0; c < cols; c++) {
+            uint64_t flat = (uint64_t)row * cols + c;
+            int8_t q8 = (int8_t)A->data[(flat / 32) * 34 + 2 + (flat % 32)];
+            uint16_t sc = q8_combined_scale(A, row, c, row_scale[i]);
+            int16_t deq = (int16_t)(((int32_t)q8 * (int32_t)sc) >> 8);
+            acc += (int64_t)deq * (int64_t)xq[c];
+        }
+        gold[i] = acc;
+    }
+}
+
+// Q5 d_pre = clamp((f16_decode(d) * norm) >> 8, S16).
+static inline int16_t q5_d_pre_c(uint16_t d_f16, uint16_t norm) {
+    int64_t shr = ((int64_t)f16_decode_s248(d_f16) * (int64_t)norm) >> 8;
+    if (shr > 32767) return 32767;
+    if (shr < -32768) return -32768;
+    return (int16_t)shr;
+}
+
+// Q5 golden raw accumulator for one tile (norm = 256 = 1.0, as q5_preprocess_tile sets).
+static void q5_golden_raw(const Tensor* A, int row0, int nrows, int cols,
+                          const int16_t* xq, int64_t* gold) {
+    int stride = cols / 32;
+    for (int i = 0; i < nrows; i++) {
+        int row = row0 + i;
+        int64_t acc = 0;
+        for (int blk = 0; blk < stride; blk++) {
+            uint8_t* b = A->data + ((uint64_t)row * stride + blk) * 22;
+            uint16_t d_f16 = (uint16_t)b[0] | ((uint16_t)b[1] << 8);
+            int16_t d_pre = q5_d_pre_c(d_f16, 256);
+            uint32_t qh = (uint32_t)b[2] | ((uint32_t)b[3] << 8) |
+                          ((uint32_t)b[4] << 16) | ((uint32_t)b[5] << 24);
+            for (int wi = 0; wi < 32; wi++) {
+                int j = (wi < 16) ? wi : wi - 16;
+                uint8_t ql = (wi < 16) ? (b[6+j] & 0xF) : (b[6+j] >> 4);
+                int q5 = (((qh >> wi) & 1) << 4 | ql) - 16;
+                int32_t dq = (int32_t)d_pre * (int32_t)q5;
+                acc += (int64_t)dq * (int64_t)xq[blk * 32 + wi];
+            }
+        }
+        gold[i] = acc;
+    }
+}
+
 // ===== FPGA Matmuls =====
-static int fpga_q8_tile(const uint8_t* wt, const int16_t* xq, float* y,
-    int row0, float x_scale, int nrows, const float* row_scale)
+static int fpga_q8_tile(const Tensor* A, const uint8_t* wt, const int16_t* xq,
+    float* y, int row0, float x_scale, int nrows, const float* row_scale)
 {
     memcpy(ddr(FPGA_WEIGHT_REFMT), wt, Q8_TILE_STRIDE);
     memcpy(ddr(FPGA_WEIGHT_REFMT + Q8_TILE_STRIDE), xq, Q8_TILE_COLS*2);
@@ -409,20 +485,31 @@ static int fpga_q8_tile(const uint8_t* wt, const int16_t* xq, float* y,
 
     if (chain_run(DESC_CHAIN_BASE, 1) < 0) return -1;
 
+    // Golden raw reference (bit-exact fixed point, no float mismatch)
+    int64_t gold[Q8_TILE_ROWS];
+    q8_golden_raw(A, row0, nrows, (int)A->cols, xq, row_scale, gold);
+
     uint32_t* r = (uint32_t*)ddr(FPGA_WEIGHT_REFMT+Q8_TILE_STRIDE+0x10000);
     dcache_inval(r, nrows*8);
+    int64_t max_raw_diff = 0; int max_raw_row = -1;
     for (int i=0; i<nrows; i++) {
         uint64_t raw = (uint64_t)r[i*2] | ((uint64_t)r[i*2+1]<<32);
         if (raw & (1ULL<<47)) raw |= 0xFFFF000000000000ULL;
+        int64_t raw_s = (int64_t)raw;
+        int64_t diff = raw_s - gold[i]; if (diff < 0) diff = -diff;
+        if (diff > max_raw_diff) { max_raw_diff = diff; max_raw_row = row0 + i; }
         if (g_compare && i == 0 && row0 == 0)
-            printf("    [q8 r0=%d] acc=%lld  xs=%.6f  rs=%.6f\n",
-                   row0, (long long)(int64_t)raw, (double)x_scale,
+            printf("    [q8 r0=%d] acc=%lld gold=%lld  xs=%.6f  rs=%.6f\n",
+                   row0, raw_s, (long long)gold[i], (double)x_scale,
                    (double)row_scale[i]);
         /* raw = dequant*act sum. scales include row_inv normalization.
          * dequant = (q8 * sc) >> 8 already removes the UQ8.8 factor,
          * so no /256 needed (unlike Q5 which accumulates at 256x). */
-        y[row0+i] += (float)(int32_t)(int64_t)raw * x_scale * row_scale[i];
+        y[row0+i] += (float)(int32_t)raw_s * x_scale * row_scale[i];
     }
+    if (g_compare && max_raw_diff > 0)
+        printf("    [q8 RAWDIFF] max=%lld at row=%d\n",
+               (long long)max_raw_diff, max_raw_row);
     return 0;
 }
 
@@ -441,19 +528,30 @@ static int fpga_q5_tile(const Tensor* A, int row0, const int16_t* xq,
 
     if (chain_run(DESC_CHAIN_BASE, 1) < 0) return -1;
 
+    // Golden raw reference (bit-exact fixed point, no float mismatch)
+    int64_t gold[Q5_TILE_ROWS];
+    q5_golden_raw(A, row0, nrows, (int)A->cols, xq, gold);
+
     uint32_t* r = (uint32_t*)ddr(res);
     dcache_inval(r, nrows*8);
+    int64_t max_raw_diff = 0; int max_raw_row = -1;
     for (int i=0; i<nrows; i++) {
         uint64_t raw = (uint64_t)r[i*2] | ((uint64_t)r[i*2+1]<<32);
         if (raw & (1ULL<<47)) raw |= 0xFFFF000000000000ULL;
+        int64_t raw_s = (int64_t)raw;
+        int64_t diff = raw_s - gold[i]; if (diff < 0) diff = -diff;
+        if (diff > max_raw_diff) { max_raw_diff = diff; max_raw_row = row0 + i; }
         if (g_compare && i == 0 && row0 == 0)
-            printf("    [q5 r0=%d] acc=%lld  xs=%.6f\n",
-                   row0, (long long)(int64_t)raw, (double)x_scale);
+            printf("    [q5 r0=%d] acc=%lld gold=%lld  xs=%.6f\n",
+                   row0, raw_s, (long long)gold[i], (double)x_scale);
         /* d_pre = f16_decode(d) = 256·d (ri=1.0). raw = Σ 256·d·q5·act.
          * y = raw·x_scale/256 = Σ d·q5·x. (ri removed — was 32767/max_abs
          * which saturated d_pre at S16.) */
-        y[row0+i] += (float)(int32_t)(int64_t)raw * x_scale / 256.0f;
+        y[row0+i] += (float)(int32_t)raw_s * x_scale / 256.0f;
     }
+    if (g_compare && max_raw_diff > 0)
+        printf("    [q5 RAWDIFF] max=%lld at row=%d\n",
+               (long long)max_raw_diff, max_raw_row);
     return 0;
 }
 
@@ -479,7 +577,7 @@ static void matmul_impl(const Tensor* A, const float* x, float* y, int rows, int
             int nr = (rows-r0 < Q8_TILE_ROWS) ? rows-r0 : Q8_TILE_ROWS;
             float row_scale[Q8_TILE_ROWS];
             q8_preprocess_tile(A, r0, (uint8_t*)ddr(FPGA_WEIGHT_REFMT), row_scale);
-            fpga_q8_tile((uint8_t*)ddr(FPGA_WEIGHT_REFMT), xq, y, r0, xs, nr, row_scale);
+            fpga_q8_tile(A, (uint8_t*)ddr(FPGA_WEIGHT_REFMT), xq, y, r0, xs, nr, row_scale);
         }
     } else if (A->type == TENSOR_Q5_0) {
         for (int r0=0; r0<rows; r0+=Q5_TILE_ROWS) fpga_q5_tile(A, r0, xq, y, xs);

@@ -153,21 +153,22 @@ module matmul_q8_core (
         acc_r[7] <= acc_b7[pre_read_g];
     end
 
-    // Result read: pipelined from specific bank
-    reg [47:0] res_dout_r;
-    always @(posedge clk) begin
+    // Result read: combinational from specific bank
+    // (was registered -> 1-cycle latency -> off-by-one in FSM readback)
+    reg [47:0] res_dout_comb;
+    always @(*) begin
         case (res_addr[2:0])
-            3'd0: res_dout_r <= acc_b0[res_addr[5:3]];
-            3'd1: res_dout_r <= acc_b1[res_addr[5:3]];
-            3'd2: res_dout_r <= acc_b2[res_addr[5:3]];
-            3'd3: res_dout_r <= acc_b3[res_addr[5:3]];
-            3'd4: res_dout_r <= acc_b4[res_addr[5:3]];
-            3'd5: res_dout_r <= acc_b5[res_addr[5:3]];
-            3'd6: res_dout_r <= acc_b6[res_addr[5:3]];
-            3'd7: res_dout_r <= acc_b7[res_addr[5:3]];
+            3'd0: res_dout_comb = acc_b0[res_addr[5:3]];
+            3'd1: res_dout_comb = acc_b1[res_addr[5:3]];
+            3'd2: res_dout_comb = acc_b2[res_addr[5:3]];
+            3'd3: res_dout_comb = acc_b3[res_addr[5:3]];
+            3'd4: res_dout_comb = acc_b4[res_addr[5:3]];
+            3'd5: res_dout_comb = acc_b5[res_addr[5:3]];
+            3'd6: res_dout_comb = acc_b6[res_addr[5:3]];
+            3'd7: res_dout_comb = acc_b7[res_addr[5:3]];
         endcase
     end
-    assign res_dout = res_dout_r;
+    assign res_dout = res_dout_comb;
 
     // ======================================================================
     // BRAM/LUTRAM read data (registered outputs from wmem, smem, act)
