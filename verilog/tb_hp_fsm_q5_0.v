@@ -207,7 +207,7 @@ module tb_hp_fsm_q5_0;
             for (b = 0; b < 56; b = b + 1) begin
                 // Core0 d = 0x3C00 (f16 1.0)
                 ddr_write8(base + b*48 + 0, 8'h00);
-                ddr_write8(base + b*48 + 1, 8'h3C);
+                ddr_write8(base + b*48 + 1, 8'h34);
                 // Core0 qh = 0xFFFFFFFF (all high bits = 1)
                 ddr_write8(base + b*48 + 2, 8'hFF);
                 ddr_write8(base + b*48 + 3, 8'hFF);
@@ -218,7 +218,7 @@ module tb_hp_fsm_q5_0;
                     ddr_write8(base + b*48 + 6 + k, {q5_val, q5_val});
                 // Core1 d = 0x3C00
                 ddr_write8(base + b*48 + 22, 8'h00);
-                ddr_write8(base + b*48 + 23, 8'h3C);
+                ddr_write8(base + b*48 + 23, 8'h34);
                 // Core1 qh = 0xFFFFFFFF
                 ddr_write8(base + b*48 + 24, 8'hFF);
                 ddr_write8(base + b*48 + 25, 8'hFF);
@@ -298,7 +298,7 @@ module tb_hp_fsm_q5_0;
         // Test 1: Single Q5_0 descriptor, all-1s -> expect 896 per row
         // =================================================================
         test_num = test_num + 1;
-        $display("\n--- Test %0d: Single Q5_0 all-1s (expect each row=229376) ---", test_num);
+        $display("\n--- Test %0d: Single Q5_0 all-1s (expect each row=14680064) ---", test_num);
         setup_q5_desc(32'h00300000, 32'h00000000,
                       32'h00310000, 32'h00320000, 32'h00330000, 1792, 16'd1);
         fill_q5_weight(32'h00310000, 4'd1);
@@ -310,7 +310,7 @@ module tb_hp_fsm_q5_0;
         axil_read(16'h14, rd_val); $display("  STATUS=0x%08x", rd_val);
         axil_read(16'h28, rd_val); $display("  DEBUG=0x%08x", rd_val);
         axil_read(16'h20, rd_val); $display("  HEAD=%d", rd_val);
-        verify_q5_result(32'h00330000, 229376, test_num);
+        verify_q5_result(32'h00330000, 14680064, test_num);
 
         // =================================================================
         // Test 2: Chain of 2 Q5_0 descriptors
@@ -323,7 +323,7 @@ module tb_hp_fsm_q5_0;
                       32'h00310000, 32'h00320000, 32'h00330040, 1792, 16'd1);
         setup_q5_desc(32'h00300040, 32'h00000000,   // desc 1 -> end
                       32'h00313000, 32'h00322000, 32'h00330080, 1792, 16'd1);
-        fill_q5_weight(32'h00310000, 4'd1);   // Desc 0: weights=1 -> expect 229376
+        fill_q5_weight(32'h00310000, 4'd1);   // Desc 0: weights=1 -> expect 14680064
         fill_q5_scales(32'h00310000);
         fill_q5_weight(32'h00313000, 4'd0);   // Desc 1: weights=0 -> expect 0
         fill_q5_scales(32'h00313000);
@@ -335,8 +335,8 @@ module tb_hp_fsm_q5_0;
         wait_done(2);
         axil_read(16'h14, rd_val); $display("  STATUS=0x%08x", rd_val);
         axil_read(16'h20, rd_val); $display("  HEAD=%d (expect 2)", rd_val);
-        $display("  Verifying Desc 0 (weights=1, expect 229376):");
-        verify_q5_result(32'h00330040, 229376, test_num);
+        $display("  Verifying Desc 0 (weights=1, expect 14680064):");
+        verify_q5_result(32'h00330040, 14680064, test_num);
         $display("  Verifying Desc 1 (weights=0, expect 0):");
         verify_q5_result(32'h00330080, 0, test_num);
 
@@ -382,8 +382,8 @@ module tb_hp_fsm_q5_0;
             end
         end
         // Verify Q5_0 result
-        $display("  Verifying Q5_0 desc 1 (expect 229376 per row):");
-        verify_q5_result(32'h003300C0, 229376, test_num);
+        $display("  Verifying Q5_0 desc 1 (expect 14680064 per row):");
+        verify_q5_result(32'h003300C0, 14680064, test_num);
 
         // =================================================================
         // Test 4: Chain of 3: Q5_0 -> CPU_OP -> Q5_0
@@ -418,8 +418,8 @@ module tb_hp_fsm_q5_0;
         wait_done(3);
         axil_read(16'h14, rd_val); $display("  STATUS=0x%08x", rd_val);
         axil_read(16'h20, rd_val); $display("  HEAD=%d (expect 3)", rd_val);
-        $display("  Verifying Q5_0 desc 0 (weights=1, expect 229376):");
-        verify_q5_result(32'h00330100, 229376, test_num);
+        $display("  Verifying Q5_0 desc 0 (weights=1, expect 14680064):");
+        verify_q5_result(32'h00330100, 14680064, test_num);
         $display("  Verifying CPU_OP desc 1 passthrough (64 bytes):");
         for (j = 0; j < 16; j = j + 1) begin
             reg [31:0] expected;
@@ -432,11 +432,11 @@ module tb_hp_fsm_q5_0;
                 fail_count = fail_count + 1;
             end
         end
-        $display("  Verifying Q5_0 desc 2 (weights=2, acts=2, expect 917504):");
-        verify_q5_result(32'h00330180, 917504, test_num);
+        $display("  Verifying Q5_0 desc 2 (weights=2, acts=2, expect 58720256):");
+        verify_q5_result(32'h00330180, 58720256, test_num);
 
         // =================================================================
-        // Test 5: Zero activations — non-zero weights with all-act=0
+        // Test 5: Zero activations �?non-zero weights with all-act=0
         //   Expect: all 4 rows = 0 (accumulator never changes from 0)
         // =================================================================
         test_num = test_num + 1;
@@ -453,8 +453,8 @@ module tb_hp_fsm_q5_0;
 
         // =================================================================
         // Test 6: Back-to-back independent chains (restart from DONE)
-        //   Chain A: all-1s → 229376
-        //   Chain B: all-1s → 229376 (same weight, new descriptor)
+        //   Chain A: all-1s �?14680064
+        //   Chain B: all-1s �?14680064 (same weight, new descriptor)
         //   Verifies FSM properly re-enters from DONE state
         // =================================================================
         test_num = test_num + 1;
@@ -469,42 +469,42 @@ module tb_hp_fsm_q5_0;
         start_chain(32'h003000C0);
         wait_done(1);
         $display("  Chain A result:");
-        verify_q5_result(32'h00330280, 229376, test_num);
-        // Chain B — different descriptor, same pattern
+        verify_q5_result(32'h00330280, 14680064, test_num);
+        // Chain B �?different descriptor, same pattern
         setup_q5_desc(32'h003000E0, 32'h00000000,
                       32'h00319000, 32'h00327000, 32'h00330300, 1792, 16'd1);
         zero_res(32'h00330300);
         start_chain(32'h003000E0);
         wait_done(1);
         $display("  Chain B result:");
-        verify_q5_result(32'h00330300, 229376, test_num);
+        verify_q5_result(32'h00330300, 14680064, test_num);
 
         // =================================================================
-        // Test 7: Long chain (4 descriptors: Q5_0 → Q5_0 → Q5_0 → Q5_0)
+        // Test 7: Long chain (4 descriptors: Q5_0 �?Q5_0 �?Q5_0 �?Q5_0)
         //   Each uses different weight (1, 2, 0, 1) with uniform acts=1
         //   Tests chain depth and varied results
         // =================================================================
         test_num = test_num + 1;
         $display("\n--- Test %0d: Chain of 4 Q5_0 ---", test_num);
-        // Desc 0 → 1
+        // Desc 0 �?1
         setup_q5_desc(32'h00300100, 32'h00300120,
                       32'h0031A000, 32'h00328000, 32'h00330380, 1792, 16'd1);
-        // Desc 1 → 2
+        // Desc 1 �?2
         setup_q5_desc(32'h00300120, 32'h00300140,
                       32'h0031B000, 32'h00329000, 32'h00330400, 1792, 16'd1);
-        // Desc 2 → 3
+        // Desc 2 �?3
         setup_q5_desc(32'h00300140, 32'h00300160,
                       32'h0031C000, 32'h0032A000, 32'h00330480, 1792, 16'd1);
-        // Desc 3 → end
+        // Desc 3 �?end
         setup_q5_desc(32'h00300160, 32'h00000000,
                       32'h0031D000, 32'h0032B000, 32'h00330500, 1792, 16'd1);
-        fill_q5_weight(32'h0031A000, 4'd1);  // desc 0: weight=1 → 229376
+        fill_q5_weight(32'h0031A000, 4'd1);  // desc 0: weight=1 �?14680064
         fill_q5_scales(32'h0031A000);
-        fill_q5_weight(32'h0031B000, 4'd2);  // desc 1: weight=2 → ?
+        fill_q5_weight(32'h0031B000, 4'd2);  // desc 1: weight=2 �??
         fill_q5_scales(32'h0031B000);
-        fill_q5_weight(32'h0031C000, 4'd0);  // desc 2: weight=0 → 0
+        fill_q5_weight(32'h0031C000, 4'd0);  // desc 2: weight=0 �?0
         fill_q5_scales(32'h0031C000);
-        fill_q5_weight(32'h0031D000, 4'd1);  // desc 3: weight=1 → 229376
+        fill_q5_weight(32'h0031D000, 4'd1);  // desc 3: weight=1 �?14680064
         fill_q5_scales(32'h0031D000);
         fill_q5_acts(32'h00328000, 16'd1);
         fill_q5_acts(32'h00329000, 16'd1);
@@ -519,22 +519,22 @@ module tb_hp_fsm_q5_0;
         axil_read(16'h20, rd_val);
         $display("  HEAD=%d (expect 4)", rd_val);
         $display("  Desc 0 (weights=1):");
-        verify_q5_result(32'h00330380, 229376, test_num);
-        // Desc 1: q5=2 → dq=512 → per block 32*512 → per row 28*16384=458752
+        verify_q5_result(32'h00330380, 14680064, test_num);
+        // Desc 1: q5=2 → dq=16384*2=32768 → per block 32*32768=1048576 → per row 28*1048576=29360128
         $display("  Desc 1 (weights=2):");
-        verify_q5_result(32'h00330400, 458752, test_num);
+        verify_q5_result(32'h00330400, 29360128, test_num);
         $display("  Desc 2 (weights=0):");
         verify_q5_result(32'h00330480, 0, test_num);
         $display("  Desc 3 (weights=1):");
-        verify_q5_result(32'h00330500, 229376, test_num);
+        verify_q5_result(32'h00330500, 14680064, test_num);
 
         // =================================================================
         // Test 8: Negative activations (act=-1, weights=1)
-        //   q5=1, d_pre=256 → dq=256 → prod = 256*(-1) = -256
-        //   Per block: 32 * (-256) = -8192. Per row: 28 * -8192 = -229376
+        //   q5=1, d_pre=256 �?dq=256 �?prod = 256*(-1) = -256
+        //   Per block: 32 * (-16384) = -524288. Per row: 28 * -524288 = -14680064
         // =================================================================
         test_num = test_num + 1;
-        $display("\n--- Test %0d: Negative activations (expect all rows=-229376) ---", test_num);
+        $display("\n--- Test %0d: Negative activations (expect all rows=-14680064) ---", test_num);
         setup_q5_desc(32'h00300180, 32'h00000000,
                       32'h0031E000, 32'h0032C000, 32'h00330600, 1792, 16'd1);
         fill_q5_weight(32'h0031E000, 4'd1);
@@ -543,28 +543,28 @@ module tb_hp_fsm_q5_0;
         zero_res(32'h00330600);
         start_chain(32'h00300180);
         wait_done(1);
-        verify_q5_result(32'h00330600, -229376, test_num);
+        verify_q5_result(32'h00330600, -14680064, test_num);
 
         // =================================================================
-        // Test 9: 5-descriptor chain (Q5_0 → CPU_OP → Q5_0 → CPU_OP → Q5_0)
-        //   Desc 0: Q5_0 weights=1, acts=1 → 229376
+        // Test 9: 5-descriptor chain (Q5_0 �?CPU_OP �?Q5_0 �?CPU_OP �?Q5_0)
+        //   Desc 0: Q5_0 weights=1, acts=1 �?14680064
         //   Desc 1: CPU_OP passthrough 128 bytes
-        //   Desc 2: Q5_0 weights=0, acts=1 → 0
+        //   Desc 2: Q5_0 weights=0, acts=1 �?0
         //   Desc 3: CPU_OP passthrough 128 bytes
-        //   Desc 4: Q5_0 weights=1, acts=1 → 229376
+        //   Desc 4: Q5_0 weights=1, acts=1 �?14680064
         //   Tests deep mixed chain
         // =================================================================
         test_num = test_num + 1;
         $display("\n--- Test %0d: 5-desc mixed chain ---", test_num);
-        setup_q5_desc(32'h003001A0, 32'h003001C0,   // desc 0 → 1
+        setup_q5_desc(32'h003001A0, 32'h003001C0,   // desc 0 �?1
                       32'h0031F000, 32'h0032D000, 32'h00330700, 1792, 16'd1);
-        setup_cpu_desc(32'h003001C0, 32'h003001E0,   // desc 1 → 2
+        setup_cpu_desc(32'h003001C0, 32'h003001E0,   // desc 1 �?2
                        32'h00340000, 32'h00340080, 128);
-        setup_q5_desc(32'h003001E0, 32'h00300200,   // desc 2 → 3
+        setup_q5_desc(32'h003001E0, 32'h00300200,   // desc 2 �?3
                       32'h00320000, 32'h0032E000, 32'h00330780, 1792, 16'd1);
-        setup_cpu_desc(32'h00300200, 32'h00300220,   // desc 3 → 4
+        setup_cpu_desc(32'h00300200, 32'h00300220,   // desc 3 �?4
                        32'h00340100, 32'h00340180, 128);
-        setup_q5_desc(32'h00300220, 32'h00000000,   // desc 4 → end
+        setup_q5_desc(32'h00300220, 32'h00000000,   // desc 4 �?end
                       32'h00321000, 32'h0032F000, 32'h00330800, 1792, 16'd1);
         // Desc 0: weights=1
         fill_q5_weight(32'h0031F000, 4'd1);
@@ -596,8 +596,8 @@ module tb_hp_fsm_q5_0;
         wait_done(5);
         axil_read(16'h20, rd_val);
         $display("  HEAD=%d (expect 5)", rd_val);
-        $display("  Verifying Q5_0 desc 0 (weights=1, expect 229376):");
-        verify_q5_result(32'h00330700, 229376, test_num);
+        $display("  Verifying Q5_0 desc 0 (weights=1, expect 14680064):");
+        verify_q5_result(32'h00330700, 14680064, test_num);
         $display("  Verifying CPU_OP desc 1 passthrough (128 bytes):");
         for (j = 0; j < 32; j = j + 1) begin
             reg [31:0] expected;
@@ -624,15 +624,15 @@ module tb_hp_fsm_q5_0;
                 fail_count = fail_count + 1;
             end
         end
-        $display("  Verifying Q5_0 desc 4 (weights=1, expect 229376):");
-        verify_q5_result(32'h00330800, 229376, test_num);
+        $display("  Verifying Q5_0 desc 4 (weights=1, expect 14680064):");
+        verify_q5_result(32'h00330800, 14680064, test_num);
 
         // =================================================================
         // Test 10: Multi-tile Q5_0 descriptor (4 tiles, all-1s)
-        //   16 rows × 896 cols, all weights=1, acts=1 → each row = 229376
+        //   16 rows × 896 cols, all weights=1, acts=1 �?each row = 14680064
         // =================================================================
         test_num = test_num + 1;
-        $display("\n--- Test %0d: Multi-tile Q5_0 (4 tiles, expect 16×229376) ---", test_num);
+        $display("\n--- Test %0d: Multi-tile Q5_0 (4 tiles, expect 16×14680064) ---", test_num);
         setup_q5_desc(32'h00300240, 32'h00000000,
                       32'h00322000, 32'h00325000, 32'h00330880, 1792, 16'd4);
         // Fill 4 tiles of weight data at 2696-byte stride
@@ -650,7 +650,7 @@ module tb_hp_fsm_q5_0;
         axil_read(16'h20, rd_val); $display("  HEAD=%d (expect 1)", rd_val);
         for (j = 0; j < 4; j = j + 1) begin
             $display("  Verifying tile %0d (rows %0d-%0d):", j, j*4, j*4+3);
-            verify_q5_result(32'h00330880 + j * 32, 229376, test_num);
+            verify_q5_result(32'h00330880 + j * 32, 14680064, test_num);
         end
 
         // Summary
@@ -668,3 +668,4 @@ module tb_hp_fsm_q5_0;
         $finish;
     end
 endmodule
+

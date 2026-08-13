@@ -398,7 +398,7 @@ All cores output S24.8 fixed-point (48-bit accumulator, zero-extended to 64-bit 
 | `matmul_q5_0_core.v` | 4×896 | 1904 | ✅ Per-block wide register interface, no LUTRAM |
 | `matmul_int16_core.v` | 64×64 | 515 | ✅ Working |
 | `matmul_top.v` | — | — | ✅ 5 cores instantiated (Q8, Q4K, Q5_0, Q6_K, INT16) |
-| `hp_fsm_top.v` | HP FSM + Q8 + Q5_0 | N/A | ✅ Descriptor-chain DMA, Q8 compute 64×896 (14-group, uniform-data validated; address advancement + DDR layout bugs fixed 2026-08-12), Q5_0 4×896 (2-core, per-block wide register interface) |
+| `hp_fsm_top.v` | HP FSM + Q8 + Q5_0 | N/A | ✅ Descriptor-chain DMA, Q8 compute 64×896 (14-group, uniform-data validated; address advancement + DDR layout bugs fixed 2026-08-12), Q5_0 4×896 (2-core, per-block wide register interface; f16_decode widened S24.8→S24.16 2026-08-13 for small-block-scale precision) |
 
 ### Missing Verilog Cores:
 

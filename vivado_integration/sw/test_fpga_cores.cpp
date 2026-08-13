@@ -82,13 +82,13 @@ static uint16_t f32_to_f16(float f) {
     return (s<<15)|((f16_e&0x1F)<<10)|(f16_m&0x3FF);
 }
 
-// f16_decode matching Verilog matmul_q5_0_core.v (sign-agnostic, S24.8 output: 1.0→256)
+// f16_decode matching Verilog matmul_q5_0_core.v (sign-agnostic, S24.16 output: 1.0→65536)
 static int32_t f16_decode_c(uint16_t f16) {
     int32_t exp = (f16 >> 10) & 0x1F;
     int32_t mant = f16 & 0x3FF;
     if (exp == 0 || exp == 31) return 0;
-    if (exp >= 17) return (1024 + mant) << (exp - 17);
-    return ((1024 + mant + (1 << (16 - exp))) >> (17 - exp));
+    if (exp >= 9) return (1024 + mant) << (exp - 9);
+    return ((1024 + mant + (1 << (8 - exp))) >> (9 - exp));
 }
 
 static void gen_q5_tile(uint8_t* buf, int8_t q5_val) {
@@ -135,10 +135,12 @@ static void test_q5(const char* name, int idx, int8_t q5_val) {
     // Read results (4 rows)
     uint32_t* r32 = (uint32_t*)(uintptr_t)res;
     // FPGA: d_pre = f16_decode(d) × norm >> 8, acc = Σ d_pre × q5 × act
-    // d = 1.0 → f16_decode(0x3C00)=256, norm=256 → d_pre=256
+    // d = 1.0 → f16_decode(0x3C00)=65536, norm=256 → d_pre=65536 (clamp S16→32767)
     // q5_decoded = q5_val, act=1 → row = d_pre × q5_val × 896
-    int32_t d_fp   = f16_decode_c(f32_to_f16(1.0f));   // 256
-    int32_t d_pre  = (d_fp * 256) >> 8;                 // norm=256 UQ8.8 → 256
+    int32_t d_fp   = f16_decode_c(f32_to_f16(1.0f));   // 65536
+    int32_t d_pre  = (d_fp * 256) >> 8;                 // 65536
+    if (d_pre > 32767) d_pre = 32767;                   // S16 clamp
+    if (d_pre < -32768) d_pre = -32768;
     float expected = (float)(d_pre * q5_val) * 896.0f;
     int ok = 1;
     for (int i = 0; i < 4 && ok; i++)
@@ -160,8 +162,8 @@ static void test_q5_golden(const char* name, int idx) {
     for (r = 0; r < 4; r++) {
         for (blk = 0; blk < 28; blk++) {
             uint8_t* b = lp + (r * 28 + blk) * 22;
-            // distinct d: 0.25 + 0.02*(r*28+blk), range 0.25..2.47
-            uint16_t d_f16 = f32_to_f16(0.25f + 0.02f * (float)(r * 28 + blk));
+            // distinct d: 0.01 + 0.003*(r*28+blk), range 0.01..0.343 (no S16 saturation)
+            uint16_t d_f16 = f32_to_f16(0.01f + 0.003f * (float)(r * 28 + blk));
             b[0] = (uint8_t)(d_f16 & 0xFF); b[1] = (uint8_t)(d_f16 >> 8);
             for (wi = 0; wi < 16; wi++) b[6 + wi] = 0;
             uint32_t qh = 0;

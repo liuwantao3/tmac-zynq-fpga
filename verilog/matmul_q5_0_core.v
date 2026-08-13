@@ -152,8 +152,10 @@ module matmul_q5_0_core (
     wire       qh = blk_qh_r[wi_for_prod];
     wire signed [4:0] q5 = $signed({1'b0, {qh, ql}}) - $signed(6'd16);
 
-    // ── f16 decode: (1.mant) × 2^(exp-15) scaled to S24.8 ──
-    // Output is S24.8 fixed-point: 1.0 f16 → 256
+    // ── f16 decode: (1.mant) × 2^(exp-15) scaled to S24.16 ──
+    // Output is S24.16 fixed-point: 1.0 f16 → 65536 (16 fractional bits,
+    // enough to preserve small Q5_0 block scales; was S24.8 = 1.0→256 which
+    // rounded d<0.004 to zero).
     function signed [31:0] f16_decode;
         input [15:0] f16;
         reg [4:0] exp;
@@ -163,18 +165,21 @@ module matmul_q5_0_core (
             mant = f16[9:0];
             if (exp == 5'd0 || exp == 5'd31)
                 f16_decode = 32'sd0;
-            else if (exp >= 5'd17)
-                f16_decode = $signed((32'd1024 + mant) << (exp - 5'd17));
+            else if (exp >= 5'd9)
+                f16_decode = $signed((32'd1024 + mant) << (exp - 5'd9));
             else
                 f16_decode = $signed(({1'b0, 32'd1024 + mant} +
-                    (32'd1 << (5'd17 - exp - 5'd1))) >>> (5'd17 - exp));
+                    (32'd1 << (5'd9 - exp - 5'd1))) >>> (5'd9 - exp));
         end
     endfunction
 
     // ── d_pre = f16_decode(d) × norm >> 8, clamped to S16 ──
-    // f16_decode output is S24.8 (1.0 = 256).
+    // f16_decode output is S24.16 (1.0 = 65536).
     // norm is UQ8.8 (1.0 = 256).
     // d_pre = d_fp × norm / 256 = f16_decode(d) × norm >> 8.
+    // NOTE: d_pre stays S16 so the dq multiplier (16×5) and DSP MAC (21×16)
+    // keep their widths — the extra fractional precision lives entirely in
+    // f16_decode's S24.16 scale, at zero resource cost.
     wire signed [31:0] d_fp       = f16_decode(blk_d_r);
     wire [1:0] norm_idx           = {core_id, row_high};
     wire signed [16:0] norm_s     = $signed({1'b0, row_norm[norm_idx]});

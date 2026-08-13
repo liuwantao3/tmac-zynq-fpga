@@ -398,13 +398,13 @@ static float quantize(const float* x, int16_t* xq, int n) {
 // These replicate the exact integer/fixed-point arithmetic of the Q8/Q5 cores,
 // so FPGA raw accumulators can be compared against a float-free reference.
 
-// f16 -> S24.8 (1.0 -> 256), sign-agnostic, bit-exact port of the Verilog.
-static inline int32_t f16_decode_s248(uint16_t f16) {
+// f16 -> S24.16 (1.0 -> 65536), sign-agnostic, bit-exact port of the Verilog.
+static inline int32_t f16_decode_s2416(uint16_t f16) {
     int32_t exp  = (f16 >> 10) & 0x1F;
     int32_t mant = f16 & 0x3FF;
     if (exp == 0 || exp == 31) return 0;
-    if (exp >= 17) return (1024 + mant) << (exp - 17);
-    return ((1024 + mant) + (1 << (16 - exp))) >> (17 - exp);
+    if (exp >= 9) return (1024 + mant) << (exp - 9);
+    return ((1024 + mant) + (1 << (8 - exp))) >> (9 - exp);
 }
 
 // Q8 combined scale for weight (row, col): UQ8.8 = round(block_scale/row_scale*256).
@@ -439,7 +439,7 @@ static void q8_golden_raw(const Tensor* A, int row0, int nrows, int cols,
 
 // Q5 d_pre = clamp((f16_decode(d) * norm) >> 8, S16).
 static inline int16_t q5_d_pre_c(uint16_t d_f16, uint16_t norm) {
-    int64_t shr = ((int64_t)f16_decode_s248(d_f16) * (int64_t)norm) >> 8;
+    int64_t shr = ((int64_t)f16_decode_s2416(d_f16) * (int64_t)norm) >> 8;
     if (shr > 32767) return 32767;
     if (shr < -32768) return -32768;
     return (int16_t)shr;
@@ -544,10 +544,9 @@ static int fpga_q5_tile(const Tensor* A, int row0, const int16_t* xq,
         if (g_compare && i == 0 && row0 == 0)
             printf("    [q5 r0=%d] acc=%lld gold=%lld  xs=%.6f\n",
                    row0, raw_s, (long long)gold[i], (double)x_scale);
-        /* d_pre = f16_decode(d) = 256·d (ri=1.0). raw = Σ 256·d·q5·act.
-         * y = raw·x_scale/256 = Σ d·q5·x. (ri removed — was 32767/max_abs
-         * which saturated d_pre at S16.) */
-        y[row0+i] += (float)(int32_t)raw_s * x_scale / 256.0f;
+        /* d_pre = f16_decode(d) = 65536·d (S24.16, ri=1.0). raw = Σ 65536·d·q5·act.
+         * y = raw·x_scale/65536 = Σ d·q5·x. */
+        y[row0+i] += (float)(int32_t)raw_s * x_scale / 65536.0f;
     }
     if (g_compare && max_raw_diff > 0)
         printf("    [q5 RAWDIFF] max=%lld at row=%d\n",

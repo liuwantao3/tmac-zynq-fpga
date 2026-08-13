@@ -25,6 +25,7 @@ stored_integer = real_value × 2^(fractional_bits)
 | **S5**   | 5  (1 + 4 + 0)                | −16 … 15     | −16 … 15   | 1 |
 | **S16**  | 16 (1 + 15 + 0)               | −32768 … 32767 | −32768 … 32767 | 1 |
 | **S24.8**| 32 (1 + 23 + 8)               | ±8388608     | ±32768.0   | 256 |
+| **S24.16**| 32 (1 + 15 + 16)              | ±32768       | ±32768.0   | 65536 |
 | **UQ8.8**| 16 (8 + 8, unsigned)          | 0 … 65535    | 0 … 255.996| 256 |
 
 Key facts:
@@ -105,7 +106,7 @@ a per-row normalization `norm`, then does the dot product.
 | `norm`  | UQ8.8 | per-row normalization, `1.0` → 256 |
 | `d_pre` | S16   | reconstructed scale **after clamping** |
 | `q5`    | S5    | signed 5-bit weight (−16 … 15) |
-| `dq`    | 21-bit signed | dequantized weight (S24.8 scale) |
+| `dq`    | 21-bit signed | dequantized weight (S24.16 scale) |
 | `act`   | S16   | quantized activation |
 | `acc`   | S48   | accumulator |
 
@@ -117,92 +118,97 @@ dq    = d_pre × q5                        // 21-bit signed (16 × 5)
 acc   = Σ (dq × act)                      // 48-bit signed
 ```
 
-- `f16_decode(d)` returns S24.8: the half-precision value scaled by 256.
+- `f16_decode(d)` returns S24.16: the half-precision value scaled by 65536.
   See §4 for the exact bit-level algorithm.
 - `d_pre = f16_decode(d) × norm / 256`. With `norm = 256` (=1.0),
-  `d_pre = f16_decode(d)` — the S24.8 value unchanged.
-- `dq = d_pre × q5` is in **S24.8**: `dq / 256 = d × q5 × (norm/256)` is the real
-  dequantized weight.
+  `d_pre = f16_decode(d)` — the S24.16 value, then clamped to S16 (±32767,
+  i.e. block scales `d ≤ 0.5`).
+- `dq = d_pre × q5` is in **S24.16**: `dq / 65536 = d × q5 × (norm/256)` is the
+  real dequantized weight.
 - `dq × act` is a 21×16 signed product (37 bits); summed over 896 columns into
   the 48-bit accumulator.
 
-Because `d_pre` stays in S24.8 (the `×256` survives into `dq`), the accumulator is
-in **S24.8** (real value × 256), and the host conversion needs a **`/256`**:
+Because `d_pre` stays in S24.16 (the `×65536` survives into `dq`), the accumulator
+is in **S24.16** (real value × 65536), and the host conversion needs a **`/65536`**:
 
 ```
-y = acc × x_scale / 256
+y = acc × x_scale / 65536
 ```
 
 ### Worked example
 
-`d = 0.5` (f16), `norm = 256` (=1.0), `q5 = 5`, `act = 100`.
+`d = 0.25` (f16), `norm = 256` (=1.0), `q5 = 5`, `act = 100`.
 
 ```
-f16_decode(0.5) = 128                   (0.5 × 256)
-d_pre = (128 × 256) >>> 8 = 128         (0.5, no clamp needed)
-dq    = 128 × 5 = 640                   (640/256 = 2.5 = 0.5 × 5  ✓)
-dq × act = 640 × 100 = 64000            (64000/256 = 250 = 0.5 × 5 × 100  ✓)
+f16_decode(0.25) = 16384                  (0.25 × 65536)
+d_pre = (16384 × 256) >>> 8 = 16384       (0.25, no clamp needed)
+dq    = 16384 × 5 = 81920                 (81920/65536 = 1.25 = 0.25 × 5  ✓)
+dq × act = 81920 × 100 = 8192000          (8192000/65536 = 125 = 0.25 × 5 × 100  ✓)
 ```
 
 ---
 
 ## 4. `f16_decode` — exact bit-level algorithm
 
-Reproduced verbatim from `matmul_q5_0_core.v` (function `f16_decode`) and
-`test_fpga_cores.cpp` (`f16_decode_c`). Input is a 16-bit half; output is S24.8.
+Reproduced verbatim from `matmul_q5_0_core.v` (function `f16_decode`) and the
+golden model. Input is a 16-bit half; output is **S24.16** (16 fractional bits).
 
 ```c
-// input: uint16_t f16;  output: int32_t (S24.8)
+// input: uint16_t f16;  output: int32_t (S24.16, 1.0 -> 65536)
 int32_t exp  = (f16 >> 10) & 0x1F;      // 5-bit exponent
 int32_t mant = f16 & 0x3FF;             // 10-bit mantissa
 
-if (exp == 0 || exp == 31) return 0;                       // subnormal/inf/NaN → 0
-if (exp >= 17) return (1024 + mant) << (exp - 17);         // exact left shift
-return ((1024 + mant) + (1 << (16 - exp))) >> (17 - exp);  // round-half-up, then shift
+if (exp == 0 || exp == 31) return 0;                      // subnormal/inf/NaN -> 0
+if (exp >= 9) return (1024 + mant) << (exp - 9);          // exact left shift
+return ((1024 + mant) + (1 << (8 - exp))) >> (9 - exp);   // round-half-up, then shift
 ```
 
 Notes:
 
 - **Sign-agnostic**: bit 15 (the half's sign) is ignored — Q5_0 block scales are
   defined non-negative in GGUF.
-- The output is the half's magnitude scaled to S24.8: `value × 256`.
-- The `else` branch adds `2^(16−exp)` before shifting right `17−exp` bits, i.e.
+- The output is the half's magnitude scaled to S24.16: `value × 65536`.
+- The `else` branch adds `2^(8−exp)` before shifting right `9−exp` bits, i.e.
   round-half-up.
-- `f16_decode(1.0)` (0x3C00) = `(1024 + 0 + (1 << 1)) >> 2` = `1026 >> 2` = 256.
+- `f16_decode(1.0)` (0x3C00) = `(1024 + 0) << (15 − 9)` = `1024 << 6` = 65536.
+- **16 fractional bits** (was S24.8 / 8 bits, which rounded block scales
+  `d < 0.004` to zero). With 16 bits, `d = 0.001` → ~66, preserving small Q5_0
+  block scales.
 
 ---
 
-## 5. Structural difference: where the `256×` factor lives
+## 5. Structural difference: where the scale factor lives
 
-| | 256× removed where? | Accumulator units | Host conversion |
+| | factor removed where? | Accumulator units | Host conversion |
 |--|---------------------|-------------------|-----------------|
 | **Q8** | `deq` does `>>> 8` **before** the MAC | plain integer | `acc × x_scale × row_scale` |
-| **Q5** | `d_pre` does `>>> 8`, but `dq` re-multiplies by `q5` keeping the ×256 | **S24.8** (×256) | `acc × x_scale / 256` |
+| **Q5** | `d_pre` does `>>> 8`, but `dq` re-multiplies by `q5` keeping the ×65536 | **S24.16** (×65536) | `acc × x_scale / 65536` |
 
-This is the single most common source of off-by-256 confusion. When verifying a
-core against a reference, first confirm the accumulator scaling matches this table
-before hunting for address/layout bugs.
+This is the single most common source of off-by-scale-factor confusion. When
+verifying a core against a reference, first confirm the accumulator scaling matches
+this table before hunting for address/layout bugs.
 
 ---
 
-## 6. Accuracy implications (the `d_pre` S16 bottleneck)
+## 6. Accuracy implications (the `d_pre` fractional-precision fix)
 
 `d_pre` is **S16** (`reg signed [15:0] d_pre`, `matmul_q5_0_core.v:87`), and
-`d_pre = f16_decode(d) × norm >> 8 = d × 256 × (norm/256)`.
+`d_pre = f16_decode(d) × norm >> 8 = d × 65536 × (norm/256)`, clamped to ±32767.
 
-Two failure modes:
+The original design used **S24.8** `f16_decode` (8 fractional bits): a block scale
+`d ≈ 0.001` gave `round(0.001 × 256) = 0` → `d_pre = 0` → the whole 32-weight
+block dequantized to zero. Q5_0 block scales of `1e-3 … 1e-1` are typical, so many
+blocks lost all precision (the source of the ~5-22 `maxdiff` vs the CPU).
 
-1. **Underflow (small `d`)**: with `norm = 1.0`, `d ≈ 0.001` gives
-   `f16_decode(d) = round(0.001 × 256) = 0` → `d_pre = 0` → the whole 32-weight
-   block dequantizes to zero. Q5_0 block scales of `1e-3 … 1e-1` are typical, so
-   many blocks lose all precision.
-2. **Saturation (proper row normalization)**: with `norm = 32767/max_abs`
-   (large for small `max_abs`), `d_pre` overflows S16 and clamps at ±32767,
-   flattening the weight variation within the row.
+**Fix (2026-08-13):** `f16_decode` now outputs **S24.16** (16 fractional bits), so
+`d = 0.001` → ~66 instead of 0. This is a **zero-resource** change — only the shift
+amounts in `f16_decode` move; `d_pre` stays S16, so the `dq` LUT multiply (16×5)
+and the DSP MAC (21×16) keep their exact widths. The output scaling changes from
+`/256` to `/65536`.
 
-The clean fix is to widen `d_pre` (S16 → S24/S32) so it can hold the normalized
-scale without losing the small-block resolution or saturating. This is the primary
-accuracy lever for the Q5 path.
+Remaining trade-off: with `norm = 1.0`, block scales `d > 0.5` saturate `d_pre` at
+S16 (±32767). This is acceptable for Q5_0 (scales are small); if larger scales
+appear, the per-row `norm` (UQ8.8) can be reduced to bring them into range.
 
 The Q8 core has no equivalent bottleneck: its `sc` is UQ8.8 (wider, 0…65535) and
 the `>>> 8` is applied per-weight before the MAC, so `deq` is already in integer

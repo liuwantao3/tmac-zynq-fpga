@@ -38,16 +38,17 @@ static inline int16_t clamp_s16(int64_t v) {
 }
 
 // ===========================================================================
-// f16_decode: half -> S24.8 (1.0 -> 256). Bit-exact port of the Verilog
-// function in matmul_q5_0_core.v and test_fpga_cores.cpp (f16_decode_c).
-// Sign-agnostic (bit 15 ignored): Q5_0 block scales are non-negative.
+// f16_decode: half -> S24.16 (1.0 -> 65536). Bit-exact port of the Verilog
+// function in matmul_q5_0_core.v. Sign-agnostic (bit 15 ignored): Q5_0 block
+// scales are non-negative. 16 fractional bits (was S24.8/1.0->256) so small
+// block scales (d<0.004) no longer round to zero.
 // ===========================================================================
-static inline int32_t f16_decode_s248(uint16_t f16) {
+static inline int32_t f16_decode_s2416(uint16_t f16) {
     int32_t exp  = (f16 >> 10) & 0x1F;
     int32_t mant = f16 & 0x3FF;
-    if (exp == 0 || exp == 31) return 0;                    // subnormal/inf/NaN
-    if (exp >= 17) return (1024 + mant) << (exp - 17);      // exact
-    return ((1024 + mant) + (1 << (16 - exp))) >> (17 - exp); // round-half-up
+    if (exp == 0 || exp == 31) return 0;                     // subnormal/inf/NaN
+    if (exp >= 9) return (1024 + mant) << (exp - 9);         // exact
+    return ((1024 + mant) + (1 << (8 - exp))) >> (9 - exp);  // round-half-up
 }
 
 // ===========================================================================
@@ -102,8 +103,8 @@ static inline void q8_tile_golden(const int8_t* W,    // 64*64 row-major
 //   out[4] : S48 accumulator per row.
 // ===========================================================================
 static inline int16_t q5_d_pre(uint16_t d_f16, uint16_t norm) {
-    int64_t d_fp   = f16_decode_s248(d_f16);        // S24.8
-    int64_t shr    = (d_fp * (int64_t)norm) >> 8;   // >>> 8 (arithmetic; both non-neg)
+    int64_t d_fp   = f16_decode_s2416(d_f16);        // S24.16
+    int64_t shr    = (d_fp * (int64_t)norm) >> 8;    // >>> 8 (arithmetic; both non-neg)
     return clamp_s16(shr);
 }
 

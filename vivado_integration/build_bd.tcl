@@ -149,7 +149,7 @@ if {$gp0_seg ne ""} {
     puts "ERROR: cannot find GP0 address segment"
 }
 
-# HP0: PL→DDR at 0x00000000 (256 MB)
+# HP0: PL→DDR at 0x00000000 (512 MB = 0x20000000; matches 4 Gbit MT41J256M16)
 create_bd_addr_seg -range 0x20000000 -offset 0x00000000 \
     [get_bd_addr_spaces axi_hp_top/M_AXI_HP] \
     $hp0_seg \
