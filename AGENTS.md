@@ -95,6 +95,26 @@ Added `sim/golden_model.hpp` — bit-exact C++ models of the Q8/Q5 cores' fixed-
 - **Q5 core: bit-exact** — `test_q5_golden` all 4 rows match (37563, 80518, 123895, 166672). Confirms the Q5 arithmetic is correct; the Linux Q5 `maxdiff` (5-22) is the `d_pre` S16 precision bottleneck, not a bug.
 - **Q8 core: bit-exact after res_dout fix** — row-pattern now gives `64*(r+1)` for all 64 rows; col-pattern 2080 ✓.
 
+### Bug 5: Q8 multi-group (num_groups>1) produces garbage — OPEN
+
+Single-group Q8 (num_groups=1) is bit-exact, but the 14-group path used by the
+Linux `attn_v` tensor produces garbage: `test_q8_multigroup` (14 groups,
+col-pattern, expect 401856) returns `r0=7616`, most rows `0xFFFFFFFF`, some
+negative. This is a **pre-existing latent bug** — the multi-group path was only
+ever exercised with all-1s data (which masks it); the distinct-data test added
+2026-08-13 exposes it.
+
+Suspects (all verified correct by RTL tracing, need dedicated debug):
+- `LOAD_WEIGHT`/`LOAD_SCALES`/`LOAD_ACT` per-group address offsets (col_group*4096/256/128)
+- `READ_RES_ACC` accumulation `acc_buf[idx] <= acc_buf[idx] + q8_res_dout` (read-modify-write)
+- `COPY_ACC_TO_BUF` → `WRITE_RES` writeback
+- `q8_num_groups` (14) dispatch from descriptor
+
+Note: the Linux `act_bytes` must be **128** (one group), not 1792 (whole tile) —
+fixed 2026-08-13; this was a separate host bug, but does not resolve the RTL
+multi-group garbage. The `tb_hw_fsm_comprehensive.v` test suite has no
+multi-group distinct-data test; one should be added to debug in iVerilog.
+
 ### Q8 DDR Layout (Authoritative Reference)
 
 The correct Q8 weight layout for the HP FSM descriptor-chain path:
