@@ -479,9 +479,12 @@ static int fpga_q8_tile(const Tensor* A, const uint8_t* wt, const int16_t* xq,
     dcache_flush(ddr(FPGA_WEIGHT_REFMT), Q8_TILE_STRIDE + Q8_TILE_COLS*2);
 
     Descriptor* d = (Descriptor*)ddr(DESC_CHAIN_BASE);
+    // act_bytes = ONE group's activations (64 int16 = 128 bytes), NOT the whole
+    // 896-column tile. The FSM's LOAD_ACT runs per column-group at
+    // act_addr + col_group*128, so it reads 128 bytes/group.
     desc_write(d, 0, FPGA_WEIGHT_REFMT, FPGA_WEIGHT_REFMT+Q8_TILE_STRIDE,
                FPGA_WEIGHT_REFMT+Q8_TILE_STRIDE+0x10000, DESC_Q8,
-               Q8_NUM_GROUPS, 1, Q8_TILE_COLS*2);
+               Q8_NUM_GROUPS, 1, Q8_GROUP_COLS*2);
 
     if (chain_run(DESC_CHAIN_BASE, 1) < 0) return -1;
 
