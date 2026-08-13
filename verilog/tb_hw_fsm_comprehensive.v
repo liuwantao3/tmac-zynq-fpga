@@ -239,6 +239,39 @@ module tb_hw_fsm_comprehensive;
             ddr_write32(base_addr + j*4, 32'h01000100);
     endtask
 
+    // Fill ngroups x 4096-byte Q8 weight tiles with row-pattern W[r][c]=r+1.
+    // Row-group-major layout: 64-bit word at (g*512 + rg*64 + c) holds 8 rows
+    // (8rg..8rg+7) of column c, value r+1. Row pattern is group-independent.
+    task fill_q8_weight_rowpattern(input [31:0] base_addr, input [3:0] ngroups);
+        integer g, rg, c;
+        for (g = 0; g < ngroups; g = g + 1)
+            for (rg = 0; rg < 8; rg = rg + 1)
+                for (c = 0; c < 64; c = c + 1)
+                    ddr_mem[(base_addr >> 3) + g*512 + rg*64 + c] =
+                        64'h0807060504030201 + 8*rg * 64'h0101010101010101;
+    endtask
+
+    // Fill ngroups x 256-byte Q8 scale tiles with all-1.0 (UQ8.8 256)
+    task fill_q8_scales_all1_mg(input [31:0] base_addr, input [3:0] ngroups);
+        integer g;
+        for (g = 0; g < ngroups; g = g + 1)
+            fill_q8_scales_all1(base_addr + g*256);
+    endtask
+
+    // Multi-group Q8 descriptor (num_groups=ngroups, num_tiles=1)
+    task setup_q8_desc_mg(input [31:0] desc_addr, input [31:0] next_addr,
+                          input [31:0] weight_addr, input [31:0] act_addr,
+                          input [31:0] res_addr, input [7:0] ngroups);
+        ddr_write32(desc_addr + 0,  next_addr);
+        ddr_write32(desc_addr + 4,  weight_addr);
+        ddr_write32(desc_addr + 8,  act_addr);
+        ddr_write32(desc_addr + 12, res_addr);
+        ddr_write32(desc_addr + 16, 32'h00000000);  // tensor_type=0 (Q8_0)
+        ddr_write32(desc_addr + 20, {16'h0001, 8'h00, ngroups});  // num_groups, num_tiles=1
+        ddr_write32(desc_addr + 24, 24'd128);  // act_total_bytes = 64 x INT16 (per group)
+        ddr_write32(desc_addr + 28, 32'h00000000);
+    endtask
+
     // Fill activation with INT16 1 (0x0001 little-endian)
     task fill_act_all1(input [31:0] base_addr, input [23:0] nbytes);
         integer j;
@@ -543,6 +576,31 @@ module tb_hw_fsm_comprehensive;
             verify_q8_row(32'h00321000, i, 64'd64, test_num);
         for (i = 0; i < 64; i = i + 1)
             verify_q8_row(32'h00321200, i, 64'd64, test_num);
+        $display("  Test %0d: verify done (failures counted above)", test_num);
+
+        // ===================================================================
+        // Test 9: Q8 multi-group (14 column groups, row-pattern weights)
+        //   W[r][c] = r+1 (group-independent), scale=1.0, act=1
+        //   result[r] = 896 * (r+1)  (14 groups x 64 cols)
+        // ===================================================================
+        test_num = test_num + 1;
+        $display("\n--- Test %0d: Q8 multi-group (14 groups, row-pattern) ---", test_num);
+        // Weights: 14 groups x 4096 bytes at 0x00340000
+        fill_q8_weight_rowpattern(32'h00340000, 4'd14);
+        // Scales: 14 groups x 256 bytes at weight_addr + 14*4096 = 0x0034E000
+        fill_q8_scales_all1_mg(32'h0034E000, 4'd14);
+        // Activations: 896 x INT16 1 at 0x00350000
+        fill_act_all1(32'h00350000, 1792);
+        zero_fill(32'h00360000, 1024);
+        // Descriptor: tensor_type=0, num_groups=14, num_tiles=1, act_bytes=128
+        setup_q8_desc_mg(32'h00330040, 32'h00000000, 32'h00340000,
+                         32'h00350000, 32'h00360000, 8'd14);
+        start_chain(32'h00330040);
+        wait_done(1);
+        axil_read(16'h14, rd_val);
+        $display("  STATUS=0x%08x (expect 0x300)", rd_val);
+        for (i = 0; i < 64; i = i + 1)
+            verify_q8_row(32'h00360000, i, 896 * (i + 1), test_num);
         $display("  Test %0d: verify done (failures counted above)", test_num);
 
         // ===================================================================

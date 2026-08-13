@@ -167,10 +167,10 @@ for {set i 0} {$i < 4} {incr i} {
     puts [format "    r%d fpga=%d gold=%d %s" $i [expr [read32 $f]] [expr [read32 $g]] \
         [expr {[read32 $f] == [read32 $g] ? "MATCH" : "DIFF"}]]
 }
-puts "  multigroup fpga[0..15] (expect 401856):"
+puts "  multigroup fpga[0..15] (expect 896*(r+1)):"
 for {set i 0} {$i < 16} {incr i} {
     set f [expr $OUTPUT_BUF + 640 + $i*4]
-    puts [format "    r%2d=%d" $i [expr [read32 $f]]]
+    puts [format "    r%2d=%d (exp %d)" $i [expr [read32 $f]] [expr {896 * ($i + 1)}]]
 }
 
 puts ""

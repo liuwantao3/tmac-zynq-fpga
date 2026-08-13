@@ -383,7 +383,7 @@ static void test_q8_wpattern(const char* name, int idx, int mode) {
 static float p_all1(int r, int c) { (void)r; (void)c; return 1.0f; }
 static float p_allm1(int r, int c) { (void)r; (void)c; return -1.0f; }
 
-// ===== Q8 multi-group test: 14 groups, col-pattern, expect 401856 =====
+// ===== Q8 multi-group test: 14 groups, row-pattern, expect 896*(r+1) =====
 static void test_q8_multigroup(const char* name, int idx) {
     OUT(2, 0x80000000 | idx);
     uint32_t wt = 0x1F004000, act_a = 0x1F002000, res = 0x1F003000, desc = 0x1F001000;
@@ -392,11 +392,11 @@ static void test_q8_multigroup(const char* name, int idx) {
     int16_t* aq = (int16_t*)(uintptr_t)act_a;
     int g, r, c;
 
-    // 14 groups of weights: W[r][global_col] = global_col+1 (col-pattern)
+    // 14 groups of weights: W[r][c] = r+1 (row-pattern, group-independent, fits INT8)
     for (g = 0; g < 14; g++)
         for (r = 0; r < 64; r++)
             for (c = 0; c < 64; c++)
-                W[g*4096 + (r>>3)*512 + c*8 + (r&7)] = (uint8_t)(int8_t)(g*64 + c + 1);
+                W[g*4096 + (r>>3)*512 + c*8 + (r&7)] = (uint8_t)(int8_t)(r+1);
     // 14 groups of scales: all 1.0 (256)
     for (g = 0; g < 14; g++)
         for (r = 0; r < 64; r++)
@@ -419,7 +419,7 @@ static void test_q8_multigroup(const char* name, int idx) {
     for (r = 0; r < 64; r++) {
         long long fpga = read48(r32, r);
         if (r < 16) OUT(160 + r, (uint32_t)(int32_t)fpga);
-        if (fpga != 401856) { ok = 0; break; }  // Σ(c+1) for c=0..895 = 896*897/2
+        if (fpga != 896LL * (r + 1)) { ok = 0; break; }  // 896*(r+1)
     }
     OUT(12+idx, ok?1u:0u);
     uart_init();
