@@ -156,20 +156,29 @@ module matmul_q5_0_core (
     // Output is S24.16 fixed-point: 1.0 f16 → 65536 (16 fractional bits,
     // enough to preserve small Q5_0 block scales; was S24.8 = 1.0→256 which
     // rounded d<0.004 to zero).
+    //
+    // SIGN-HANDLING (2026-08-14): llama.cpp quantizes Q5_0 blocks with the
+    // negative-d trick (d = max/-16, where max is the largest-|value| element
+    // and can be negative). ~50% of real blocks have a negative d, and the
+    // dequant (q-16)·d REQUIRES the sign of d. This function previously
+    // ignored bit 15 (decoding |d|), which sign-flipped every weight in every
+    // negative-d block. Bit 15 is now applied to negate the magnitude.
     function signed [31:0] f16_decode;
         input [15:0] f16;
         reg [4:0] exp;
         reg [9:0] mant;
+        reg [31:0] mag;
         begin
             exp = f16[14:10];
             mant = f16[9:0];
             if (exp == 5'd0 || exp == 5'd31)
-                f16_decode = 32'sd0;
+                mag = 32'd0;
             else if (exp >= 5'd9)
-                f16_decode = $signed((32'd1024 + mant) << (exp - 5'd9));
+                mag = (32'd1024 + mant) << (exp - 5'd9);
             else
-                f16_decode = $signed(({1'b0, 32'd1024 + mant} +
-                    (32'd1 << (5'd9 - exp - 5'd1))) >>> (5'd9 - exp));
+                mag = ({1'b0, 32'd1024 + mant} +
+                    (32'd1 << (5'd9 - exp - 5'd1))) >>> (5'd9 - exp);
+            f16_decode = f16[15] ? -$signed(mag) : $signed(mag);
         end
     endfunction
 

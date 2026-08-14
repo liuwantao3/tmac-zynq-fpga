@@ -298,13 +298,31 @@ module matmul_q8_core (
                         endcase
                     end
                     if (acc_clr_cnt == 7) begin
-                        // Pre-load BRAM addresses for first COMPUTE read (g=0,k=0)
+                        // Pre-load BRAM addresses for first COMPUTE reads.
+                        // wmem is anticipated 1 iteration ahead (g=0,k=0),
+                        // act/smem are anticipated 2 iterations ahead (g=1,k=0).
+                        // The smem/act addresses for the FIRST entry were already
+                        // set at acc_clr_cnt==6 ({0,0}/act[0], read during cycle 0
+                        // so they appear in smem_rdata/act_rdata during cycle 1);
+                        // this edge advances them to the SECOND entry's addresses
+                        // (S(1,0)/act[0], read during cycle 1 -> cycle 2).
                         pre_wmem_addr <= {3'd0, 6'd0};
-                        pre_smem_addr <= {3'd0, 1'b0};
+                        pre_smem_addr <= {3'd1, 1'b0};
                         pre_act_addr <= 6'd0;
+                        pre_g <= 3'd0;
+                        pre_k <= 6'd0;
                         pre_valid <= 1;  // pre-valid for first Stage 0 capture
                         state <= COMPUTE;
                     end else begin
+                        // One cycle early: arm the smem/act reads for the FIRST
+                        // COMPUTE entry (g=0,k=0). Effective during the next
+                        // (acc_clr_cnt==7) cycle, so the reads at its edge
+                        // capture S(0,0)/act[0] into smem_rdata/act_rdata during
+                        // the first COMPUTE cycle.
+                        if (acc_clr_cnt == 6) begin
+                            pre_smem_addr <= {3'd0, 1'b0};
+                            pre_act_addr <= 6'd0;
+                        end
                         acc_clr_cnt <= acc_clr_cnt + 1;
                     end
                 end
@@ -375,17 +393,23 @@ module matmul_q8_core (
                     end
                     pre_valid <= 1;
 
-                    // Set BRAM read addresses for the next iteration
-                    // Uses g/k from the current cycle (NBA reads old values,
-                    // same as the counter update below). Moved here from a
-                    // separate always block to avoid cross-block synthesis hazard.
+                    // Set BRAM read addresses for the next iteration.
+                    // act/smem go through an extra Stage-0 register (1 more
+                    // cycle of latency than wmem, which feeds Stage 1a directly),
+                    // so their addresses are anticipated 2 iterations ahead
+                    // (column k+1 when g>=6, i.e. one wrap away) while wmem is
+                    // anticipated only 1 iteration ahead.
                     if (g == 7) begin
                         pre_wmem_addr <= {3'd0, k + 6'd1};
+                        pre_smem_addr <= {3'd1, (k + 6'd1) >= 32};
+                        pre_act_addr <= k + 6'd1;
+                    end else if (g == 6) begin
+                        pre_wmem_addr <= {g + 3'd1, k};
                         pre_smem_addr <= {3'd0, (k + 6'd1) >= 32};
                         pre_act_addr <= k + 6'd1;
                     end else begin
                         pre_wmem_addr <= {g + 3'd1, k};
-                        pre_smem_addr <= {g + 3'd1, k[5]};
+                        pre_smem_addr <= {g + 3'd2, k[5]};
                         pre_act_addr <= k;
                     end
 

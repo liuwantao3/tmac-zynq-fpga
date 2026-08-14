@@ -14,6 +14,7 @@
 #include <iostream>
 #include <chrono>
 #include "fpga_sim.hpp"
+#include "golden_model.hpp"
 // ===========================================================================
 // CHROME TRACE EVENT PROFILER
 // ===========================================================================
@@ -183,6 +184,7 @@ static bool g_fpga_q5_0 = false;
 static bool g_fpga_q6_k = false;
 static bool g_fpga_phaseb = false;
 static bool g_dump_phaseb = false;
+static bool g_compare = false;
 
 // Phase B per-descriptor verification slot — stores expected results + scales
 struct PhaseBVerifySlot {
@@ -470,7 +472,62 @@ void matmul_fpga_q5_0(const Tensor* A, const float* x, float* y, int rows, int c
 void matmul_fpga_q6_k(const Tensor* A, const float* x, float* y, int rows, int cols);
 void get_logits_q8(float* logits, const float* hidden);
 
+static const char* tensor_type_name(uint32_t t) {
+    switch (t) {
+        case TENSOR_Q8_0: return "Q8_0";
+        case TENSOR_Q5_0: return "Q5_0";
+        case TENSOR_Q6_K: return "Q6_K";
+        case TENSOR_Q4_K: return "Q4_K";
+        case TENSOR_F32:  return "F32";
+        default:          return "?";
+    }
+}
+
+/* Pure-CPU float reference for a matmul (matches the non-FPGA branch below). */
+static void matmul_cpu_ref(const Tensor* A, const float* x, float* y, int rows, int cols) {
+    for (int i = 0; i < rows; i++) {
+        float sum = 0;
+        for (int j = 0; j < cols; j++) sum += read_tensor(A, i, j) * x[j];
+        y[i] = sum;
+    }
+}
+
 void matmul(const Tensor* A, const float* x, float* y, int rows, int cols) {
+    if (g_compare) {
+        /* run both paths and report the difference (mirrors board --compare) */
+        static std::vector<float> y_cpu, y_fpga;
+        y_cpu.resize(rows);
+        y_fpga.resize(rows);
+        matmul_cpu_ref(A, x, y_cpu.data(), rows, cols);
+        /* FPGA path dispatch, matching matmul()'s g_use_fpga branches */
+        if (g_fpga_q5_0 && A->type == TENSOR_Q5_0) {
+            matmul_fpga_q5_0(A, x, y_fpga.data(), rows, cols);
+        } else if (g_fpga_q6_k && A->type == TENSOR_Q6_K) {
+            matmul_fpga_q6_k(A, x, y_fpga.data(), rows, cols);
+        } else if (g_fpga_q4k && A->type == TENSOR_Q4_K) {
+            matmul_fpga_q4_k(A, x, y_fpga.data(), rows, cols);
+        } else if (g_fpga_q8 && A->type == TENSOR_Q8_0) {
+            matmul_fpga_q8(A, x, y_fpga.data(), rows, cols);
+        } else {
+            matmul_cpu_ref(A, x, y_fpga.data(), rows, cols);
+        }
+        float md = 0; float sum_sq = 0;
+        for (int i = 0; i < rows; i++) {
+            float d = y_fpga[i] - y_cpu[i]; if (d < 0) d = -d;
+            if (d > md) md = d;
+            sum_sq += d * d;
+        }
+        float rms = (rows > 0) ? sqrtf(sum_sq / rows) : 0.0f;
+        bool fpga_used = (g_fpga_q5_0 && A->type == TENSOR_Q5_0) ||
+                         (g_fpga_q6_k && A->type == TENSOR_Q6_K) ||
+                         (g_fpga_q4k && A->type == TENSOR_Q4_K) ||
+                         (g_fpga_q8 && A->type == TENSOR_Q8_0);
+        printf("  cmp %-30s %-6s %5dx%-5d cpu[0]=%12.4f fpga[0]=%12.4f maxdiff=%12.5f rms=%10.5f %s\n",
+               A->name, tensor_type_name(A->type), rows, cols,
+               y_cpu[0], y_fpga[0], md, rms, fpga_used ? "FPGA" : "cpu");
+        memcpy(y, y_fpga.data(), rows * sizeof(float));
+        return;
+    }
     if (g_use_fpga) {
         if (g_fpga_q5_0 && A->type == TENSOR_Q5_0) {
             matmul_fpga_q5_0(A, x, y, rows, cols);
@@ -485,11 +542,7 @@ void matmul(const Tensor* A, const float* x, float* y, int rows, int cols) {
         }
         return;
     }
-    for (int i = 0; i < rows; i++) {
-        float sum = 0;
-        for (int j = 0; j < cols; j++) sum += read_tensor(A, i, j) * x[j];
-        y[i] = sum;
-    }
+    matmul_cpu_ref(A, x, y, rows, cols);
 }
 
 void matmul_transposed(const Tensor* A, const float* x, float* y, int rows, int cols) {
@@ -1041,7 +1094,16 @@ void matmul_fpga_q8(const Tensor* A, const float* x, float* y, int rows, int col
             fpga_sim::in16_t vec[fpga_sim::N] = {0};
             for (int k = 0; k < c_size; k++) vec[k] = x_q[c + k];
 
-            fpga_sim::acc16_t result[fpga_sim::N] = {0};
+            // Bit-exact RTL model: golden::q8_tile_golden (same fixed-point as
+            // matmul_q8_core.v; the board's q8_golden_raw uses the same logic).
+            // q8_tile[][] is col-major (q8_tile[col][row]); transpose to row-major.
+            int8_t W_rowmajor[fpga_sim::N * fpga_sim::N] = {0};
+            for (int i = 0; i < r_size; i++)
+                for (int k = 0; k < c_size; k++)
+                    W_rowmajor[i * fpga_sim::N + k] = (int8_t)q8_tile[k][i];
+
+            int64_t out[fpga_sim::N] = {0};
+            golden::q8_tile_golden(W_rowmajor, combined_scales, (const int16_t*)vec, out);
 
             // Cosimulation tile dump
             if (g_dump_file && g_dump_tiles_remaining > 0) {
@@ -1049,31 +1111,17 @@ void matmul_fpga_q8(const Tensor* A, const float* x, float* y, int rows, int col
                 fwrite(q8_tile, 1, sizeof(q8_tile), g_dump_file);
                 fwrite(combined_scales, 2, fpga_sim::N * 2, g_dump_file);
                 fwrite(vec, 2, fpga_sim::N, g_dump_file);
-                // Compute reference result via fpga_sim
-                fpga_sim::axi_vecmul_tile_q8(
-                    (const uint8_t*)q8_tile,
-                    combined_scales,
-                    vec,
-                    result
-                );
-                fwrite(result, 8, fpga_sim::N, g_dump_file);
+                fwrite(out, 8, fpga_sim::N, g_dump_file);
                 g_dump_tiles_remaining--;
                 if (g_dump_tiles_remaining == 0) {
                     fclose(g_dump_file);
                     g_dump_file = nullptr;
                     printf("[COSIM] Dumped all tiles to /tmp/cosim_tiles.bin\n");
                 }
-            } else {
-                fpga_sim::axi_vecmul_tile_q8(
-                    (const uint8_t*)q8_tile,
-                    combined_scales,
-                    vec,
-                    result
-                );
             }
 
             for (int i = 0; i < r_size; i++)
-                y[r + i] += (double)result[i] * x_scale * row_scale[i];
+                y[r + i] += (double)out[i] * x_scale * row_scale[i];
 
             fpga_sim::g_timing.total_tiles++;
         }
@@ -1232,62 +1280,62 @@ void matmul_fpga_q5_0(const Tensor* A, const float* x, float* y, int rows, int c
 
     fpga_sim::g_timing.total_mac_ops += (int64_t)rows * cols;
 
-    constexpr int TILE_ROWS = 8;
-    constexpr int BLOCKS_PER_ROW = 28;     // 896 / 32 = 28 blocks per row
-    constexpr int BLOCKS_PER_TILE = 224;   // 8 rows × 28
+    // Match the board's Q5_0 path (linux/tmac_linux.c fpga_q5_tile):
+    //   ri = 1.0, norm = 256 (UQ8.8 1.0)  -- NO row_inv normalization
+    //   d_pre = clamp((f16_decode(d)*norm)>>8) = clamp(65536*d)  (S24.16)
+    //   dq    = d_pre * q5                 (21-bit)
+    //   acc   = SUM(dq * act)              (S48)
+    //   y     = acc * x_scale / 65536      (raw scaled back)
+    // Bit-exact model: golden::q5_tile_golden (hardware-verified vs matmul_q5_0_core.v)
+    constexpr int TILE_ROWS = 4;          // Q5_TILE_ROWS (2-core, 4-row tile)
+    constexpr int BLOCKS_PER_ROW = 28;    // 896 / 32 = 28 blocks per row
+    constexpr int BLOCKS_PER_TILE = 224;  // PhaseB packs 8-row tiles (TR=8)
 
     uint64_t row_stride_blocks = (uint64_t)cols / fpga_sim::Q5_0_BLOCK_SIZE;  // 28
 
-    // Pre-compute row_inv (FP32) for all rows
-    std::vector<float> row_inv(rows);
-    for (int row = 0; row < rows; row++) {
-        float max_abs = 0.0f;
-        uint64_t base_block = (uint64_t)row * row_stride_blocks;
-        for (uint64_t b = 0; b < BLOCKS_PER_ROW; b++) {
-            const uint8_t* blk = A->data + (base_block + b) * fpga_sim::Q5_0_BLOCK_BYTES;
-            float d = fpga_sim::read_f16(blk);
-            uint32_t qh = (uint32_t)blk[2] | ((uint32_t)blk[3] << 8) |
-                          ((uint32_t)blk[4] << 16) | ((uint32_t)blk[5] << 24);
-            for (int wi = 0; wi < 32; wi++) {
-                uint64_t j = wi < 16 ? wi : wi - 16;
-                uint8_t qs_byte = blk[6 + j];
-                uint8_t ql = (wi < 16) ? (qs_byte & 0xF) : (qs_byte >> 4);
-                uint8_t qh_bit = (qh >> wi) & 1;
-                int q = ((qh_bit << 4) | ql) - 16;
-                float ab = fabsf(d * (float)q);
-                if (ab > max_abs) max_abs = ab;
-            }
-        }
-        max_abs = (max_abs < 1e-10f) ? 1.0f : max_abs;
-        row_inv[row] = 32767.0f / max_abs;
-    }
+    uint16_t norm[TILE_ROWS];
+    for (int i = 0; i < TILE_ROWS; i++) norm[i] = 0x0100;  // UQ8.8 1.0 (board ri=1.0)
 
-    std::vector<int64_t> tile_result(rows, 0);
+    // PhaseB descriptor path below still needs a per-row FP32 norm vector (all 1.0)
+    std::vector<float> row_inv(rows, 1.0f);
 
     for (int row0 = 0; row0 < rows; row0 += TILE_ROWS) {
         int r_size = std::min(TILE_ROWS, rows - row0);
 
-        // Load 224 Q5_0 blocks
-        uint8_t blocks[fpga_sim::Q5_0_224BLOCK_BYTES];
-        uint64_t tile_base_block = (uint64_t)row0 * row_stride_blocks;
-        for (int bi = 0; bi < BLOCKS_PER_TILE; bi++) {
-            memcpy(blocks + bi * fpga_sim::Q5_0_BLOCK_BYTES,
-                   A->data + (tile_base_block + bi) * fpga_sim::Q5_0_BLOCK_BYTES,
-                   fpga_sim::Q5_0_BLOCK_BYTES);
+        // GGUF Q5_0 blocks are row-major: blocks[row][blk][22]; 4 rows contiguous.
+        const uint8_t* blocks = A->data +
+            (uint64_t)(row0 * row_stride_blocks) * fpga_sim::Q5_0_BLOCK_BYTES;
+
+        int64_t out[TILE_ROWS];
+        golden::q5_tile_golden(blocks, norm, x_q.data(), out);
+
+        for (int i = 0; i < r_size; i++) {
+            y[row0 + i] += (float)out[i] * x_scale / 65536.0f;
         }
 
-            fpga_sim::axi_vecmul_tile_q5_0_8x896_axilite(
-                blocks, x_q.data(), row_inv.data() + row0, tile_result.data(), row0);
-
-            // Cosimulation tile dump for Q5_0
-            if (g_dump_q5_0_file && g_dump_q5_0_tiles_remaining > 0) {
-                // Dump: 224 blocks (4928) + scales (8*4 FP32) + activations (896*2) + expected result (8*8 int64)
-                fwrite(blocks, 1, fpga_sim::Q5_0_224BLOCK_BYTES, g_dump_q5_0_file);
+            // Cosimulation tile dump for Q5_0 (8-row format, kept for tb_cosim_q5_0.v)
+            if (g_dump_q5_0_file && g_dump_q5_0_tiles_remaining > 0 && (row0 & 7) == 0) {
+                uint8_t dblocks[fpga_sim::Q5_0_224BLOCK_BYTES];
+                uint64_t dbase = (uint64_t)row0 * row_stride_blocks;
+                for (int bi = 0; bi < 224; bi++) {
+                    memcpy(dblocks + bi * fpga_sim::Q5_0_BLOCK_BYTES,
+                           A->data + (dbase + bi) * fpga_sim::Q5_0_BLOCK_BYTES,
+                           fpga_sim::Q5_0_BLOCK_BYTES);
+                }
+                fwrite(dblocks, 1, fpga_sim::Q5_0_224BLOCK_BYTES, g_dump_q5_0_file);
                 fwrite(x_q.data(), 2, 896, g_dump_q5_0_file);
-                fwrite(row_inv.data() + row0, 4, 8, g_dump_q5_0_file);
+                float ri8[8];
+                for (int i = 0; i < 8; i++) ri8[i] = 1.0f;
+                fwrite(ri8, 4, 8, g_dump_q5_0_file);
                 int64_t ref_result[8] = {0};
-                fpga_sim::axi_vecmul_tile_q5_0_8x896_axilite(
-                    blocks, x_q.data(), row_inv.data() + row0, ref_result, row0);
+                uint16_t norm8[8];
+                for (int i = 0; i < 8; i++) norm8[i] = 0x0100;
+                for (int sub = 0; sub < 2; sub++) {
+                    int64_t o8[4];
+                    golden::q5_tile_golden(dblocks + sub * 112 * fpga_sim::Q5_0_BLOCK_BYTES,
+                                           norm8, x_q.data(), o8);
+                    for (int i = 0; i < 4; i++) ref_result[sub * 4 + i] = o8[i];
+                }
                 fwrite(ref_result, 8, 8, g_dump_q5_0_file);
                 g_dump_q5_0_tiles_remaining--;
                 if (g_dump_q5_0_tiles_remaining == 0) {
@@ -1298,10 +1346,6 @@ void matmul_fpga_q5_0(const Tensor* A, const float* x, float* y, int rows, int c
             }
 
             fpga_sim::g_timing.total_tiles++;
-    }
-
-    for (int i = 0; i < rows; i++) {
-        y[i] += (double)tile_result[i] * x_scale / (double)row_inv[i];
     }
 
     // Phase B: pack tiles into DDR and build descriptor
@@ -2049,7 +2093,7 @@ void generate(float* hidden, float* logits, int prompt_len, int n_tokens, int to
 // ===========================================================================
 int main(int argc, char** argv) {
     if (argc < 2) {
-        printf("Usage: %s <model.tmac> [--generate N] [--dump-layers] [--fpga] [--fpga-int16] [--fpga-q8] [--fpga-q4k] [--fpga-q5-0] [--fpga-q6-k] [--perf] [--dump-tiles N] [--dump-tiles-q6-k N] [--dump-tiles-q5-0 N]\n", argv[0]);
+        printf("Usage: %s <model.tmac> [--generate N] [--greedy] [--dump-layers] [--fpga] [--fpga-int16] [--fpga-q8] [--fpga-q4k] [--fpga-q5-0] [--fpga-q6-k] [--perf] [--dump-tiles N] [--dump-tiles-q6-k N] [--dump-tiles-q5-0 N]\n", argv[0]);
         printf("  Prompt tokens read from stdin, generated tokens printed to stdout\n");
         printf("  --fpga:       Same as --fpga-int16 (recommended path)\n");
         printf("  --fpga-int16: Pre-dequant all tensors to INT16 on CPU, INT16×INT16 FPGA path\n");
@@ -2060,6 +2104,7 @@ int main(int argc, char** argv) {
         printf("  --fpga-phaseb: Build Phase B descriptor chain (alongside AXI-Lite path)\n");
 
         printf("  --perf:       Enable pipeline profiling (Chrome trace JSON + bottleneck analysis)\n");
+        printf("  --compare:    Run CPU reference AND FPGA path per matmul, print maxdiff (host-only A/B)\n");
         printf("  --dump-tiles N: Dump first N Q8 tiles for Verilog cosimulation\n");
         printf("  --dump-tiles-q6-k N: Dump first N Q6_K tiles for Verilog cosimulation\n");
         printf("  --dump-tiles-q5-0 N: Dump first N Q5_0 tiles for Verilog cosimulation\n");
@@ -2077,10 +2122,12 @@ int main(int argc, char** argv) {
     float* logits = new float[VOCAB_SIZE];
     int generate_n = 0;
     bool dump_layers = false;
+    int top_k = 40;
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--generate") == 0 && i + 1 < argc) {
             generate_n = atoi(argv[++i]);
         }
+        if (strcmp(argv[i], "--greedy") == 0) { top_k = 1; }
         if (strcmp(argv[i], "--dump-layers") == 0) dump_layers = true;
         if (strcmp(argv[i], "--fpga") == 0) { g_use_fpga = true; }
         if (strcmp(argv[i], "--fpga-int16") == 0) { g_use_fpga = true; }
@@ -2089,6 +2136,7 @@ int main(int argc, char** argv) {
         if (strcmp(argv[i], "--fpga-q5-0") == 0) { g_use_fpga = true; g_fpga_q5_0 = true; }
         if (strcmp(argv[i], "--fpga-q6-k") == 0) { g_use_fpga = true; g_fpga_q6_k = true; }
         if (strcmp(argv[i], "--fpga-phaseb") == 0) { g_fpga_phaseb = true; g_use_fpga = true; g_fpga_q5_0 = true; g_fpga_q6_k = true; g_fpga_q4k = true; g_fpga_q8 = true; }
+        if (strcmp(argv[i], "--compare") == 0) { g_compare = true; g_use_fpga = true; }
 
         if (strcmp(argv[i], "--dump-phaseb") == 0) { g_dump_phaseb = true; }
         if (strcmp(argv[i], "--perf") == 0) g_perf_enabled = true;
@@ -2146,7 +2194,7 @@ int main(int argc, char** argv) {
     }
 
     if (generate_n > 0) {
-        generate(hidden, logits, (int)tokens.size(), generate_n, 40);
+        generate(hidden, logits, (int)tokens.size(), generate_n, top_k);
     } else {
         if (g_fpga_q8) {
             get_logits_q8(logits, hidden);

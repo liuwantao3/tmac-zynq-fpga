@@ -684,7 +684,6 @@ module hp_fsm_top (
                             // Q8 compute path (default)
                             compute_type <= 0;
                             q8_num_tiles <= ({desc_buf[23], desc_buf[22]} == 0) ? 16'd1 : {desc_buf[23], desc_buf[22]};
-                            q8_tile_counter <= 0;
                             q8_tile_stride <= ({((desc_buf[20][3:0] != 0) ? desc_buf[20][3:0] : reg_q8_num_groups), 12'd0}) + ((desc_buf[20][3:0] != 0) ? desc_buf[20][3:0] : reg_q8_num_groups) * 16'd256;
                             col_group     <= 0;
                             wt_byte_idx   <= 0;

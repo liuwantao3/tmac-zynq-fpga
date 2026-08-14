@@ -58,6 +58,14 @@ sim_q5_0: $(Q5_0_SRC)
 	$(IVERILOG) $(FLAGS) -o $(Q5_0_TOP).vvp $(Q5_0_SRC)
 	$(VVP) $(Q5_0_TOP).vvp
 
+# ---- Q5_0 negative-d sign regression (2026-08-14) ----
+Q5_NEGD_SRC  = matmul_q5_0_core.v tb_q5_negd.v
+Q5_NEGD_TOP  = tb_q5_negd
+
+sim_q5_negd: $(Q5_NEGD_SRC)
+	$(IVERILOG) $(FLAGS) -o $(Q5_NEGD_TOP).vvp $(Q5_NEGD_SRC)
+	$(VVP) $(Q5_NEGD_TOP).vvp
+
 # ---- Q6_K core test ----
 Q6_K_SRC  = matmul_q6_k_core.v tb_matmul_q6_k.v
 Q6_K_TOP  = tb_matmul_q6_k
@@ -120,7 +128,7 @@ sim_phaseb: $(PHASEB_SRC)
 	$(VVP) $(PHASEB_TOP).vvp
 
 # ---- Run all tests (core unit tests only — phaseb requires C++ dump) ----
-all: sim_q8 sim_q4k sim_int16 sim_q5_0 sim_q6_k sim_hpfsm sim_hpfsm_q5_0
+all: sim_q8 sim_q4k sim_int16 sim_q5_0 sim_q5_negd sim_q6_k sim_hpfsm sim_hpfsm_q5_0
 
 # ---- Waveform viewing ----
 waves-q8:
@@ -135,4 +143,4 @@ waves-cosim:
 clean:
 	rm -f *.vvp *.vcd
 
-.PHONY: all sim_q8 sim_q4k sim_q4k_min sim_cosim sim_cosim_q4k sim_phaseb waves-q8 waves-q4k waves-cosim clean
+.PHONY: all sim_q8 sim_q4k sim_q4k_min sim_cosim sim_cosim_q4k sim_phaseb sim_q5_negd waves-q8 waves-q4k waves-cosim clean

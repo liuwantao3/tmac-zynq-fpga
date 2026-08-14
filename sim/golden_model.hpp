@@ -39,16 +39,22 @@ static inline int16_t clamp_s16(int64_t v) {
 
 // ===========================================================================
 // f16_decode: half -> S24.16 (1.0 -> 65536). Bit-exact port of the Verilog
-// function in matmul_q5_0_core.v. Sign-agnostic (bit 15 ignored): Q5_0 block
-// scales are non-negative. 16 fractional bits (was S24.8/1.0->256) so small
-// block scales (d<0.004) no longer round to zero.
+// function in matmul_q5_0_core.v. 16 fractional bits (was S24.8/1.0->256) so
+// small block scales (d<0.004) no longer round to zero.
+//
+// SIGN-HANDLING (2026-08-14): llama.cpp quantizes Q5_0 blocks with the
+// negative-d trick (d = max/-16); ~50% of real blocks have a negative d, and
+// dequant (q-16)·d requires the sign. Bit 15 is applied to negate the
+// magnitude, matching the fixed matmul_q5_0_core.v f16_decode.
 // ===========================================================================
 static inline int32_t f16_decode_s2416(uint16_t f16) {
     int32_t exp  = (f16 >> 10) & 0x1F;
     int32_t mant = f16 & 0x3FF;
-    if (exp == 0 || exp == 31) return 0;                     // subnormal/inf/NaN
-    if (exp >= 9) return (1024 + mant) << (exp - 9);         // exact
-    return ((1024 + mant) + (1 << (8 - exp))) >> (9 - exp);  // round-half-up
+    int32_t mag;
+    if (exp == 0 || exp == 31) mag = 0;                       // subnormal/inf/NaN
+    else if (exp >= 9) mag = (1024 + mant) << (exp - 9);      // exact
+    else mag = ((1024 + mant) + (1 << (8 - exp))) >> (9 - exp); // round-half-up
+    return (f16 & 0x8000) ? -mag : mag;                       // apply sign bit
 }
 
 // ===========================================================================
@@ -103,8 +109,8 @@ static inline void q8_tile_golden(const int8_t* W,    // 64*64 row-major
 //   out[4] : S48 accumulator per row.
 // ===========================================================================
 static inline int16_t q5_d_pre(uint16_t d_f16, uint16_t norm) {
-    int64_t d_fp   = f16_decode_s2416(d_f16);        // S24.16
-    int64_t shr    = (d_fp * (int64_t)norm) >> 8;    // >>> 8 (arithmetic; both non-neg)
+    int64_t d_fp   = f16_decode_s2416(d_f16);        // S24.16 (may be negative)
+    int64_t shr    = (d_fp * (int64_t)norm) >> 8;    // >>> 8 (arithmetic shift)
     return clamp_s16(shr);
 }
 

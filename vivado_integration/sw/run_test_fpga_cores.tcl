@@ -172,6 +172,21 @@ for {set i 0} {$i < 16} {incr i} {
     set f [expr $OUTPUT_BUF + 640 + $i*4]
     puts [format "    r%2d=%d (exp %d)" $i [expr [read32 $f]] [expr {896 * ($i + 1)}]]
 }
+puts "  mg_scales fpga[0..15] (expect 6720):"
+for {set i 0} {$i < 16} {incr i} {
+    set f [expr $OUTPUT_BUF + 704 + $i*4]
+    puts [format "    r%2d=%d" $i [expr [read32 $f]]]
+}
+puts "  mg_weights fpga[0..15] (expect 5824):"
+for {set i 0} {$i < 16} {incr i} {
+    set f [expr $OUTPUT_BUF + 768 + $i*4]
+    puts [format "    r%2d=%d" $i [expr [read32 $f]]]
+}
+puts "  mg_acts fpga[0..15] (expect 401856):"
+for {set i 0} {$i < 16} {incr i} {
+    set f [expr $OUTPUT_BUF + 832 + $i*4]
+    puts [format "    r%2d=%d" $i [expr [read32 $f]]]
+}
 
 puts ""
 puts "=============================================="

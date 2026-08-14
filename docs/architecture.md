@@ -22,7 +22,7 @@ Each transformer layer (blk.N):
 2. **QKV projections** → attn_q/k/v.weight + bias
    - Q: [896×896] Q5_0
    - K: [128×896] Q5_0
-   - V: [128×896] Q8_0 (12 layers) or Q5_0 (12 layers)
+   - V: [128×896] Q8_0 (layers 0,1,3,6,7,8,9,10,13,16,19,21) or Q5_0 (other 12)
 3. **RoPE** applied to Q (14 heads) and K (2 heads)
 4. **GQA attention**: 14 Q heads, 2 KV heads, 7 queries per KV
 5. **Output projection** → attn_output.weight [896×896] Q5_0
@@ -31,7 +31,7 @@ Each transformer layer (blk.N):
 8. **SwiGLU FFN**:
    - gate_proj [4864×896] Q5_0
    - up_proj [4864×896] Q5_0
-   - down_proj [896×4864] Q6_K (some layers) or Q5_0
+   - down_proj [896×4864] Q6_K (12 selected layers) or Q4_K (other 12)
 9. **Residual** + → output
 
 ### Weight tensor count breakdown (290 total)

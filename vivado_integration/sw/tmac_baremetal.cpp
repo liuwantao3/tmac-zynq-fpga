@@ -243,12 +243,12 @@ static float dequant(const Tensor* t, uint64_t idx) {
         float super = f16_to_f32((uint16_t)d[bo+208] | ((uint16_t)d[bo+209]<<8));
         uint64_t wi = idx % 256;
         int half = wi / 128, pos = wi % 128, l = pos % 32, sub = pos / 32;
-        int lo = half * 64 + l + (sub % 2) * 32;
+        int lo = bo + half * 64 + l + (sub % 2) * 32;
         uint8_t ql_n = (sub < 2) ? (d[lo] & 0xF) : (d[lo] >> 4);
-        int ho = 128 + half * 32 + l;
+        int ho = bo + 128 + half * 32 + l;
         uint8_t qh_b = (d[ho] >> (sub * 2)) & 0x3;
         int q6 = ((qh_b << 4) | ql_n) - 32;
-        int sco = 192 + half * 8 + (l / 16) + sub * 2;
+        int sco = bo + 192 + half * 8 + (l / 16) + sub * 2;
         float sf = (float)(int8_t)d[sco];
         return super * sf * (float)q6;
     }

@@ -6,18 +6,96 @@ Qwen2-0.5B FPGA accelerator targeting Zynq 7010. Multi-core Verilog RTL: INT16√ó
 
 | tensor | shape | type | C++ path | Verilog core |
 |--------|-------|------|----------|-------------|
-| `token_embd` | 151936√ó896 | Q8_0 | ‚úÖ | ‚úÖ `matmul_q8_core.v` |
-| `attn_v` | 128√ó896 | Q8_0 (12 layers) / Q5_0 (12 layers) | ‚úÖ `matmul_fpga_q8`/`matmul_fpga_q5_0` | ‚úÖ `matmul_q8_core.v` / `matmul_q5_0_core.v` |
-| `attn_q`, `attn_k`, `attn_output` | 896√ó896 | Q5_0 | ‚úÖ `matmul_fpga_q5_0` | ‚úÖ `matmul_q5_0_core.v` |
-| `ffn_gate`, `ffn_up` | 4864√ó896 | Q5_0 | ‚úÖ `matmul_fpga_q5_0` | ‚úÖ `matmul_q5_0_core.v` |
-| `ffn_down` (layers 0,1,3,6,7,8,9,10,13,16,19,21) | 896√ó4864 | Q6_K | ‚úÖ `matmul_fpga_q6_k` | ‚úÖ `matmul_q6_k_core.v` |
-| `ffn_down` (layers 2,4,5,11,12,14,15,17,18,20,22,23) | 896√ó4864 | Q4_K | ‚úÖ `matmul_fpga_q4_k` | ‚úÖ `matmul_q4k_core.v` (56√ó256 tile) |
+| `token_embd` | 151936√ó896 | Q8_0 | ‚ú?| ‚ú?`matmul_q8_core.v` |
+| `attn_v` | 128√ó896 | Q8_0 (12 layers) / Q5_0 (12 layers) | ‚ú?`matmul_fpga_q8`/`matmul_fpga_q5_0` | ‚ú?`matmul_q8_core.v` / `matmul_q5_0_core.v` |
+| `attn_q`, `attn_k`, `attn_output` | 896√ó896 | Q5_0 | ‚ú?`matmul_fpga_q5_0` | ‚ú?`matmul_q5_0_core.v` |
+| `ffn_gate`, `ffn_up` | 4864√ó896 | Q5_0 | ‚ú?`matmul_fpga_q5_0` | ‚ú?`matmul_q5_0_core.v` |
+| `ffn_down` (layers 0,1,3,6,7,8,9,10,13,16,19,21) | 896√ó4864 | Q6_K | ‚ú?`matmul_fpga_q6_k` | ‚ú?`matmul_q6_k_core.v` |
+| `ffn_down` (layers 2,4,5,11,12,14,15,17,18,20,22,23) | 896√ó4864 | Q4_K | ‚ú?`matmul_fpga_q4_k` | ‚ú?`matmul_q4k_core.v` (56√ó256 tile) |
 
-**Important (2026-07-31):** the Q6_K/Q4_K and Q8_0/Q5_0 splits are **NOT even/odd parity**. `attn_v` and `ffn_down` are correlated per layer: layers `{0,1,3,6,7,8,9,10,13,16,19,21}` have `attn_v`=Q8_0 + `ffn_down`=Q6_K; layers `{2,4,5,11,12,14,15,17,18,20,22,23}` have `attn_v`=Q5_0 + `ffn_down`=Q4_K. This is llama.cpp's q4_k_m quantizer recipe (higher-precision subset). The C++ sim dispatches by actual `A->type` (`sim/tmac_gguf.cpp:475-482`), so mixed types are handled automatically ‚Äî no code change needed, only the docs previously misdescribed the split as even/odd.
+**Important (2026-07-31):** the Q6_K/Q4_K and Q8_0/Q5_0 splits are **NOT even/odd parity**. `attn_v` and `ffn_down` are correlated per layer: layers `{0,1,3,6,7,8,9,10,13,16,19,21}` have `attn_v`=Q8_0 + `ffn_down`=Q6_K; layers `{2,4,5,11,12,14,15,17,18,20,22,23}` have `attn_v`=Q5_0 + `ffn_down`=Q4_K. This is llama.cpp's q4_k_m quantizer recipe (higher-precision subset). The C++ sim dispatches by actual `A->type` (`sim/tmac_gguf.cpp:475-482`), so mixed types are handled automatically ‚Ä?no code change needed, only the docs previously misdescribed the split as even/odd.
 
 ## Key Decisions (2026-07-12)
 
-## Key Fix (2026-08-12) ‚Äî Q8 Core Address Advancement Bug + DDR Layout
+## Key Fix (2026-08-14) ‚Ä?Q5_0 negative-d sign bug, S48‚Üíint32 truncation, and Q8 first-run stale-state warm-up
+
+This session root-caused and fixed the **long-standing "pre-existing Q5_0/Q8_0 precision issue"** that had been carried in the docs since 2026-08-13. Three independent bugs were found, each masked by the fact that **all prior Q5/Q8 hardware and sim tests used either uniform data or positive-only block scales**. The sim was re-wired to use the bit-exact golden models so it now faithfully reflects the real RTL.
+
+### Bug 1: Q5_0 core `f16_decode` ignores the f16 sign bit ‚Ü?~50% of real weight blocks sign-flipped
+
+**Root cause (RTL):** llama.cpp quantizes Q5_0 blocks with the **negative-d trick**: `d = max / -16` where `max` is the largest-|value| element (can be negative). The dequant `w = (q-16)¬∑d` **requires the sign of d**. In real model data ~50% of blocks have a negative `d` (measured 49.68% of `blk.0.attn_q.weight`'s 25,088 blocks). The RTL `f16_decode` in `verilog/matmul_q5_0_core.v` read `f16[14:10]` (exp) and `f16[9:0]` (mant) but **never bit 15**, so negative `d` decoded as `|d|`, sign-flipping every weight in those blocks.
+
+**Why it was masked:** the golden model (`sim/golden_model.hpp` `f16_decode_s2416`), the board golden (`linux/tmac_linux.c` `f16_decode_s2416`), and every hardware/golden test used `d=1.0` (positive) ‚Ä?the sign path was never exercised. The old sim path (`fpga_sim.hpp` `axi_vecmul_tile_q5_0_8x896_axilite`) used sign-respecting `read_f16`, which is why the pre-golden baseline matched CPU at maxdiff 0.0046 while the golden-based sim showed 2‚Ä?0.
+
+**Evidence:** `[DIAG row0] exact=0.036140 golden=-0.021725` ‚Ä?the golden sign-flipped row 0; `blk.0.attn_q` block 0 has `d=0x986B` (bit 15 set, = ‚à?.002157). Confirmed against llama.cpp's `quantize_row_q5_0_ref` (`d = max / -16`, `id = 1/d`, `q = MIN(31, x*id + 16.5)`).
+
+**Fix (3 places in lockstep):**
+- `verilog/matmul_q5_0_core.v` `f16_decode`: compute magnitude `mag`, then `f16_decode = f16[15] ? -$signed(mag) : $signed(mag);`
+- `sim/golden_model.hpp` `f16_decode_s2416`: `return (f16 & 0x8000) ? -mag : mag;`
+- `linux/tmac_linux.c` `f16_decode_s2416`: same.
+
+**Verification:** new negative-d self-test in `sim/test_golden_model.cpp` (¬±1.0/¬±0.5/¬±0.25, ‚à?, full negative-d tile); new iVerilog regression `verilog/tb_q5_negd.v` (direct `dbg_d_fp`/`dbg_d_pre` check, incl. S16 clamp ¬±65536‚Üí¬?2768) wired into the Makefile `sim_q5_negd`. Sim `--compare` Q5_0 maxdiff dropped 2‚Ä?0 ‚Ü?0.0001‚Ä?.02. **On silicon:** `--trace` layer norms match the sim (L0=17.49‚Ä¶L23=55.92); every `[q5 acc=gold]` bit-exact.
+
+### Bug 2: S48 accumulator cast to `int32_t` in board output scaling ‚Ü?rows > 2¬≥¬π wrapped
+
+**Root cause (host):** `linux/tmac_linux.c` scaled results with `(float)(int32_t)raw_s` for both Q8 (`fpga_q8_tile`) and Q5 (`fpga_q5_tile`). The core accumulators are S48; real row sums reach ~8√ó10‚Å?(e.g. `y‚â?0 ‚Ü?raw = 10¬∑65536/0.000082 ‚â?8e9 > 2¬≥¬π`), so the `(int32_t)` cast wrapped. The sim used `(float)out[i]` (int64), which is why the sim matched CPU but the board showed maxdiff 10‚Ä?7 on Q5 tensors.
+
+**Fix:** cast the S48 value directly to float: `y[row0+i] += (float)raw_s * x_scale * row_scale[i];` (Q8) and `/ 65536.0f` (Q5). Rebuilt `tmac` ‚Ü?md5 `F5EDAA...`. Verified on silicon: Q5 maxdiff collapsed 10‚Ä?7 ‚Ü?0.0001‚Ä?.02.
+
+### Bug 3: Q8 core first run after a Q5 descriptor ‚Ü?rows 16‚Ä?3 corrupted (stale FSM/core state)
+
+**Symptom:** `[q8 RAWDIFF]` on scattered rows (24,28,42,47,51,52,55,56‚Ä? **only in the first 64-row tile** (rows 0‚Ä?3) of each `attn_v`; tile 1 (rows 64‚Ä?27) always clean. Golden correct (host compare: board `q8_golden_raw` == sim `q8_tile_golden`, 0 mismatches on real data), core arithmetic bit-exact (cosim `tb_cosim.v` PASS on real tiles). So the bug is **not** data, golden, or core arithmetic.
+
+**Decisive diagnostic (on-board `--compare` Q8DBG):** the *identical* descriptor re-run comes back **clean** (`max diff=0`). Per-group isolation (num_groups=1..14) confirmed `grp14` (full) == golden exactly while the first-ever run was corrupted. Conclusion: **the first Q8 descriptor processed after a Q5_0 descriptor leaves stale FSM/core state (acc-bank groups g=2..7) that corrupts that first compute; the first Q8 compute itself clears the state.** Re-triggers on every Q5‚ÜíQ8 transition (each `attn_v` follows `attn_q`/`attn_k`).
+
+**Why not reproduced in sim:** iVerilog's `__ICARUS__` initial block zeroes the Q8 core's LUTRAM acc/smem banks, and CLEAR_ACC works correctly in simulation (an uninitialized-acc sim variant still passed) ‚Ä?the stale state only manifests on real silicon. Root cause is a first-run state initialization/timing interaction in the RTL (see "Open items" below).
+
+**Mitigation (board-side, proven):** run **every** Q8 descriptor twice ‚Ä?first `chain_run` warms up/clears the stale state (result discarded), second is bit-exact. One-time 2√ó cost on Q8 matmuls (`attn_v` + logits), negligible vs the Q5/Q6/Q4 CPU-side work. On silicon: no more `[q8 RAWDIFF]`; `attn_v` maxdiff now 0.0004‚Ä?.004 (was 0.012‚Ä?.12). `linux/tmac_linux.c` `fpga_q8_tile` warm-up block.
+
+### Sim re-wiring (funnel principle)
+
+`sim/tmac_gguf.cpp` `matmul_fpga_q5_0` now calls `golden::q5_tile_golden` (was the idealized FP32 `axi_vecmul_tile_q5_0_8x896_axilite`), and `matmul_fpga_q8` now calls `golden::q8_tile_golden` (was `axi_vecmul_tile_q8`). This makes the sim reflect the real RTL fixed-point behavior, which is how Bugs 1‚Ä? were exposed and how Bug 3 was ruled in/out of the model.
+
+### Open items
+
+- **Q8 first-run stale state (RTL root cause not yet fixed in silicon):** the board-side warm-up is a workaround. Root-cause fix would require an ILA capture of the Q8 core's acc-bank/smem state on the first CLEAR_ACC‚ÜíCOMPUTE after a Q5 descriptor, or a robust reset/init of the Q8 core's LUTRAM banks at the Q8 dispatch. Until then the warm-up stays.
+- `blk.1.attn_v` still shows maxdiff 0.0135 (vs 0.0004‚Ä?.004 for others) ‚Ä?residual tail of the warm-up edge, much improved from 0.12, worth a follow-up look.
+
+### Test count updates (from earlier uncommitted work, folded in)
+
+- `tb_hw_fsm_comprehensive.v`: 12 tests (was 8), incl. non-uniform Q8 scales/acts/col-pattern and 14-group row-pattern.
+- `test_fpga_cores.cpp`: 13 tests (was 5), incl. bit-exact Q5 golden, Q8 row/col patterns, 14-group.
+- Sim: Q8 `matmul_fpga_q8` wired to golden; Q5 `matmul_fpga_q5_0` wired to golden.
+- Docs corrected throughout: 24 layers (not 28), Q6_K/Q4_K and Q8_0/Q5_0 splits are NOT even/odd (see Project State).
+
+## Key Fix (2026-08-13) ‚Ä?Linux Q6_K dequant: two bugs caused layer-0 explosion on hardware
+
+**Root cause of the layer-0 `ffn_down` explosion** (hidden norm ‚Ü?115M instead of ~17) that broke inference on the board: two independent bugs in `tmac_linux.c`'s Q6_K dequant path. Both were masked by the fact that all prior testing compared Linux-vs-sim on the SAME shared helpers, or used uniform data.
+
+### Bug 1: Q6_K ql/qh/scale reads missing the block offset `bo`
+
+`tmac_linux.c` Q6_K branch (old lines 245-250) added `bo` ONLY to the super-scale read (`d+bo+208`); the ql/qh/scale byte reads used absolute offsets (`d[lo]`, `d[128+...]`, `d[192+...]`) with no `+bo`. So for every block ‚â?1 (idx ‚â?256), the dequant read **block 0's** ql/qh/scales while using the current block's super-scale ‚Ä?producing garbage weights. The sim (`tmac_gguf.cpp:326-362`) adds `base` everywhere. Q4_K (lines 252-262) already included `bo` correctly.
+
+**Empirical proof:** a standalone byte-compare (`q6k_cmp.c`) of sim-vs-linux Q6_K dequant over all 3,575,040 samples diverged starting exactly at idx=256 (start of block 1). After adding `+bo`, all samples match bit-exactly.
+
+**Fix:** `int lo = bo + half*64 + l + (sub%2)*32;` `d[bo+128+half*32+l]` `d[bo+192+half*8+(l/16)+sub*2]`.
+
+### Bug 2: `f16_to_f32` unsigned-overflowed negative subnormals ‚Ü?+256.0
+
+The old subnormal branch was `((sign?-1:1)*mant/1024.0f*0.00006103515625f)` with `mant` a `uint32_t`. `(sign?-1:1)` is an `int`; `int * uint32` promotes the `-1` to unsigned and **wraps**: `0xFFFFFFFF * 172` mod 2¬≥¬≤ √∑ 1024 √ó 2‚Åª¬π‚Å¥ ‚â?**+256.0** instead of `-1.03e-5`. Real Q6_K super-scales ARE negative subnormals (e.g. block 1 of `blk.0.ffn_down.weight` = `0x80ac`), so layer-0 weights were amplified ~2.5e7√ó ‚Ü?norm 115M. The sim (`tmac_gguf.cpp:222`) uses a float ternary `(sign ? -1.0f : 1.0f)` so it never wraps ‚Ä?another reason the sim stayed healthy.
+
+**Fix:** `return (mant==0)?0.0f:((sign ? -1.0f : 1.0f) * (mant / 1024.0f) * 0.00006103515625f);` (float ternary). Also changed the normal-path sign to float for consistency.
+
+### Verification (host, WSL, no FPGA needed)
+
+- `q6k_cmp.c` (sim dequant vs fixed linux dequant): **Q6_K all 3,575,040 samples match**, Q4_K all 2,451,456 samples match.
+- `linux_repro.c` (verbatim Linux forward-pass on x86): layer-0 `fout` norm dropped from **165,461,015 ‚Ü?17.49**, and ALL 24 layer norms now match the sim's `--dump-layers` (L0=17.49, L1=31.49, L2=812.22, L22=37.47, L23=55.92). Before the fix it reproduced the board's 115,599,718.70 exactly, proving the bug was code, not ARM/FPGA.
+- Rebuilt static ARM binary (`arm-linux-gnueabihf-gcc -std=gnu11 -O2 -static`) ‚Ü?deployed to `linux/boot/tmac` (468,684 B, md5 298c00f147f0506775a5eb1e9908bc74; **superseded 2026-08-14** by the generation-protocol fix ‚Ä?see the boot-file table below for the current md5).
+- **Bare-metal port (`tmac_baremetal.cpp`) had Bug 1 too** ‚Ä?its Q6_K `lo`/`ho`/`sco` also lacked `+bo` (its `f16_to_f32` in `tmac_baremetal.h` was already the float-ternary form, so Bug 2 absent). Fixed `lo/ho/sco` ‚Ü?`+bo`, compile-checked with clang (`--target=armv7a-none-eabi`, COMPILE OK).
+
+**2026-08-13 follow-up:** hardware re-test done ‚Ä?deployed `linux/boot/tmac` on the SD card, ran `./tmac model.tmac --trace` (all 24 layer norms now match the sim: L0=17.49 ‚Ä?L23=55.92; the earlier 115M explosion is gone). Note: full-token generation still shows an FPGA-vs-CPU mismatch (see `--trace` comparison) ‚Ä?that is the **separate, pre-existing Q5_0/Q8_0 precision issue** (the Q6_K/Q4_K `ffn_down` matmul runs on the CPU in both paths), not the dequant bug fixed above.
+
+## Key Fix (2026-08-12) ‚Ä?Q8 Core Address Advancement Bug + DDR Layout
 
 **Root Cause: Two independent bugs that together prevented Q8 from computing with non-uniform data.**
 
@@ -25,27 +103,44 @@ Qwen2-0.5B FPGA accelerator targeting Zynq 7010. Multi-core Verilog RTL: INT16√ó
 
 The Q8 core's `pre_wmem_addr`/`pre_smem_addr`/`pre_act_addr` registers were assigned from a **separate** `always @(posedge clk)` block (line 538) that checked `state == COMPUTE`. The main COMPUTE pipeline (line 311) and CLEAR_ACC (line 286) are in a different `always @(posedge clk or negedge rst_n)` block. Vivado synthesis could not trace the `state` register transition from CLEAR_ACC‚ÜíCOMPUTE across always-blocks and **optimized the entire anticipation block away**, leaving the addresses stuck at 0 (the CLEAR_ACC constant `{3'd0, 6'd0}`).
 
-**Effect:** During COMPUTE, all 512 iterations read `wmem[0]`/`smem[0]`/`act[0]` ‚Äî the core processed the same data repeatedly instead of iterating over the full 64√ó64 tile. With uniform data (all weights/scales/acts identical), this produces correct-looking results (all-1s test ‚Üí 64 per row ‚úì) because any address reads the same value. This is why the bug was undetected for 9 months ‚Äî **every existing test used uniform data.**
+**Effect:** During COMPUTE, all 512 iterations read `wmem[0]`/`smem[0]`/`act[0]` ‚Ä?the core processed the same data repeatedly instead of iterating over the full 64√ó64 tile. With uniform data (all weights/scales/acts identical), this produces correct-looking results (all-1s test ‚Ü?64 per row ‚ú? because any address reads the same value. This is why the bug was undetected for 9 months ‚Ä?**every existing test used uniform data.**
 
-**Fix:** Moved `pre_wmem_addr`/`pre_smem_addr`/`pre_act_addr` assignments from the separate always block into the main COMPUTE case (within the same always block). The assignments use counter values `g` and `k`:
+**Fix (2026-08-12):** Moved `pre_wmem_addr`/`pre_smem_addr`/`pre_act_addr` assignments from the separate always block into the main COMPUTE case (within the same always block). The old separate block (552-567) is now commented out.
+
+**Refinement (2026-08-13, current working tree):** the anticipation was made pipeline-accurate ‚Ä?smem/act go through an extra Stage-0 register (1 more cycle latency than wmem), so their addresses are anticipated **2 iterations ahead** (column k+1 when g‚â?, i.e. one wrap away) while wmem is anticipated 1 iteration ahead. `pre_g`/`pre_k`/`pre_valid` register the anticipated (g,k) as pipeline meta, and CLEAR_ACC arms the very first entry's smem/act reads at `acc_clr_cnt==6`. Current form:
 ```verilog
+// PRE stage (pipeline meta): anticipate (g_next,k_next) for the arriving BRAM data
 if (g == 7) begin
-    pre_wmem_addr <= {3'd0, k + 6'd1};
-    pre_smem_addr <= {3'd0, (k + 6'd1) >= 32};
+    pre_k <= k + 1;
+    pre_g <= 0;
+end else begin
+    pre_k <= k;
+    pre_g <= g + 1;
+end
+pre_valid <= 1;
+
+// Set BRAM read addresses for the next iteration
+if (g == 7) begin
+    pre_wmem_addr <= {3'd0, k + 6'd1};          // wrap to (0,k+1)
+    pre_smem_addr <= {3'd1, (k + 6'd1) >= 32};  // (1, col-major half of k+1)
+    pre_act_addr <= k + 6'd1;
+end else if (g == 6) begin
+    pre_wmem_addr <= {g + 3'd1, k};
+    pre_smem_addr <= {3'd0, (k + 6'd1) >= 32};  // (0, half of k+1) ‚Ä?wrap boundary
     pre_act_addr <= k + 6'd1;
 end else begin
     pre_wmem_addr <= {g + 3'd1, k};
-    pre_smem_addr <= {g + 3'd1, k[5]};
+    pre_smem_addr <= {g + 3'd2, k[5]};          // 2 ahead for the extra Stage-0 reg
     pre_act_addr <= k;
 end
 ```
-The old separate block (552-567) is now commented out.
+Plus CLEAR_ACC pre-arm: `acc_clr_cnt==6` sets `pre_smem_addr={0,0}`/`pre_act_addr=0` for the FIRST COMPUTE entry, and the `acc_clr_cnt==7` edge advances to the SECOND entry's addresses (`pre_smem_addr={1,0}`) and sets `pre_valid=1`. This refinement was part of making the 12-test comprehensive suite (incl. non-uniform scales/acts/col-pattern tests) pass 12/12.
 
 ### Bug 2: DDR weight layout mismatch (column-major vs row-group-major)
 
 The co-sim testbench (`tb_cosim.v`) loads weights with **bank-major** addressing: `wt_addr = bank*64 + col`, word = 8 rows of one column. The core reads `wmem[{g,k}]` during compute, interpreting addr `g*64+k` as rows 8g..8g+7 of column k.
 
-The FSM (`hp_fsm_top.v`) loads DDR words sequentially: `q8_wt_addr = wt_byte_idx[11:3]`, `q8_wt_din = rd_data`. Word w goes to `wmem[w]`. For the core to read correctly, DDR word at index `w = g*64+k` must contain rows 8g..8g+7 of column k ‚Äî i.e., the DDR layout must be:
+The FSM (`hp_fsm_top.v`) loads DDR words sequentially: `q8_wt_addr = wt_byte_idx[11:3]`, `q8_wt_din = rd_data`. Word w goes to `wmem[w]`. For the core to read correctly, DDR word at index `w = g*64+k` must contain rows 8g..8g+7 of column k ‚Ä?i.e., the DDR layout must be:
 
 ```
 byte_offset(row, col) = (row >> 3) * 512 + col * 8 + (row & 7)
@@ -59,58 +154,58 @@ The Linux port wrote **column-major**: `go[c * 64 + r]`. These differ! With unif
 
 All now use `(r >> 3) * 512 + c * 8 + (r & 7)`.
 
-**Scale layout** (`sc_addr = ((r>>3)<<4) | ((r&7)<<1) | h`) was **already correct** (verified by tracing the core's smem write-decode and read-addressing ‚Äî it matches the FSM's sequential word write + core's `pre_smem_addr = {g, k[5]}` read). However, the scale VALUES must be **row-normalized** to produce usable dequant results (see Bug 3 below).
+**Scale layout** (`sc_addr = ((r>>3)<<4) | ((r&7)<<1) | h`) was **already correct** (verified by tracing the core's smem write-decode and read-addressing ‚Ä?it matches the FSM's sequential word write + core's `pre_smem_addr = {g, k[5]}` read). However, the scale VALUES must be **row-normalized** to produce usable dequant results (see Bug 3 below).
 
 ### Bug 3: Q8_0 scale values too small (missing row normalization)
 
-The Linux `q8_preprocess_tile` wrote raw f16 block scale values (d ‚âà 0.001-0.1) as UQ8.8: `sc = round(d * 256)`. For typical Q8_0 block scales, this gives `sc = 0-25`, causing the core's dequant `(q8 * sc) >> 8 = 0` for most weights ‚Üí `acc = 0`.
+The Linux `q8_preprocess_tile` wrote raw f16 block scale values (d ‚â?0.001-0.1) as UQ8.8: `sc = round(d * 256)`. For typical Q8_0 block scales, this gives `sc = 0-25`, causing the core's dequant `(q8 * sc) >> 8 = 0` for most weights ‚Ü?`acc = 0`.
 
 The C++ reference (`tmac_gguf.cpp`) normalizes scales by `row_scale = max_abs / 32767`:
 ```
 combined_scales = (block_scale / row_scale) * 256  // UQ8.8, range ~256-65535
 ```
-The output is then scaled back: `y += raw * x_scale * row_scale` (no `/256` needed for Q8 ‚Äî the dequant `>>8` already removes the UQ8.8 factor, unlike Q5 which accumulates at 256√ó).
+The output is then scaled back: `y += raw * x_scale * row_scale` (no `/256` needed for Q8 ‚Ä?the dequant `>>8` already removes the UQ8.8 factor, unlike Q5 which accumulates at 256√ó).
 
 **Fix:** `tmac_linux.c`: added row normalization to `q8_preprocess_tile` (+row_scale array), updated `fpga_q8_tile` output formula.
 
 ### Verification
 
-- iVerilog: Q8 core 6/6 PASS, HP FSM comprehensive 8/8 PASS (both before and after fix ‚Äî uniform data)
-- Hardware bare-metal: col-pattern 2080 ‚úì, distinct-scale passes rows 0-13 (minor diffs at 14-15), all Q8 tests produce non-zero results
+- iVerilog: Q8 core 6/6 PASS, HP FSM comprehensive 8/8 PASS (both before and after fix ‚Ä?uniform data)
+- Hardware bare-metal: col-pattern 2080 ‚ú? distinct-scale passes rows 0-13 (minor diffs at 14-15), all Q8 tests produce non-zero results
 - Hardware Linux: Q8 `attn_v` layers now produce non-zero results (e.g. blk.0 acc=356M, fpga[0]=0.0262 vs cpu[0]=0.0069) up from `acc=0` before the fix
 
 ### Bug 4: Q8 result readback off-by-one (registered `res_dout`)
 
-The Q8 core's `res_dout` was a **registered** output (`res_dout_r <= acc_bX[res_addr]` in an `always @(posedge clk)` block), introducing a 1-cycle latency. The FSM's `READ_RES` captures `act_buf[idx] <= res_dout` in the same cycle it advances `res_addr`, so the readback was systematically shifted by one row: `result[0]` = stale, `result[i]` = `acc_bX[i-1]` for i‚â•1.
+The Q8 core's `res_dout` was a **registered** output (`res_dout_r <= acc_bX[res_addr]` in an `always @(posedge clk)` block), introducing a 1-cycle latency. The FSM's `READ_RES` captures `act_buf[idx] <= res_dout` in the same cycle it advances `res_addr`, so the readback was systematically shifted by one row: `result[0]` = stale, `result[i]` = `acc_bX[i-1]` for i‚â?.
 
-This was masked by the all-1s/all(-1)s/col-pattern tests (all rows identical ‚Üí shift invisible), but exposed by the row-pattern test (`result[r] = 64*r` instead of `64*(r+1)`).
+This was masked by the all-1s/all(-1)s/col-pattern tests (all rows identical ‚Ü?shift invisible), but exposed by the row-pattern test (`result[r] = 64*r` instead of `64*(r+1)`).
 
 **Fix:** Made `res_dout` **combinational** (`always @(*)`, blocking assignments) since the acc banks are distributed RAM with async read.
 
 ### Bit-exact golden model (`sim/golden_model.hpp`) + core verification (2026-08-13)
 
-Added `sim/golden_model.hpp` ‚Äî bit-exact C++ models of the Q8/Q5 cores' fixed-point arithmetic (see `docs/maths.md` for notation), plus `sim/test_golden_model.cpp` self-test. Wired the golden model into the bare-metal `test_fpga_cores.cpp` (`test_q5_golden` distinct-value test) and Linux `tmac_linux.c` (`gold=` vs `acc=` per-tile comparison).
+Added `sim/golden_model.hpp` ‚Ä?bit-exact C++ models of the Q8/Q5 cores' fixed-point arithmetic (see `docs/maths.md` for notation), plus `sim/test_golden_model.cpp` self-test. Wired the golden model into the bare-metal `test_fpga_cores.cpp` (`test_q5_golden` distinct-value test) and Linux `tmac_linux.c` (`gold=` vs `acc=` per-tile comparison).
 
 **Verification on hardware (bare-metal, distinct data):**
-- **Q5 core: bit-exact** ‚Äî `test_q5_golden` all 4 rows match (37563, 80518, 123895, 166672). Confirms the Q5 arithmetic is correct; the Linux Q5 `maxdiff` (5-22) is the `d_pre` S16 precision bottleneck, not a bug.
-- **Q8 core: bit-exact after res_dout fix** ‚Äî row-pattern now gives `64*(r+1)` for all 64 rows; col-pattern 2080 ‚úì.
+- **Q5 core: bit-exact** ‚Ä?`test_q5_golden` all 4 rows match (37563, 80518, 123895, 166672). Confirms the Q5 arithmetic is correct; the Linux Q5 `maxdiff` (5-22) is the `d_pre` S16 precision bottleneck, not a bug.
+- **Q8 core: bit-exact after res_dout fix** ‚Ä?row-pattern now gives `64*(r+1)` for all 64 rows; col-pattern 2080 ‚ú?
 
-### Bug 5: Q8 multi-group was a TEST bug, not an RTL bug ‚Äî RESOLVED (2026-08-13)
+### Bug 5: Q8 multi-group was a TEST bug, not an RTL bug ‚Ä?RESOLVED (2026-08-13)
 
 The `test_q8_multigroup` (14 groups, col-pattern) initially returned garbage
 (`r0=7616`, most rows `0xFF`). Investigation showed this was a **test data bug**:
-the col-pattern weight `(int8_t)(g*64+c+1)` overflows INT8 for `g ‚â• 2` (wraps
+the col-pattern weight `(int8_t)(g*64+c+1)` overflows INT8 for `g ‚â?2` (wraps
 past 127), so the "expected 401856" was wrong and the weights were garbage. The
 actual value 7616 = Œ£(int8_t)(c+1) for c=0..895 is the *correct* result for the
 wrapped weights.
 
 Switching to a **row-pattern** (`W[r][c]=r+1`, fits INT8, group-independent)
 confirms the multi-group RTL is **bit-exact on hardware**: all 64 rows give
-`896¬∑(r+1)`. Also verified in iVerilog (Test 9, 14 groups, row-pattern ‚Üí PASS).
+`896¬∑(r+1)`. Also verified in iVerilog (Test 9, 14 groups, row-pattern ‚Ü?PASS).
 
-Note: the Linux `act_bytes` must be **128** (one group), not 1792 (whole tile) ‚Äî
+Note: the Linux `act_bytes` must be **128** (one group), not 1792 (whole tile) ‚Ä?
 fixed 2026-08-13. This was a real host bug, but the RTL multi-group accumulation
-(`READ_RES_ACC` ‚Üí `COPY_ACC_TO_BUF` ‚Üí `WRITE_RES`) is correct.
+(`READ_RES_ACC` ‚Ü?`COPY_ACC_TO_BUF` ‚Ü?`WRITE_RES`) is correct.
 
 ### Q8 DDR Layout (Authoritative Reference)
 
@@ -120,97 +215,97 @@ W[r][c] stored at DDR byte offset = (r >> 3) * 512 + c * 8 + (r & 7)
 ```
 - 64 rows √ó 64 columns per group
 - Each 64-bit DDR word = 8 consecutive rows (group r/8) of a single column
-- Word index w = row_group*64 + col ‚Üí contains rows row_group*8 .. row_group*8+7 of column col
+- Word index w = row_group*64 + col ‚Ü?contains rows row_group*8 .. row_group*8+7 of column col
 - FSM reads sequentially and writes wmem[w] = DDR word w
-- Core reads wmem[{g,k}] during compute ‚Üí gets rows 8g..8g+7 of column k
+- Core reads wmem[{g,k}] during compute ‚Ü?gets rows 8g..8g+7 of column k
 
 Scale layout (unchanged, already correct):
 ```
 sc_addr = ((r >> 3) << 4) | ((r & 7) << 1) | h    (= r*2 + h, row-major)
 ```
 - 64 rows √ó 2 blocks (32 cols each) = 128 UQ8.8 values per group
-- FSM reads 256 bytes sequentially (sc_byte_idx 0..255 ‚Üí q8_sc_addr 0..127)
+- FSM reads 256 bytes sequentially (sc_byte_idx 0..255 ‚Ü?q8_sc_addr 0..127)
 - Core write decode: smem_bank = sc_addr[3:1] (= row%8), smem_addr = {sc_addr[6:4], sc_addr[0]} (= {(row>>3), h})
-- Core read: smem_bank[wi_i][{g, k[5]}] during compute ‚Üí reads scale for row g*8+wi_i, block k[5]
+- Core read: smem_bank[wi_i][{g, k[5]}] during compute ‚Ü?reads scale for row g*8+wi_i, block k[5]
 
 ## Key Decisions (2026-07-12)
 
-1. **TB `wr` task: `input integer din` truncates 64-bit weight word** ‚Äî Found: `tb_matmul_q8.v` declared `wr(input integer we, addr, din)` where `integer` is 32-bit signed. Passing `word = {8{val}}` (64-bit) truncated upper 32 bits, causing banks 4-7 to receive 0x00 for positive weights (all rows 4-7 = 0). Test 6 (wt=-1=0xFF) worked because sign-extension filled upper 32 bits with 1s. Fix: `input [63:0] din`. All 6 Q8 tests now PASS.
+1. **TB `wr` task: `input integer din` truncates 64-bit weight word** ‚Ä?Found: `tb_matmul_q8.v` declared `wr(input integer we, addr, din)` where `integer` is 32-bit signed. Passing `word = {8{val}}` (64-bit) truncated upper 32 bits, causing banks 4-7 to receive 0x00 for positive weights (all rows 4-7 = 0). Test 6 (wt=-1=0xFF) worked because sign-extension filled upper 32 bits with 1s. Fix: `input [63:0] din`. All 6 Q8 tests now PASS.
 
-2. **Break statements removed from cosim testbenches** ‚Äî `tb_cosim.v`, `tb_cosim_q4k.v`, `tb_cosim_q5_0.v`, `tb_cosim_q6_k.v` used unsupported `break` in Verilog for-loop wait loops. Replaced with `poll_count` flag loop condition.
+2. **Break statements removed from cosim testbenches** ‚Ä?`tb_cosim.v`, `tb_cosim_q4k.v`, `tb_cosim_q5_0.v`, `tb_cosim_q6_k.v` used unsupported `break` in Verilog for-loop wait loops. Replaced with `poll_count` flag loop condition.
 
-3. **Q8 core: 64-bit word write, LUTRAM smem/act, dist-RAM acc banks** ‚Äî Q8 core rewritten:
+3. **Q8 core: 64-bit word write, LUTRAM smem/act, dist-RAM acc banks** ‚Ä?Q8 core rewritten:
    - Write port: `wt_addr[8:0]`/`wt_din[63:0]` replaces byte-lane BWE case (BRAM-friendly)
    - Accumulator: 8√ó distributed RAM/FFs banks (acc_b0..acc_b7), each 512√ó48 effective (48-bit width exceeds BRAM18 capacity), banked by address[2:0]=g
    - Dequant saturation removed: max product 127√ó65535=8,322,945 < 8,388,607, never saturates
    - Pipeline: 6-stage (PRE‚ÜíS0‚ÜíS1a‚ÜíS1b‚ÜíS2a‚ÜíS2b), CLEAR_ACC state for bulk BRAM clear
    - Result: saves ~884 LUTs (384 LUTRAMs + 500 logic) vs old reg [47:0] acc[0:63]
 
-4. **HP FSM: rd_ready <= rd_valid in LOAD_WEIGHT_W** ‚Äî Fixed 0-cycle rvalid pulse: continuous `rd_ready=1` caused read master's PRESENT state to self-clear rvalid. Same delayed-handshake as LOAD_ACT_W.
+4. **HP FSM: rd_ready <= rd_valid in LOAD_WEIGHT_W** ‚Ä?Fixed 0-cycle rvalid pulse: continuous `rd_ready=1` caused read master's PRESENT state to self-clear rvalid. Same delayed-handshake as LOAD_ACT_W.
 
-5. **Multi-group Q8: q8_wt_din reg, col_group fix, act_remaining fix** ‚Äî Three bugs from multi-group (2026-07-01): unregistered wt_din (NBA timing), col_group reset in COMPUTE_W, hardcoded act_remaining in READ_RES_ACC.
+5. **Multi-group Q8: q8_wt_din reg, col_group fix, act_remaining fix** ‚Ä?Three bugs from multi-group (2026-07-01): unregistered wt_din (NBA timing), col_group reset in COMPUTE_W, hardcoded act_remaining in READ_RES_ACC.
 
 6. **All core unit tests PASS (2026-07-05):** Q8 6/6, Q4K 4/4, Q5_0 32/32, Q6_K 97/97, HP FSM 7/7. INT16 smoke pre-existing failure (unrelated wmem addressing).
 
-7. **Track A BRAM conversion complete (2026-07-05):** All LUTRAM arrays converted to BRAM ‚Äî 7,769 LUTs (44.1%), 17 BRAM18 (14.2%), 16 DSP (20%). WNS=0.601ns. All 9 HW tests PASS.
+7. **Track A BRAM conversion complete (2026-07-05):** All LUTRAM arrays converted to BRAM ‚Ä?7,769 LUTs (44.1%), 17 BRAM18 (14.2%), 16 DSP (20%). WNS=0.601ns. All 9 HW tests PASS.
 
-8. **Q5_0 block-streaming redesign (2026-07-06):** Replaced 4-cycle/element pipeline (7170 cycles) with block-at-a-time architecture (1904 core cycles + DDR overhead ‚âà2856 system cycles/tile). Precomputes d_pre = f16_decode(d) √ó scale >> 8 once per block, then 1 MAC/cycle per element. Scale indexing bug fixed (core1 used scale[0:1] instead of scale[2:3]). All 8 unit tests + 4 HP FSM dispatch tests PASS (pre-redesign testbench; core unit tests need port-renamed rebuild for new `qs_word`/`blk_num` interface).
+8. **Q5_0 block-streaming redesign (2026-07-06):** Replaced 4-cycle/element pipeline (7170 cycles) with block-at-a-time architecture (1904 core cycles + DDR overhead ‚â?856 system cycles/tile). Precomputes d_pre = f16_decode(d) √ó scale >> 8 once per block, then 1 MAC/cycle per element. Scale indexing bug fixed (core1 used scale[0:1] instead of scale[2:3]). All 8 unit tests + 4 HP FSM dispatch tests PASS (pre-redesign testbench; core unit tests need port-renamed rebuild for new `qs_word`/`blk_num` interface).
 
-9. **Q5_0 clean-slate rewrite ‚Äî per-block wide register interface (2026-07-07):** Completely rewrote both `matmul_q5_0_core.v` and `hp_fsm_top.v` to eliminate byte-at-a-time header loading, `hdr_packed` LUTRAM, and `qs_word`/`blk_num`/`core_id`/`start` ports. The core now receives per-block `blk_d[15:0]`, `blk_qh[31:0]`, `blk_qs[127:0]` via a single `blk_valid` pulse ‚Äî all fed from a 48-byte DDR burst (12 AXI beats) per block. No LUTRAM for header storage (at most one block's d/qh/qs in the core at a time). Fixed pre-existing `act_r` pipeline bug (off-by-one masked by all-1s test activations). `row_scale` renamed to `row_norm`. FSM states Q5_PRELOAD_HDR/Q5_PRELOAD_HDR_W removed, replaced by Q5_LOAD_NORM/Q5_LOAD_NORM_W (8-byte DDR read for 4 √ó UQ8.8 norm values). Core results read via hierarchical reference (`u_q5_core0.res0/res1`). DDR layout per block: 48 bytes (core0_d+qh+qs + core1_d+qh+qs + padding). Total: 56 √ó 48 = 2688 bytes block data + 8 bytes norm = 2696 bytes/tile. All 9 HP FSM dispatch tests PASS.
+9. **Q5_0 clean-slate rewrite ‚Ä?per-block wide register interface (2026-07-07):** Completely rewrote both `matmul_q5_0_core.v` and `hp_fsm_top.v` to eliminate byte-at-a-time header loading, `hdr_packed` LUTRAM, and `qs_word`/`blk_num`/`core_id`/`start` ports. The core now receives per-block `blk_d[15:0]`, `blk_qh[31:0]`, `blk_qs[127:0]` via a single `blk_valid` pulse ‚Ä?all fed from a 48-byte DDR burst (12 AXI beats) per block. No LUTRAM for header storage (at most one block's d/qh/qs in the core at a time). Fixed pre-existing `act_r` pipeline bug (off-by-one masked by all-1s test activations). `row_scale` renamed to `row_norm`. FSM states Q5_PRELOAD_HDR/Q5_PRELOAD_HDR_W removed, replaced by Q5_LOAD_NORM/Q5_LOAD_NORM_W (8-byte DDR read for 4 √ó UQ8.8 norm values). Core results read via hierarchical reference (`u_q5_core0.res0/res1`). DDR layout per block: 48 bytes (core0_d+qh+qs + core1_d+qh+qs + padding). Total: 56 √ó 48 = 2688 bytes block data + 8 bytes norm = 2696 bytes/tile. All 9 HP FSM dispatch tests PASS.
 
-10. **CPU_OP col_group bug ‚Äî `col_group` not reset on CPU_OP dispatch (2026-07-11):** The HP FSM's `LOAD_ACT` state always adds `col_group * 128` to `rd_addr` (`hp_fsm_top.v:675`). For Q8 compute, `col_group` is cleared in `LOAD_WEIGHT_W` before transitioning to `LOAD_SCALES`. For CPU_OP (tensor_type=15), the FETCH_DESC dispatch goes directly to `LOAD_ACT` without clearing `col_group`. If the previous descriptor was a multi-group Q8 (e.g., 14 groups), `col_group` retains its last value (e.g., 13), causing CPU_OP's `LOAD_ACT` to read from `act_addr + 13*128` ‚Äî the wrong DDR address. E9's CPU_OP (which follows a single-group Q8 descriptor) works by accident because Q8 single-group also clears `col_group` in `LOAD_WEIGHT_W`.
+10. **CPU_OP col_group bug ‚Ä?`col_group` not reset on CPU_OP dispatch (2026-07-11):** The HP FSM's `LOAD_ACT` state always adds `col_group * 128` to `rd_addr` (`hp_fsm_top.v:675`). For Q8 compute, `col_group` is cleared in `LOAD_WEIGHT_W` before transitioning to `LOAD_SCALES`. For CPU_OP (tensor_type=15), the FETCH_DESC dispatch goes directly to `LOAD_ACT` without clearing `col_group`. If the previous descriptor was a multi-group Q8 (e.g., 14 groups), `col_group` retains its last value (e.g., 13), causing CPU_OP's `LOAD_ACT` to read from `act_addr + 13*128` ‚Ä?the wrong DDR address. E9's CPU_OP (which follows a single-group Q8 descriptor) works by accident because Q8 single-group also clears `col_group` in `LOAD_WEIGHT_W`.
 
-    **Test workaround:** Added dummy Q8 single-group chain (`write_desc ... 128 0 0`) before each CPU_OP test to force `col_group=0`. **Proper fix:** Add `col_group <= 0` in the CPU_OP branch of FETCH_DESC dispatch (near `hp_fsm_top.v:642-644`). Also affects Q5_0 path (second descriptor after multi-group Q8) if Q5_0 uses LOAD_ACT for any purpose ‚Äî current Q5_0 uses Q5_LOAD_NORM/Q5_COPY_ACT/Q5_BLOCK_COMPUTE which don't use `col_group`.
+    **Test workaround:** Added dummy Q8 single-group chain (`write_desc ... 128 0 0`) before each CPU_OP test to force `col_group=0`. **Proper fix:** Add `col_group <= 0` in the CPU_OP branch of FETCH_DESC dispatch (near `hp_fsm_top.v:642-644`). Also affects Q5_0 path (second descriptor after multi-group Q8) if Q5_0 uses LOAD_ACT for any purpose ‚Ä?current Q5_0 uses Q5_LOAD_NORM/Q5_COPY_ACT/Q5_BLOCK_COMPUTE which don't use `col_group`.
 
-11. **CPU_OP interrupt protocol (2026-07-12):** Added `interrupt` output port, `reg_chain_ctrl` (0x04), `reg_gie` (0x08), `reg_isr` (0x0C) to `hp_fsm_top.v`. New CPU_OP_WAIT state (5'd27) ‚Äî pulses `desc_irq`, sets `chain_ctrl[2]=1` (cpu_op_pending), waits for CPU to clear ISR and set `chain_ctrl[0]=1` (resume). Backward compatible: `chain_ctrl[3]=0` ‚Üí passthrough (unchanged), `chain_ctrl[3]=1` ‚Üí interrupt protocol. Multi-driver resolved via `axil_we_chain_ctrl` flag. Register map:
+11. **CPU_OP interrupt protocol (2026-07-12):** Added `interrupt` output port, `reg_chain_ctrl` (0x04), `reg_gie` (0x08), `reg_isr` (0x0C) to `hp_fsm_top.v`. New CPU_OP_WAIT state (5'd27) ‚Ä?pulses `desc_irq`, sets `chain_ctrl[2]=1` (cpu_op_pending), waits for CPU to clear ISR and set `chain_ctrl[0]=1` (resume). Backward compatible: `chain_ctrl[3]=0` ‚Ü?passthrough (unchanged), `chain_ctrl[3]=1` ‚Ü?interrupt protocol. Multi-driver resolved via `axil_we_chain_ctrl` flag. Register map:
 
     | 0x04 | REG_CHAIN_CTRL | R/W | [0]=resume, [2]=cpu_op_pending, [3]=intr_enable |
     | 0x08 | REG_GIE        | R/W | [0]=global interrupt enable |
     | 0x0C | REG_ISR        | R/W | [0]=cpu_op_irq (W1C) |
 
-    All 18 simulation tests PASS (8 comprehensive + 10 Q5_0, includes backward compat verification).
+    All 22 simulation tests PASS (12 comprehensive + 10 Q5_0, includes backward compat verification).
 
-12. **Bitstream rebuild (2026-07-12, SUPERSEDED by #24):** Vivado build completed. WNS=-0.360 ns (4 failing endpoints). BRAM18: 33‚Üí10 (Q5_0 clean-slate rewrite eliminated 14, Q8 smem/act LUTRAM saved 9). Slice LUTs: 9,898‚Üí9,066. LUT as Memory: 97‚Üí177. Slice Regs: 12,781‚Üí14,052. DSP48E1: 22‚Üí23. **Note: this 2026-07-12 bitstream lacked SDIO0 (PCW_EN_SDIO0=0). The frozen bitstream (2026-08-04, #24) adds SDIO0 and passes all HW tests ‚Äî the resource numbers below remain current for the PL fabric.**
+12. **Bitstream rebuild (2026-07-12, SUPERSEDED by #24):** Vivado build completed. WNS=-0.360 ns (4 failing endpoints). BRAM18: 33‚Ü?0 (Q5_0 clean-slate rewrite eliminated 14, Q8 smem/act LUTRAM saved 9). Slice LUTs: 9,898‚Ü?,066. LUT as Memory: 97‚Ü?77. Slice Regs: 12,781‚Ü?4,052. DSP48E1: 22‚Ü?3. **Note: this 2026-07-12 bitstream lacked SDIO0 (PCW_EN_SDIO0=0). The frozen bitstream (2026-08-04, #24) adds SDIO0 and passes all HW tests ‚Ä?the resource numbers below remain current for the PL fabric.**
 
     **Debug session (2026-07-12): Test 9a and 10 diagnosis on hardware.** Found Test 9a was a test-data layout bug; Test 10 had TWO bugs:
 
-    - **Test 9a fix (verified PASS on HW):** `write_pattern_const $Q9_WEIGHT_ADDR 4096 0x01` ‚Üí `[expr $Q9_NUM_GROUPS * 4096]`. Multi-group FSM reads group 1 weights from `weight_addr + 4096` ‚Äî only 4096 bytes were written, so group 1's weight load read scale data instead (which happened to follow the weight region in DDR). Fixed by writing `num_groups √ó 4096` bytes for multi-group tests. Result: all 64 rows = 128.
+    - **Test 9a fix (verified PASS on HW):** `write_pattern_const $Q9_WEIGHT_ADDR 4096 0x01` ‚Ü?`[expr $Q9_NUM_GROUPS * 4096]`. Multi-group FSM reads group 1 weights from `weight_addr + 4096` ‚Ä?only 4096 bytes were written, so group 1's weight load read scale data instead (which happened to follow the weight region in DDR). Fixed by writing `num_groups √ó 4096` bytes for multi-group tests. Result: all 64 rows = 128.
     - **Test 10 bug 1 (DDR address collision, harmless):** `Q10_ACT_ADDR=0x00109000` collided with tile 0 scales at `Q10_WEIGHT_ADDR+4096=0x00109000`. Fixed: act‚Üí`0x0010C000`, result‚Üí`0x0010B000`.
     - **Test 10 bug 2 (RTL, root cause):** `col_group` was not reset in the Q8 FETCH_DESC dispatch path (`hp_fsm_top.v:689`). After Test 9a's multi-group iteration left `col_group=1`, Test 10's tile 0 loaded weights/scales/acts from wrong DDR offsets (`weight_addr + col_group*4096` instead of `weight_addr`). Same bug class as CPU_OP col_group issue (Key Decision #10). Fix: added `col_group <= 0` in Q8 dispatch. Verified PASS on HW: all 128 rows = 64.
 
     **Extended HW test suite (11 tests, 2026-07-11):** Designed and verified 10 new edge-case tests covering:
-    - E1: Q8 negative weights (0xFF ‚Üí -64/row) **PASS**
-    - E2: Q8 scale=0.5 (q8=2, scale=0x0100 ‚Üí 64/row) **PASS**
-    - E3: Q8 full 14-group (all-1s ‚Üí 896/row) **PASS**
-    - E4: Q5 negative q5 (qh=0, nibble=1 ‚Üí -15 ‚Üí -3,440,640/row) **PASS**
-    - E5: Q5 d=0.5 (d=0x3800 f16=0.5 ‚Üí 114,688/row) **PASS**
+    - E1: Q8 negative weights (0xFF ‚Ü?-64/row) **PASS**
+    - E2: Q8 scale=0.5 (q8=2, scale=0x0100 ‚Ü?64/row) **PASS**
+    - E3: Q8 full 14-group (all-1s ‚Ü?896/row) **PASS**
+    - E4: Q5 negative q5 (qh=0, nibble=1 ‚Ü?-15 ‚Ü?-3,440,640/row) **PASS**
+    - E5: Q5 d=0.5 (d=0x3800 f16=0.5 ‚Ü?114,688/row) **PASS**
     - E6: Q5‚ÜíCPU_OP‚ÜíQ5 chain (mixed-type transitions) **PASS**
-    - E7: Q8 negative act (act=-1 ‚Üí -64/row) **PASS**
-    - E8: Q5 negative act (act=-1 ‚Üí -229,376/row) **PASS**
+    - E7: Q8 negative act (act=-1 ‚Ü?-64/row) **PASS**
+    - E8: Q5 negative act (act=-1 ‚Ü?-229,376/row) **PASS**
     - E9: Mixed Q5‚ÜíQ8‚ÜíCPU_OP‚ÜíQ5 chain (4-desc cross-type) **PASS**
-    - E10: Q5 alternating q5 nibbles (1,2 ‚Üí 344,064/row) **PASS**
+    - E10: Q5 alternating q5 nibbles (1,2 ‚Ü?344,064/row) **PASS**
     - E6a: Standalone CPU_OP passthrough (col_group reset needed) **PASS**
 
     Debug aids added: pre-chain descriptor dumps with address layout comments, post-chain result + source data dumps, W0/W2 block data comparison. Bugs found during development: descriptor overlap (D2 only 16 bytes after D1 instead of 32), `write_pattern_const` TCL proc accepts byte value (not word).
 
-13. **Q8 col_group stale in FETCH_DESC dispatch ‚Äî Test 10 RTL fix (2026-07-16):** `col_group` was not reset in the Q8 FETCH_DESC dispatch path (`hp_fsm_top.v:689`). After a multi-group descriptor left `col_group=1`, the next descriptor in the chain loaded weights/scales/acts from wrong DDR offsets. Caused Test 10 tile 0 to fail. Fix: `col_group <= 0` added to Q8 dispatch. Same class as CPU_OP col_group bug (Key Decision #10). All 10 comprehensive HW tests now PASS.
+13. **Q8 col_group stale in FETCH_DESC dispatch ‚Ä?Test 10 RTL fix (2026-07-16):** `col_group` was not reset in the Q8 FETCH_DESC dispatch path (`hp_fsm_top.v:689`). After a multi-group descriptor left `col_group=1`, the next descriptor in the chain loaded weights/scales/acts from wrong DDR offsets. Caused Test 10 tile 0 to fail. Fix: `col_group <= 0` added to Q8 dispatch. Same class as CPU_OP col_group bug (Key Decision #10). All 10 comprehensive HW tests now PASS.
 
 ## Architecture Summary
 
 ### HP FSM flow (hp_fsm_top.v, Q8 compute path):
 ```
-IDLE ‚Üí FETCH_DESC ‚Üí LOAD_WEIGHT ‚Üí LOAD_SCALES ‚Üí LOAD_ACT ‚Üí COPY_ACT_TO_CORE ‚Üí COMPUTE ‚Üí READ_RES/READ_RES_ACC ‚Üí WRITE_RES ‚Üí DONE
+IDLE ‚Ü?FETCH_DESC ‚Ü?LOAD_WEIGHT ‚Ü?LOAD_SCALES ‚Ü?LOAD_ACT ‚Ü?COPY_ACT_TO_CORE ‚Ü?COMPUTE ‚Ü?READ_RES/READ_RES_ACC ‚Ü?WRITE_RES ‚Ü?DONE
 ```
-For multi-group (q8_num_groups > 1, from descriptor): COMPUTE ‚Üí READ_RES_ACC loops back to LOAD_SCALES for each group (accumulating into acc_buf), then COPY_ACC_TO_BUF ‚Üí WRITE_RES.
+For multi-group (q8_num_groups > 1, from descriptor): COMPUTE ‚Ü?READ_RES_ACC loops back to LOAD_SCALES for each group (accumulating into acc_buf), then COPY_ACC_TO_BUF ‚Ü?WRITE_RES.
 
-(Each LOAD_*/FETCH_DESC state has a corresponding _W wait state for AXI burst completion. Full FSM: 27 states ‚Äî see REG_DEBUG table for complete list.)
+(Each LOAD_*/FETCH_DESC state has a corresponding _W wait state for AXI burst completion. Full FSM: 27 states ‚Ä?see REG_DEBUG table for complete list.)
 
 ### CPU-OP Descriptor Protocol (CPU/FPGA synchronization):
 
 To handle CPU-only operations (RMSNorm, RoPE, SoftMax, bias add, SwiGLU, residual add) between FPGA matmuls, the descriptor chain supports a special `CPU_OP` descriptor type (`tensor_type = 15`).
 
 The interrupt-based CPU_OP protocol is implemented in `matmul_top.v` (the PhaseB chain FSM). When `matmul_top.v` encounters a CPU_OP descriptor:
-1. It sets `reg_chain_ctrl[2]=1` and pulses `desc_irq` ‚Üí CPU interrupt fires
+1. It sets `reg_chain_ctrl[2]=1` and pulses `desc_irq` ‚Ü?CPU interrupt fires
 2. FSM enters `PH_CPU_OP_WAIT` state and **pauses** until CPU resumes it
 3. CPU reads `reg_status` (status=3 = chain busy) to distinguish from chain-complete
 4. CPU reads `reg_desc_head` to identify which descriptor index triggered the CPU_OP
@@ -218,13 +313,13 @@ The interrupt-based CPU_OP protocol is implemented in `matmul_top.v` (the PhaseB
 6. CPU clears `reg_isr[0]` (write REG_ISR) and writes `CHAIN_CTRL[0]=1` to resume
 7. FSM clears the resume signal, advances to next descriptor
 
-**Note:** `hp_fsm_top.v` (the current active FSM) handles CPU_OP differently ‚Äî it simply passes activations through to DDR as a passthrough read/write, without any interrupt or wait state (see `hp_fsm_top.v:492-494`). Path:
+**Note:** `hp_fsm_top.v` (the current active FSM) handles CPU_OP differently ‚Ä?it simply passes activations through to DDR as a passthrough read/write, without any interrupt or wait state (see `hp_fsm_top.v:492-494`). Path:
 ```
-FETCH_DESC ‚Üí LOAD_ACT ‚Üí LOAD_ACT_W ‚Üí WRITE_RES ‚Üí WRITE_RES_BURST ‚Üí WRITE_RES_W ‚Üí DONE
+FETCH_DESC ‚Ü?LOAD_ACT ‚Ü?LOAD_ACT_W ‚Ü?WRITE_RES ‚Ü?WRITE_RES_BURST ‚Ü?WRITE_RES_W ‚Ü?DONE
 ```
 The interrupt-based protocol described above exists in `matmul_top.v` for future PhaseB integration.
 
-The CPU knows what operation to perform from the descriptor's position in the chain (the CPU built the chain, so it has an internal mapping: "descriptor 0 ‚Üí attn_norm, descriptor 4 ‚Üí bias+rope+softmax").
+The CPU knows what operation to perform from the descriptor's position in the chain (the CPU built the chain, so it has an internal mapping: "descriptor 0 ‚Ü?attn_norm, descriptor 4 ‚Ü?bias+rope+softmax").
 
 **CPU operations per layer** (from `tmac_gguf.cpp`):
 
@@ -244,18 +339,18 @@ The CPU knows what operation to perform from the descriptor's position in the ch
 **Typical descriptor chain for one layer** (adjacent CPU ops batched):
 
 ```
-Desc  0: CPU_OP           ‚Üí attn_norm                          (result: norm_out)
-Desc  1: matmul_q5_0      ‚Üí attn_q     (act: norm_out)          (result: q)
-Desc  2: matmul_q5_0      ‚Üí attn_k     (act: norm_out)          (result: k)
-Desc  3: matmul_q8_0      ‚Üí attn_v     (act: norm_out)          (result: v)
-Desc  4: CPU_OP           ‚Üí bias+rope+softmax                   (result: context)
-Desc  5: matmul_q5_0      ‚Üí attn_output (act: context)          (result: attn_out)
-Desc  6: CPU_OP           ‚Üí residual+ffn_norm                   (result: norm2)
-Desc  7: matmul_q5_0      ‚Üí ffn_gate   (act: norm2)             (result: gate)
-Desc  8: matmul_q5_0      ‚Üí ffn_up     (act: norm2)             (result: up)
-Desc  9: CPU_OP           ‚Üí swiglu                              (result: swiglu_out)
-Desc 10: matmul_q6k/q4k   ‚Üí ffn_down   (act: swiglu_out)        (result: ffn_out)
-Desc 11: CPU_OP           ‚Üí residual                            (result: hidden)
+Desc  0: CPU_OP           ‚Ü?attn_norm                          (result: norm_out)
+Desc  1: matmul_q5_0      ‚Ü?attn_q     (act: norm_out)          (result: q)
+Desc  2: matmul_q5_0      ‚Ü?attn_k     (act: norm_out)          (result: k)
+Desc  3: matmul_q8_0      ‚Ü?attn_v     (act: norm_out)          (result: v)
+Desc  4: CPU_OP           ‚Ü?bias+rope+softmax                   (result: context)
+Desc  5: matmul_q5_0      ‚Ü?attn_output (act: context)          (result: attn_out)
+Desc  6: CPU_OP           ‚Ü?residual+ffn_norm                   (result: norm2)
+Desc  7: matmul_q5_0      ‚Ü?ffn_gate   (act: norm2)             (result: gate)
+Desc  8: matmul_q5_0      ‚Ü?ffn_up     (act: norm2)             (result: up)
+Desc  9: CPU_OP           ‚Ü?swiglu                              (result: swiglu_out)
+Desc 10: matmul_q6k/q4k   ‚Ü?ffn_down   (act: swiglu_out)        (result: ffn_out)
+Desc 11: CPU_OP           ‚Ü?residual                            (result: hidden)
 ```
 
 12 descriptors √ó 24 layers = 288 descriptors per token. Each CPU_OP triggers one interrupt. (`NUM_LAYERS = 24` in `sim/tmac_gguf.cpp:142`.)
@@ -282,22 +377,22 @@ redundant DDR act reads.
 
 ### Dispatch Logic (tmac_gguf.cpp:452-465):
 ```
-if (g_fpga_q5_0 && A->type == TENSOR_Q5_0) ‚Üí matmul_fpga_q5_0()  (attn_q/k/o, ffn_gate/up)
-else if (g_fpga_q6_k && A->type == TENSOR_Q6_K) ‚Üí matmul_fpga_q6_k()  (ffn_down high-precision subset)
-else if (g_fpga_q4k && A->type == TENSOR_Q4_K) ‚Üí matmul_fpga_q4_k()  (ffn_down low-precision subset)
-else if (g_fpga_q8 && A->type == TENSOR_Q8_0) ‚Üí matmul_fpga_q8()   (token_embd, attn_v, logits)
-else ‚Üí matmul_fpga_int16()   (F32 norms, fallback)
+if (g_fpga_q5_0 && A->type == TENSOR_Q5_0) ‚Ü?matmul_fpga_q5_0()  (attn_q/k/o, ffn_gate/up)
+else if (g_fpga_q6_k && A->type == TENSOR_Q6_K) ‚Ü?matmul_fpga_q6_k()  (ffn_down high-precision subset)
+else if (g_fpga_q4k && A->type == TENSOR_Q4_K) ‚Ü?matmul_fpga_q4_k()  (ffn_down low-precision subset)
+else if (g_fpga_q8 && A->type == TENSOR_Q8_0) ‚Ü?matmul_fpga_q8()   (token_embd, attn_v, logits)
+else ‚Ü?matmul_fpga_int16()   (F32 norms, fallback)
 ```
 
 ### Tile Sizes and Buffer Usage:
 
 | Type | Tile | Blocks | Bytes/tile | weight_buf | Result Bytes/row |
 |------|------|--------|------------|------------|-----------------|
-| Q8_0 | 64√ó896 | ‚Äî | 7680 (per desc) | 4096 (per group) | 8 |
+| Q8_0 | 64√ó896 | ‚Ä?| 7680 (per desc) | 4096 (per group) | 8 |
 | Q5_0 | 4√ó896 | 56 | 2696 (2688 blocks + 8 norm) | N/A (per-block streaming) | 8 |
 | Q6_K | 32√ó256 | 32 | 6720 | 8192 | 8 |
 | Q4_K | 56√ó256 | 56 | 8064 | 8192 | 8 |
-| INT16 | 64√ó64 | ‚Äî | 8192 | 8192 | 8 |
+| INT16 | 64√ó64 | ‚Ä?| 8192 | 8192 | 8 |
 
 All cores output S24.8 fixed-point (48-bit accumulator, zero-extended to 64-bit in DDR).
 
@@ -331,8 +426,8 @@ All cores output S24.8 fixed-point (48-bit accumulator, zero-extended to 64-bit 
 | [18:16] | `rd_dbg_state` | Read master FSM state (3-bit) |
 | [15] | `q8_done` | Q8 core done |
 | [14:11] | `col_group` | Q8 column group counter (0..13) |
-| [10:8] | `timeout_msb` | `timeout_cnt[15:13]` ‚Äî top 3 bits of shared timeout |
-| [7:0] | `sc_byte_idx` | Scale byte counter ‚Äî useful for tracking scale loading progress |
+| [10:8] | `timeout_msb` | `timeout_cnt[15:13]` ‚Ä?top 3 bits of shared timeout |
+| [7:0] | `sc_byte_idx` | Scale byte counter ‚Ä?useful for tracking scale loading progress |
 
 **REG_Q8_DEBUG (0x3C) bitfields** (from `hp_fsm_top.v:1095-1104`):
 | Bits | Field | Description |
@@ -345,7 +440,7 @@ All cores output S24.8 fixed-point (48-bit accumulator, zero-extended to 64-bit 
 | [22:20] | `q8_core_state` | Q8 core's internal FSM state (3-bit) |
 | [19:17] | `q8_core_g` | Q8 core's bank counter (3-bit) |
 | [16:11] | `q8_core_k` | Q8 core's column counter (6-bit) |
-| [10:7] | (various) | `{copy_act_idx[1:0], q8_sc_we, sc_byte_idx[0]}` ‚Äî sc_byte_idx[0] toggles each scale byte pair |
+| [10:7] | (various) | `{copy_act_idx[1:0], q8_sc_we, sc_byte_idx[0]}` ‚Ä?sc_byte_idx[0] toggles each scale byte pair |
 | [6:0] | `wt_byte_idx` | Weight byte index `[6:0]` |
 
 ### Descriptor Format (32 bytes, 8 words):
@@ -360,7 +455,7 @@ All cores output S24.8 fixed-point (48-bit accumulator, zero-extended to 64-bit 
 | 16 | [31:16] | (reserved) | Upper 16 bits reserved |
 | 20 | [3:0] | `num_groups` | Q8 column groups (0 = use GP0 register fallback). Ignored by Q5_0. |
 | 21 | [7:0] | (reserved) | Reserved |
-| 22 | [15:0] | `num_tiles` | Tiles per descriptor (0 ‚Üí 1 for backward compat). Q5: 4-row tiles. Q8: 64-row tiles. |
+| 22 | [15:0] | `num_tiles` | Tiles per descriptor (0 ‚Ü?1 for backward compat). Q5: 4-row tiles. Q8: 64-row tiles. |
 | 24 | [23:0] | `act_total_bytes` | Total activation bytes to read from DDR |
 | 28 | [31:0] | (reserved) | Reserved |
 
@@ -400,34 +495,34 @@ All cores output S24.8 fixed-point (48-bit accumulator, zero-extended to 64-bit 
 | 27 | `CPU_OP_WAIT` | Interrupt mode: pulse desc_irq, set chain_ctrl[2], wait for CPU resume |
 
 **Key experience: Debug register field usage patterns from hardware bringup:**
-- `REG_Q8_DEBUG[25]` (q8_done) transitions 0‚Üí1 when computation completes; this is the most important signal for debug
-- `REG_Q8_DEBUG[16:11]` (q8_core_k) should count from 0‚Üí63 during result readback; if stuck at 0, the FSM never entered READ_RES/READ_RES_ACC
-- `REG_Q8_DEBUG[15:8]` bit 0 (sc_byte_idx[0]) toggles each scale byte pair processed ‚Äî if toggling stops, the scale loading DMA hung
-- `REG_DEBUG[27]` (rd_done) and [26] (wr_done) are cumulative sticky bits ‚Äî clear on next entry to LOAD_ACT/WRITE_RES respectively
+- `REG_Q8_DEBUG[25]` (q8_done) transitions 0‚Ü? when computation completes; this is the most important signal for debug
+- `REG_Q8_DEBUG[16:11]` (q8_core_k) should count from 0‚Ü?3 during result readback; if stuck at 0, the FSM never entered READ_RES/READ_RES_ACC
+- `REG_Q8_DEBUG[15:8]` bit 0 (sc_byte_idx[0]) toggles each scale byte pair processed ‚Ä?if toggling stops, the scale loading DMA hung
+- `REG_DEBUG[27]` (rd_done) and [26] (wr_done) are cumulative sticky bits ‚Ä?clear on next entry to LOAD_ACT/WRITE_RES respectively
 - `REG_DEBUG[15:8]` vs [7:0] shows which FSM phase is active: [15:8] increments during LOAD_WEIGHT/LOAD_SCALES, [7:0] increments during LOAD_ACT
 
 ### Existing Verilog Cores:
 
 | Core | Tile | Cycle/tile | Status |
 |------|------|-----------|--------|
-| `matmul_q8_core.v` | 64√ó896 | ~515 | ‚úÖ Core logic correct (uniform-data validated 2026-07; address advancement bug fixed 2026-08-12) |
-| `matmul_q4k_core.v` | 56√ó256 | ~? | ‚úÖ Working |
-| `matmul_q5_0_core.v` | 4√ó896 | 1904 | ‚úÖ Per-block wide register interface, no LUTRAM |
-| `matmul_int16_core.v` | 64√ó64 | 515 | ‚úÖ Working |
-| `matmul_top.v` | ‚Äî | ‚Äî | ‚úÖ 5 cores instantiated (Q8, Q4K, Q5_0, Q6_K, INT16) |
-| `hp_fsm_top.v` | HP FSM + Q8 + Q5_0 | N/A | ‚úÖ Descriptor-chain DMA, Q8 compute 64√ó896 (14-group, uniform-data validated; address advancement + DDR layout bugs fixed 2026-08-12), Q5_0 4√ó896 (2-core, per-block wide register interface; f16_decode widened S24.8‚ÜíS24.16 2026-08-13 for small-block-scale precision) |
+| `matmul_q8_core.v` | 64√ó896 | ~515 | ‚ú?Core logic correct (uniform-data validated 2026-07; address advancement bug fixed 2026-08-12) |
+| `matmul_q4k_core.v` | 56√ó256 | ~? | ‚ú?Working |
+| `matmul_q5_0_core.v` | 4√ó896 | 1904 | ‚ú?Per-block wide register interface, no LUTRAM |
+| `matmul_int16_core.v` | 64√ó64 | 515 | ‚ú?Working |
+| `matmul_top.v` | ‚Ä?| ‚Ä?| ‚ú?5 cores instantiated (Q8, Q4K, Q5_0, Q6_K, INT16) |
+| `hp_fsm_top.v` | HP FSM + Q8 + Q5_0 | N/A | ‚ú?Descriptor-chain DMA, Q8 compute 64√ó896 (14-group, uniform-data validated; address advancement + DDR layout bugs fixed 2026-08-12), Q5_0 4√ó896 (2-core, per-block wide register interface; f16_decode widened S24.8‚ÜíS24.16 2026-08-13 for small-block-scale precision) |
 
 ### Missing Verilog Cores:
 
 | Core | Tile | Status |
 |------|------|--------|
-| None | ‚Äî | All cores implemented ‚úÖ |
+| None | ‚Ä?| All cores implemented ‚ú?|
 
-## Fixes (2026-07-06) ‚Äî Spurious block 56
+## Fixes (2026-07-06) ‚Ä?Spurious block 56
 
 **Bug: q5_start toggles every cycle, causing extra block after Q5_READ_RES.**
 
-The `q5_start` pulse in `Q5_BLOCK_COMPUTE_W` fires every cycle because the condition `q5_qs_words == 8 && !q5_start` is always true (default sets q5_start=0 each cycle). On the cycle `q5_done_rise` fires for block 55, q5_start is ALSO pulsed. Next cycle the core enters IDLE, sees `start=1`, and starts computing with `blk_num=q5_blk_counter=56`. Header address 56 is out of bounds (0-55), returning X ‚Üí `f16_w=X` ‚Üí `d_pre=X` ‚Üí `prod_w=X` ‚Üí `acc=X`.
+The `q5_start` pulse in `Q5_BLOCK_COMPUTE_W` fires every cycle because the condition `q5_qs_words == 8 && !q5_start` is always true (default sets q5_start=0 each cycle). On the cycle `q5_done_rise` fires for block 55, q5_start is ALSO pulsed. Next cycle the core enters IDLE, sees `start=1`, and starts computing with `blk_num=q5_blk_counter=56`. Header address 56 is out of bounds (0-55), returning X ‚Ü?`f16_w=X` ‚Ü?`d_pre=X` ‚Ü?`prod_w=X` ‚Ü?`acc=X`.
 
 **Fix:** Added `q5_start_pulsed` single-shot flag:
 - Cleared in `Q5_BLOCK_COMPUTE` (line 959)
@@ -437,33 +532,39 @@ The `q5_start` pulse in `Q5_BLOCK_COMPUTE_W` fires every cycle because the condi
 
 All 4 Q5_0 HP FSM tests now PASS (previously all 4 FAILED with X in acc). No more block 56, no X propagation.
 
-**Q8 BRAM waste analysis and smem/act ‚Üí LUTRAM conversion (2026-07-07):** Analyzed `matmul_q8_core.v` BRAM utilization and found 9 BRAM18 held arrays using < 5% of their declared capacity:
-    - **smem_bank0..7** (8 BRAM18): 8 banks √ó 512√ó16 declared, only 16 entries/bank used (3.1%) ‚Äî address decode `{g, k[5]}` = 4 bits ‚Üí 16. Changed to `ram_style = "distributed"` depth 16.
+**Q8 BRAM waste analysis and smem/act ‚Ü?LUTRAM conversion (2026-07-07):** Analyzed `matmul_q8_core.v` BRAM utilization and found 9 BRAM18 held arrays using < 5% of their declared capacity:
+    - **smem_bank0..7** (8 BRAM18): 8 banks √ó 512√ó16 declared, only 16 entries/bank used (3.1%) ‚Ä?address decode `{g, k[5]}` = 4 bits ‚Ü?16. Changed to `ram_style = "distributed"` depth 16.
     - **act_bram** (1 BRAM18): 512√ó16 declared, only 64 entries used (12.5%). Changed to `ram_style = "distributed"` depth 64.
     - **wmem** (8 BRAM18): 512√ó8, 100% utilized. Left as BRAM.
     - **acc** (0 BRAM18): Already FFs/distributed RAM (8 entries/bank √ó 48-bit √ó 8 banks = 3Kb).
     
-    **Result:** Q8 core BRAM drops from 17‚Üí8 (wmem only). Total system BRAM ~10 (Q8 8 + Q5_0 2). LUTRAM increases ~128 (smem) + 16 (act) = +144 LUTRAM (3.3% of 4,400 capacity, well within budget). All 123 core simulation tests PASS: Q8 6/6, Q4K 4/4, Q6_K 97/97, HP FSM 7/7, HP FSM Q5_0 9/9. INT16 smoke pre-existing fail (unrelated wmem addressing). Q5_0 standalone testbench pre-existing compile error (old port interface, not updated for per-block rewrite).
+    **Result:** Q8 core BRAM drops from 17‚Ü? (wmem only). Total system BRAM ~10 (Q8 8 + Q5_0 2). LUTRAM increases ~128 (smem) + 16 (act) = +144 LUTRAM (3.3% of 4,400 capacity, well within budget). All 123 core simulation tests PASS: Q8 6/6, Q4K 4/4, Q6_K 97/97, HP FSM 7/7, HP FSM Q5_0 9/9. INT16 smoke pre-existing fail (unrelated wmem addressing). Q5_0 standalone testbench pre-existing compile error (old port interface, not updated for per-block rewrite).
 
-## Current Status (2026-08-12) ‚Äî Q8 address advancement bug + DDR layout + scale normalization fixed; hardware-verified
+## Current Status (2026-08-14) ‚Ä?Q5 sign bug, S48 int32 truncation, and Q8 first-run stale state all fixed; hardware-verified
 
-**2026-08-12 update:** Three Q8 bugs found and fixed (see Key Fix section above): (1) address anticipation block optimized away by Vivado ‚Äî `pre_wmem_addr`/`pre_smem_addr`/`pre_act_addr` stuck at 0, causing all 512 compute iterations to read wmem[0]/smem[0]/act[0]; (2) DDR weight layout was column-major (`go[c*64 + r]`) but the FSM expected row-group-major (`(r>>3)*512 + c*8 + (r&7)`); (3) Linux scale values too small ‚Äî raw f16 block scales (d‚âà0.001-0.1) gave UQ8.8 values of 0-25, making dequant ‚âà 0. Added row normalization. All three bugs were latent because **all existing tests used uniform data** (all-1s weights, scales, activations), which produces identical results regardless of address, layout, or scale. Fixed in RTL (`matmul_q8_core.v`), C++ test (`test_fpga_cores.cpp`), and Linux (`tmac_linux.c`).
+**2026-08-14 addendum:** the long-standing "pre-existing Q5_0/Q8_0 precision issue" was root-caused and fixed ‚Ä?see **Key Fix (2026-08-14)** at the top. Three bugs: (1) Q5_0 `f16_decode` ignored the f16 sign bit (llama.cpp's negative-d trick sign-flips ~50% of real blocks); (2) S48 accumulator cast to `int32_t` in board output scaling wrapped rows > 2¬≥¬π; (3) first Q8 descriptor after a Q5_0 descriptor corrupts rows 16‚Ä?3 (stale FSM state, cleared by the first Q8 compute ‚Ä?mitigated by running each Q8 descriptor twice). Verified on silicon: Q5 maxdiff 0.0001‚Ä?.02, Q8 `attn_v` maxdiff 0.0004‚Ä?.004, no `[q8 RAWDIFF]`, layer norms match the sim.
+
+**2026-08-13 addendum:** the two Linux Q6_K dequant bugs (missing block offset `bo`, and `f16_to_f32` unsigned-wrap on negative subnormals) were found and fixed ‚Ä?see **Key Fix (2026-08-13)** at the top. Verified on hardware via on-board `--trace`: all 24 layer norms now match the sim exactly (the layer-0 115M explosion is gone).
+
+**2026-08-12 update:** Three Q8 bugs found and fixed (see Key Fix section above): (1) address anticipation block optimized away by Vivado ‚Ä?`pre_wmem_addr`/`pre_smem_addr`/`pre_act_addr` stuck at 0, causing all 512 compute iterations to read wmem[0]/smem[0]/act[0]; (2) DDR weight layout was column-major (`go[c*64 + r]`) but the FSM expected row-group-major (`(r>>3)*512 + c*8 + (r&7)`); (3) Linux scale values too small ‚Ä?raw f16 block scales (d‚â?.001-0.1) gave UQ8.8 values of 0-25, making dequant ‚â?0. Added row normalization. All three bugs were latent because **all existing tests used uniform data** (all-1s weights, scales, activations), which produces identical results regardless of address, layout, or scale. Fixed in RTL (`matmul_q8_core.v`), C++ test (`test_fpga_cores.cpp`), and Linux (`tmac_linux.c`).
 
 | Resource | Used | Available | % | Notes |
 |----------|------|-----------|---|-------|
-| Slice LUTs | **9,066** | 17,600 | **51.51** | -832 from Q5_0 clean-slate rewrite (was 9,898) |
-| LUT as Logic | **8,889** | 17,600 | **50.51** | |
+| Slice LUTs | **9,393** | 17,600 | **53.37** | +327 vs 2026-07-12 (Q5 sign-handling negation in f16_decode) |
+| LUT as Logic | **9,216** | 17,600 | **52.36** | |
 | LUT as Memory | **177** | 6,000 | **2.95** | +80 from LUTRAM smem/act (was 97) |
-| Slice Regs | 14,052 | 35,200 | 39.92 | +1,271 (CPU_OP protocol regs + DSP pipelining) |
+| Slice Regs | 14,058 | 35,200 | 39.94 | +6 |
 | BRAM18 | **10** | 120 | **8.33** | Q8(8 wmem) + 2√óQ5_0(1+1 act_mem) = 10 |
 | DSP48E1 | **23** | 80 | **28.75** | +1 (Q5 DSP register opt added 42 regs) |
-| Slice | 4,387 | 4,400 | **99.70** | Tight ‚Äî routing congestion (unchanged) |
-| **WNS** | **-0.360 ns** | 10 ns | 4 failing | Minimal violation, works on HW |
-| **SD boot** | **‚úÖ PASS** | ‚Äî | ‚Äî | FSBL‚ÜíU-Boot‚ÜíLinux verified (see #24) |
+| Slice | 4,233 | 4,400 | **96.20** | ‚à?54 (packing improved) |
+| **WNS** | **-0.645 ns** | 10 ns | 20 failing | Sign-negation added a small combinational delay; still works on HW |
+| **SD boot** | **‚ú?PASS** | ‚Ä?| ‚Ä?| FSBL‚ÜíU-Boot‚ÜíLinux verified (see #24) |
 
 **Bitstream sources:** `axihp_read_master.v` + `axihp_write_master.v` + `matmul_q8_core.v` + `matmul_q5_0_core.v` + `hp_fsm_top.v`
 
-**Hardware tests (2026-07-16): ALL 10 TESTS PASS** *(Note: all Q8 tests used uniform data ‚Äî they could not detect the address advancement or weight layout bugs fixed 2026-08-12)*
+**2026-08-14 bitstream:** rebuilt with the Q5_0 `f16_decode` sign fix (sign-respecting d). SHA256 `E6A2E447...` for `linux/boot/system_wrapper.bit`, fused into `BOOT.BIN` (re-run `bootgen.bat` after any rebuild).
+
+**Hardware tests (2026-07-16): ALL 10 TESTS PASS** *(Note: all Q8 tests used uniform data ‚Ä?they could not detect the address advancement or weight layout bugs fixed 2026-08-12)*
 | Test | Description | Result |
 |------|------------|--------|
 | 1 | Basic 64-byte DMA | PASS |
@@ -481,9 +582,9 @@ All 4 Q5_0 HP FSM tests now PASS (previously all 4 FAILED with X in acc). No mor
 
 **q8_act_we stuck-at-1 bug (cosmetic):** `q8_act_we` set in `COPY_ACT_TO_CORE` never cleared in `COMPUTE`/`COMPUTE_W`/`READ_RES`. Overwrites `act_bram[63]` during compute. Harmless with uniform activations but should be fixed.
 
-**Simulation (iVerilog):** All 18 HP FSM tests PASS (8 comprehensive + 10 Q5_0 dispatch, includes backward compat verification).
+**Simulation (iVerilog):** All 22 HP FSM tests PASS (12 comprehensive + 10 Q5_0 dispatch, includes backward compat verification).
 
-### Hierarchical Resource Breakdown (Vivado routed ‚Äî 2026-07-12 build)
+### Hierarchical Resource Breakdown (Vivado routed ‚Ä?2026-07-12 build)
 
 ```
 Instance          Tot LUTs   %Total   FFs    BRAM18  DSP   Role
@@ -499,7 +600,7 @@ u_rd (read mstr)      173     1.9%    116      0       0   AXI HP read master
 Total               9,066   100%   14,052    10      23
 ```
 
-**`inst (FSM top)` ‚Äî 4,464 LUTs (47%)** is the binding constraint. Contains:
+**`inst (FSM top)` ‚Ä?4,464 LUTs (47%)** is the binding constraint. Contains:
 - Q8 weight/scale/act loading FSM with byte-unpack shift registers (~1,200 LUTs)
 - Q5_0 weight loading (4,928-byte iteration, per-cycle bank/addr/we routing) (~800 LUTs)
 - Q5_0 scale/act copy/unpack FSM (~300 LUTs)
@@ -509,7 +610,7 @@ Total               9,066   100%   14,052    10      23
 - Q8/Q5_0 dispatch branching (~400 LUTs)
 - Q8 control signals (wmem/smem/acc BRAM steering) (~400 LUTs)
 
-**Note on LUTRAM‚ÜíBRAM conversion potential:** The 3 FF-based buffers (act_buf 4,096 b, acc_buf 3,072 b, desc_buf 256 b) total 7,680 bits ‚Äî fitting in 1 RAMB18. Converting them would save ~7,400 FFs but **zero LUTs** (all 4,464 FSM LUTs are logic, not LUTRAM). Slice savings: ~50-70 slices (1-1.5%). Not the bottleneck.
+**Note on LUTRAM‚ÜíBRAM conversion potential:** The 3 FF-based buffers (act_buf 4,096 b, acc_buf 3,072 b, desc_buf 256 b) total 7,680 bits ‚Ä?fitting in 1 RAMB18. Converting them would save ~7,400 FFs but **zero LUTs** (all 4,464 FSM LUTs are logic, not LUTRAM). Slice savings: ~50-70 slices (1-1.5%). Not the bottleneck.
 
 **Why slices are full (99.7%) despite 56.2% LUT usage:**
 - 473 CARRY4 chains lock LUT pairs into fixed slice positions
@@ -519,7 +620,7 @@ Total               9,066   100%   14,052    10      23
 
 ### Q5_0 Clean-Slate Per-Block Wide Register Interface (2026-07-07)
 
-Completely rewrote both `matmul_q5_0_core.v` and `hp_fsm_top.v` to eliminate byte-at-a-time header loading, `hdr_packed` LUTRAM, and `qs_word`/`blk_num`/`core_id`/`start` ports. The core now receives per-block `blk_d[15:0]`, `blk_qh[31:0]`, `blk_qs[127:0]` via a single `blk_valid` pulse ‚Äî all fed from a 48-byte DDR burst (12 AXI beats) per block.
+Completely rewrote both `matmul_q5_0_core.v` and `hp_fsm_top.v` to eliminate byte-at-a-time header loading, `hdr_packed` LUTRAM, and `qs_word`/`blk_num`/`core_id`/`start` ports. The core now receives per-block `blk_d[15:0]`, `blk_qh[31:0]`, `blk_qs[127:0]` via a single `blk_valid` pulse ‚Ä?all fed from a 48-byte DDR burst (12 AXI beats) per block.
 
 **Key changes:**
 - Core ports: `blk_d[15:0]`, `blk_qh[31:0]`, `blk_qs[127:0]`, `blk_valid`, `norm_we/addr/din`
@@ -532,9 +633,9 @@ Completely rewrote both `matmul_q5_0_core.v` and `hp_fsm_top.v` to eliminate byt
 **FSM changes (hp_fsm_top.v):**
 - Removed Q5_PRELOAD_HDR/Q5_PRELOAD_HDR_W (~109 lines byte-level unpack)
 - Removed `q5_hdr_we0/1`, `q5_hdr_bank/addr/din/sub/block/core`, `q5_qs_word0/1`, `q5_sc_*`, `q5_res_addr`, `q5_res_core/row`, `q5_qs_words`
-- Added Q5_LOAD_NORM/Q5_LOAD_NORM_W: 8-byte DDR burst ‚Üí 4 √ó UQ8.8 row_norm values
+- Added Q5_LOAD_NORM/Q5_LOAD_NORM_W: 8-byte DDR burst ‚Ü?4 √ó UQ8.8 row_norm values
 - Rewrote Q5_BLOCK_COMPUTE/Q5_BLOCK_COMPUTE_W: reads 48 bytes DDR (12 AXI beats = 6 √ó 64-bit rd_data) per block, unpacks into core d/qh/qs, pulses `blk_valid`
-- Rewrote Q5_READ_RES: direct capture of `u_q5_core0.res0/res1` and `u_q5_core1.res0/res1` ‚Äî no `res_addr` interface
+- Rewrote Q5_READ_RES: direct capture of `u_q5_core0.res0/res1` and `u_q5_core1.res0/res1` ‚Ä?no `res_addr` interface
 
 **DDR layout per block (48 bytes):**
 ```
@@ -560,47 +661,47 @@ Total: 56 √ó 48 = 2688 bytes block data + 8 bytes norm (4 √ó UQ8.8) = 2696 bytes
 - Each block: 1 SETUP_D + 32 COMPUTE + 1 DRAIN = 34 cycles (SETUP_D always executed)
 - 56 blocks: 56 √ó 34 = 1904 cycles
 - DDR read per block adds ~17 cycles (12 AXI beats + latency + unpack), giving ~56 √ó 51 = ~2856 system cycles/tile
-- SETUP_D is not skipable ‚Äî d_pre is recomputed per block (each GGUF block has its own f16 scale d)
+- SETUP_D is not skipable ‚Ä?d_pre is recomputed per block (each GGUF block has its own f16 scale d)
 
 ### Q5_0 HP FSM Dispatch Tests (2026-07-06)
 
 | # | Test | Weight | Act | Expected | Covers |
 |---|------|--------|-----|----------|--------|
 | 1 | Single desc, all-1s | 1 | 1 | 229376 | baseline |
-| 2 | Chain of 2 (1‚Üí0) | 1, 0 | 1, 1 | 229376, 0 | chain, clr_acc |
-| 3 | CPU_OP ‚Üí Q5_0 | 1 | 1 | 229376 | mixed chain |
-| 4 | Q5_0 ‚Üí CPU_OP ‚Üí Q5_0 | 1, 2 | 1, 2 | 229376, 917504 | 3-desc chain |
+| 2 | Chain of 2 (1‚Ü?) | 1, 0 | 1, 1 | 229376, 0 | chain, clr_acc |
+| 3 | CPU_OP ‚Ü?Q5_0 | 1 | 1 | 229376 | mixed chain |
+| 4 | Q5_0 ‚Ü?CPU_OP ‚Ü?Q5_0 | 1, 2 | 1, 2 | 229376, 917504 | 3-desc chain |
 | 5 | Zero activations | 1 | 0 | 0 | act=0 edge case |
 | 6 | Back-to-back restart | 1, 1 | 1, 1 | 229376, 229376 | DONE‚ÜíIDLE re-entry |
 | 7 | Chain of 4 Q5_0 | 1, 2, 0, 1 | 1 | 229376, 458752, 0, 229376 | 4-desc chain |
 | 8 | Negative activations | 1 | -1 | -229376 | signed accum |
 | 9 | 5-desc mixed chain | 1, 0, 1 | 1, 1, 1 | 229376, 0, 229376 | deep mixed chain |
 
-## Bare-Metal ARM Port (2026-07-05) ‚Äî FPGA Cores Tested on Hardware
+## Bare-Metal ARM Port (2026-07-05) ‚Ä?FPGA Cores Tested on Hardware
 
 | Component | File | Status |
 |-----------|------|--------|
-| Boot code (startup.s) | `vivado_integration/sw/startup.s` | ‚úÖ FPU enable added (CPACR+FPEXC), MMU/caches off |
-| Register map + types | `vivado_integration/sw/tmac_baremetal.h` | ‚úÖ AXI-Lite access, math builtins, FP16‚ÜíFP32 |
+| Boot code (startup.s) | `vivado_integration/sw/startup.s` | ‚ú?FPU enable added (CPACR+FPEXC), MMU/caches off |
+| Register map + types | `vivado_integration/sw/tmac_baremetal.h` | ‚ú?AXI-Lite access, math builtins, FP16‚ÜíFP32 |
 | Inference engine | `vivado_integration/sw/tmac_baremetal.cpp` | Q8/Q5 FPGA paths, CPU fallback for other types |
-| Core test wrapper | `vivado_integration/sw/test_fpga_cores.cpp` | ‚úÖ Runs on HW, 5 tests |
-| Linker script | `vivado_integration/sw/link.ld` | ‚úÖ DDR at 0x00100000, 64KB stack |
-| Makefile | `vivado_integration/sw/Makefile` | ‚úÖ LLVM/clang cross-compile |
-| XSDB test script | `vivado_integration/sw/run_test_fpga_cores.tcl` | ‚úÖ bitstream+ps7_init+AFI+dow+run |
-| XSDB addr map test | `vivado_integration/sw/test_addr_map2.tcl` | ‚úÖ Proved PS=PL address mapping |
+| Core test wrapper | `vivado_integration/sw/test_fpga_cores.cpp` | ‚ú?Runs on HW, 5 tests |
+| Linker script | `vivado_integration/sw/link.ld` | ‚ú?DDR at 0x00100000, 64KB stack |
+| Makefile | `vivado_integration/sw/Makefile` | ‚ú?LLVM/clang cross-compile |
+| XSDB test script | `vivado_integration/sw/run_test_fpga_cores.tcl` | ‚ú?bitstream+ps7_init+AFI+dow+run |
+| XSDB addr map test | `vivado_integration/sw/test_addr_map2.tcl` | ‚ú?Proved PS=PL address mapping |
 
 ### Key Fixes Found During Bare-Metal Port
 
-1. **FPU not enabled** ‚Äî Cortex-A9 VFP is disabled after reset (FPEXC.EN=0). Any floating-point instruction (float literals, casts, math) causes an undefined instruction exception. `startup.s` now enables CP10/CP11 in CPACR and sets FPEXC.EN=1. Without this, `test_fpga_cores` crashed immediately in the initialization loop (`act_all1[i] = 1.0f`).
+1. **FPU not enabled** ‚Ä?Cortex-A9 VFP is disabled after reset (FPEXC.EN=0). Any floating-point instruction (float literals, casts, math) causes an undefined instruction exception. `startup.s` now enables CP10/CP11 in CPACR and sets FPEXC.EN=1. Without this, `test_fpga_cores` crashed immediately in the initialization loop (`act_all1[i] = 1.0f`).
 
-2. **48-bit result sign extension** ‚Äî The Q8/Q5 cores output 48-bit signed accumulators, zero-extended to 64-bit words in DDR. For negative results, the ARM code must manually sign-extend from bit 47:
+2. **48-bit result sign extension** ‚Ä?The Q8/Q5 cores output 48-bit signed accumulators, zero-extended to 64-bit words in DDR. For negative results, the ARM code must manually sign-extend from bit 47:
    ```c
    uint64_t raw = (uint64_t)lo | ((uint64_t)hi << 32);
    if (raw & ((uint64_t)1 << 47)) raw |= 0xFFFF000000000000ULL;
    int32_t acc = (int32_t)(int64_t)raw;
    ```
 
-3. **AFI0 registers at 0xF800_8000** ‚Äî The AFI control registers are at 0xF800_8000 (not 0xF800_9000 as documented in earlier AGENTS.md). Correct config sequence:
+3. **AFI0 registers at 0xF800_8000** ‚Ä?The AFI control registers are at 0xF800_8000 (not 0xF800_9000 as documented in earlier AGENTS.md). Correct config sequence:
    ```
    mwr 0xF8000008 0x0000DF0D    # unlock SLCR
    mwr 0xF8000910 0x0000000F    # LVL_SHFTR_EN
@@ -610,32 +711,39 @@ Total: 56 √ó 48 = 2688 bytes block data + 8 bytes norm (4 √ó UQ8.8) = 2696 bytes
    mwr 0xF8000004 0x0000767B    # lock SLCR
    ```
 
-4. **PS=PL address mapping confirmed** ‚Äî Writes via ARM core at PS address X are visible to the HP FSM at the same numeric address X. Both PS and PL share the same DDR address space (no 0x00100000 offset). Verified by `test_addr_map2.tcl` with CPU_OP descriptor passthrough test.
+4. **PS=PL address mapping confirmed** ‚Ä?Writes via ARM core at PS address X are visible to the HP FSM at the same numeric address X. Both PS and PL share the same DDR address space (no 0x00100000 offset). Verified by `test_addr_map2.tcl` with CPU_OP descriptor passthrough test.
 
-5. **Q8 weight format: single group, per-group scales** ‚Äî The HP FSM loads ONE group's weights (4096 bytes = 64√ó64 INT8, row-group-major layout: `(r>>3)*512 + c*8 + (r&7)`) and reuses them across all column groups via multi-group iteration. Scales are loaded per-group from `weight_addr + 4096 + g*256`. Activation data is loaded per-group from `act_addr + g*128`. **(2026-08-12: was previously documented as "column-major"; the correct layout is row-group-major ‚Äî see Key Fix section above.)**
+5. **Q8 weight format: single group, per-group scales** ‚Ä?The HP FSM loads ONE group's weights (4096 bytes = 64√ó64 INT8, row-group-major layout: `(r>>3)*512 + c*8 + (r&7)`) and reuses them across all column groups via multi-group iteration. Scales are loaded per-group from `weight_addr + 4096 + g*256`. Activation data is loaded per-group from `act_addr + g*128`. **(2026-08-12: was previously documented as "column-major"; the correct layout is row-group-major ‚Ä?see Key Fix section above.)**
 
-6. **Q5_0 scale location** ‚Äî Row_inv UQ16.8 values follow the 4928 bytes of block data: 4 √ó uint16_t at `weight_addr + 4928`.
+6. **Q5_0 scale location** ‚Ä?Row_inv UQ16.8 values follow the 4928 bytes of block data: 4 √ó uint16_t at `weight_addr + 4928`.
 
-7. **CPU_OP descriptor** ‚Äî Tensor type 15: loads `act_total_bytes` from `act_addr` into act_buf, writes directly to `result_addr` (passthrough). Used for CPU-only ops between FPGA matmuls.
+7. **CPU_OP descriptor** ‚Ä?Tensor type 15: loads `act_total_bytes` from `act_addr` into act_buf, writes directly to `result_addr` (passthrough). Used for CPU-only ops between FPGA matmuls.
 
-8. **`-O1` required** ‚Äî `-O2` build has a BSS layout issue on LLVM 7.0.1. Use `-O1` for bare-metal compilation.
+8. **`-O1` required** ‚Ä?`-O2` build has a BSS layout issue on LLVM 7.0.1. Use `-O1` for bare-metal compilation.
 
-9. **Scratch buffer addresses** ‚Äî Must use addresses within the first ~500 MB of DDR. The range `0x1F000000-0x1F004000` (just below the last 1MB) is verified working. Higher addresses in the `0x17E00000` range may have DDR access issues.
+9. **Scratch buffer addresses** ‚Ä?Must use addresses within the first ~500 MB of DDR. The range `0x1F000000-0x1F004000` (just below the last 1MB) is verified working. Higher addresses in the `0x17E00000` range may have DDR access issues.
 
-10. **UART0 requires explicit init in bare-metal code** ‚Äî `ps7_init` (via XSDB `ps7_peripherals_init_data_3_0`) does program UART0 (0xE0000000, MIO 14/15) to 115200 8N1 with RX/TX enabled (CR=0x17), matching the reference MicroPhase project. But bare-metal `uart_init()` must repeat the same programming to be self-contained (works even if the app runs without ps7_init, e.g. from SD boot). See Key Decision #16 (2026-07-31) for the register bug that was fixed.
+10. **UART0 requires explicit init in bare-metal code** ‚Ä?`ps7_init` (via XSDB `ps7_peripherals_init_data_3_0`) does program UART0 (0xE0000000, MIO 14/15) to 115200 8N1 with RX/TX enabled (CR=0x17), matching the reference MicroPhase project. But bare-metal `uart_init()` must repeat the same programming to be self-contained (works even if the app runs without ps7_init, e.g. from SD boot). See Key Decision #16 (2026-07-31) for the register bug that was fixed.
 
 ### Test Results (HW, 2026-07-11)
 
-**Note (2026-08-12): All existing Q8 tests ‚Äî unit tests (`tb_cosim.v`, `tb_matmul_q8.v`), hardware tests (HP FSM comprehensive), and bare-metal tests ‚Äî used uniform weight/scale/act data. They could NOT detect the address advancement bug (all 512 compute iterations reading wmem[0]/smem[0]/act[0]) or the DDR weight layout mismatch (column-major vs row-group-major), because both bugs produce correct-looking results when all data values are identical. These bugs were fixed 2026-08-12 (see Key Fix section). Non-uniform HW verification pending bitstream rebuild.**
+**Note (2026-08-12): All existing Q8 tests ‚Ä?unit tests (`tb_cosim.v`, `tb_matmul_q8.v`), hardware tests (HP FSM comprehensive), and bare-metal tests ‚Ä?used uniform weight/scale/act data. They could NOT detect the address advancement bug (all 512 compute iterations reading wmem[0]/smem[0]/act[0]) or the DDR weight layout mismatch (column-major vs row-group-major), because both bugs produce correct-looking results when all data values are identical. These bugs were fixed 2026-08-12 (see Key Fix section). Non-uniform HW verification completed 2026-08-13 (Q5 golden, Q8 row/col patterns, 14-group row-pattern ‚Ä?see Key Fix 2026-08-13).**
 
 ```
-test_fpga_cores.elf:
-  5/5 PASS (2026-07-11)
-  - Q8 all-1s:    PASS  (weights=1, acts=1 ‚Üí 896 per row)
-  - Q8 all(-1)s:  PASS  (weights=-1, acts=1 ‚Üí -896 per row, signed path)
-  - Q5 val=1:     PASS  (d=1.0, q5=+1, acts=1 ‚Üí 229376 per row)
-  - Q5 val=0:     PASS  (d=1.0, q5=0, acts=1 ‚Üí 0 per row)
-  - Q5 val=-1:    PASS  (d=1.0, q5=-1, acts=1 ‚Üí -229376 per row)
+test_fpga_cores.elf: 13 tests (indices 1-13, current source)
+  - 1 Q8 all-1s:          PASS (2026-07-11, weights=1 acts=1 ‚Ü?896/row)
+  - 2 Q8 all(-1)s:        PASS (2026-07-11, signed path ‚Ü?-896/row)
+  - 3 Q8 distinct-sc:     PASS (2026-08-12, distinct block scales)
+  - 4 Q8 row-weights:     PASS (2026-08-13, row-pattern ‚Ü?64*(r+1), bit-exact after res_dout fix)
+  - 5 Q5 val=1:           PASS (2026-07-11, ‚Ü?229376/row)
+  - 6 Q5 val=0:           PASS (2026-07-11, ‚Ü?0/row)
+  - 7 Q5 val=-1:          PASS (2026-07-11, ‚Ü?-229376/row)
+  - 8 Q8 col-weights:     PASS (2026-08-13, col-pattern ‚Ü?2080/row)
+  - 9 Q5 golden distinct: PASS (2026-08-13, bit-exact vs golden_model)
+  - 10 14-group-col:      PASS (2026-08-13, row-pattern ‚Ü?896*(r+1); earlier col-pattern fail was a TEST bug ‚Ä?INT8 overflow)
+  - 11 14-group-scales:   added 2026-08-13 (expect 6720)
+  - 12 14-group-weights:  added 2026-08-13 (expect 5824)
+  - 13 14-group-acts:     added 2026-08-13 (expect 401856)
 ```
 
 **2026-07-11 Bug fix: Q5 expected value off by 256√ó in `test_fpga_cores.cpp`.**
@@ -663,7 +771,7 @@ Reduced from 4 to 2 Q5_0 cores due to 99.84% slice utilization causing timing gl
 
 ## Two-Track Plan
 
-### Track A: BRAM Conversion ‚úÖ COMPLETE (2026-07-05)
+### Track A: BRAM Conversion ‚ú?COMPLETE (2026-07-05)
 All LUTRAM arrays in Q8 core converted to BRAM banks. Results:
 
 | Memory | Before | After | BRAM18 Delta |
@@ -685,14 +793,14 @@ Savings: 3,512 LUTs (31%), 688 LUTRAM (92%), timing +0.314ns.
 | 32√ó col | 32 | 64 | ~14,000 | 135 |
 
 ### Roadmap
-1. ‚úÖ Q8 BRAM-acc baseline: all core unit tests PASS (Q8 6/6, Q4K 4/4, Q5_0 32/32, Q6_K 97/97, HP FSM 7/7)
-2. ‚úÖ Track A: smem‚ÜíBRAM, act_reg‚ÜíBRAM, wmem‚Üí8√óBRAM (6-stage pipeline proven)
-3. ‚úÖ Rebuild bitstream, verify all 9 HW tests ‚Äî ALL PASS
-4. ‚úÖ Measured: 3,512 LUTs saved (31%), 688 LUTRAM (92%), WNS 0.601ns
-5. ‚úÖ Q5_0 integration: 2√ó Q5_0 cores in hp_fsm_top, descriptor tensor_type=1 dispatch, block-streaming pipeline, HW test PASS (2026-07-05)
-6. ‚úÖ Q5_0 block-streaming redesign: 3.7√ó speedup (1904 vs 7170 cycles/tile, core-only), 1 DSP MAC/cycle, 9 HP FSM dispatch tests PASS, 2 √ó Q5_0 cores integrated into hp_fsm_top (2026-07-06)
-7. ‚úÖ Q5_0 clean-slate rewrite: per-block wide register interface, no hdr_packed LUTRAM, no byte-at-a-time header loading, act_r pipeline fix, row_scale‚Üírow_norm, hierarchical result read (2026-07-07)
-8. ‚ñ∂ Multi-core integration (Q4K/Q6_K/INT16) with shared BRAM weight loading
+1. ‚ú?Q8 BRAM-acc baseline: all core unit tests PASS (Q8 6/6, Q4K 4/4, Q5_0 32/32, Q6_K 97/97, HP FSM 7/7)
+2. ‚ú?Track A: smem‚ÜíBRAM, act_reg‚ÜíBRAM, wmem‚Ü?√óBRAM (6-stage pipeline proven)
+3. ‚ú?Rebuild bitstream, verify all 9 HW tests ‚Ä?ALL PASS
+4. ‚ú?Measured: 3,512 LUTs saved (31%), 688 LUTRAM (92%), WNS 0.601ns
+5. ‚ú?Q5_0 integration: 2√ó Q5_0 cores in hp_fsm_top, descriptor tensor_type=1 dispatch, block-streaming pipeline, HW test PASS (2026-07-05)
+6. ‚ú?Q5_0 block-streaming redesign: 3.7√ó speedup (1904 vs 7170 cycles/tile, core-only), 1 DSP MAC/cycle, 9 HP FSM dispatch tests PASS, 2 √ó Q5_0 cores integrated into hp_fsm_top (2026-07-06)
+7. ‚ú?Q5_0 clean-slate rewrite: per-block wide register interface, no hdr_packed LUTRAM, no byte-at-a-time header loading, act_r pipeline fix, row_scale‚Üírow_norm, hierarchical result read (2026-07-07)
+8. ‚ñ?Multi-core integration (Q4K/Q6_K/INT16) with shared BRAM weight loading
 
 ## Build & Run Commands
 
@@ -700,14 +808,14 @@ Savings: 3,512 LUTs (31%), 688 LUTRAM (92%), timing +0.314ns.
 # PATH setup
 $env:Path = "D:\Program Files\Git\bin;$env:Path"   # git
 
-# Verilog tests (iVerilog ‚Äî d:\iVerilog\bin)
+# Verilog tests (iVerilog ‚Ä?d:\iVerilog\bin)
 make -C verilog all                     # Q8 + Q4K + INT16 + Q5_0 + Q6_K + HP FSM
 
 # Vivado batch build (rebuild bitstream)
 #   C:\Xilinx\Vivado\2023.1\bin\vivado.bat  (NOT D:\Xilinx)
 #   Run from vivado_integration/:  Remove-Item -Recurse -Force proj_bd; vivado.bat -mode batch -source build_bd.tcl
 
-# FSBL build ‚Äî standard Vitis flow (two gating pitfalls below)
+# FSBL build ‚Ä?standard Vitis flow (two gating pitfalls below)
 #   Pitfall 1: DO NOT use `bsp setlib -name xilffs` on standalone_domain.
 #              It creates a BSP without the sdps driver -> `xsdps.h: No such file`.
 #   Correct:   `platform create -hw matmul_bd.xsa -proc ps7_cortexa9_0 -os standalone`
@@ -715,7 +823,7 @@ make -C verilog all                     # Q8 + Q4K + INT16 + Q5_0 + Q6_K + HP FS
 #              domain whose BSP picks up the sdps driver from SD-enabled hardware.
 #   Pitfall 2: DO NOT use `app config -name "zynq_fsbl" define-compiler-symbols
 #              FSBL_DEBUG_INFO`. `zynq_fsbl` is a platform boot component, not a
-#              workspace app ‚Äî XSCT fails with "project does not exist".
+#              workspace app ‚Ä?XSCT fails with "project does not exist".
 #   Correct:   Edit `fsbl_platform/zynq_fsbl/Makefile`: add `-DFSBL_DEBUG_INFO` to
 #              CFLAGS, then rebuild with `make_4.2.exe` (gnuwin `make.exe` crashes
 #              on `SHELL=command.com`). See linux/rebuild_fsbl_debug.tcl.
@@ -734,21 +842,21 @@ xsdb.bat vivado_integration\sw\run_hp_fsm_comprehensive.tcl
 # ps7_pll_init hangs if PLLs are already configured from a prior session.
 
 # Bare-metal tests on HW (bitstream -> ps7_init -> ELF at 0x00100000 -> DDR markers)
-xsdb.bat vivado_integration\sw\run_test_fpga_cores.tcl    # Q8/Q5_0 core tests (5/5 PASS)
+xsdb.bat vivado_integration\sw\run_test_fpga_cores.tcl    # Q8/Q5_0 core tests (13 tests)
 xsdb.bat vivado_integration\sw\run_tmac_baremetal.tcl    # full inference
 
-# Bare-metal Vitis GUI workspace (platform + serial app ‚Äî see vitis_bm/README.md)
+# Bare-metal Vitis GUI workspace (platform + serial app ‚Ä?see vitis_bm/README.md)
 xsct.bat vitis_bm\build.tcl                                # regenerate z7_bm + tmac_serial
 xsdb.bat vitis_bm\scripts\run_serial.tcl                   # headless serial test (UART0)
 
-# Vitis Linux platform + app (headless XSCT ‚Äî see linux/README.md "Vitis GUI")
+# Vitis Linux platform + app (headless XSCT ‚Ä?see linux/README.md "Vitis GUI")
 #   xsct.bat; then:
 #   platform create -name z7_linux -hw linux/boot/matmul_bd.xsa -proc ps7_cortexa9 -os linux -out workspace
 #   domain config -boot linux/boot; platform generate; app create ... -template "Linux Hello World"; app build
 # JTAG bring-up helpers (SD boot is the proven path; U-Boot-less hand boot unverified):
 source linux/scripts/boot_linux_jtag.tcl
 
-# Linux kernel + DTB + initramfs build (WSL Ubuntu 24.04 ‚Äî see linux/README.md)
+# Linux kernel + DTB + initramfs build (WSL Ubuntu 24.04 ‚Ä?see linux/README.md)
 wsl -d Ubuntu-24.04 -- bash /home/u/tmac-zynq-fpga/linux/build_wsl.sh
 #   Requires: arm-linux-gnueabihf-gcc, u-boot-tools, device-tree-compiler,
 #             busybox source (auto-downloaded), linux-xlnx clone.
@@ -783,64 +891,65 @@ python3 scripts/extract_tmac.py models/qwen2-0_5b-instruct-q4_k_m.gguf /tmp/mode
 ## File Inventory
 
 ### Verilog RTL
-- `verilog/matmul_top.v` ‚Äî Quad-core top: AXI4-Lite slave (inline, replaces orphan axilite_slave.v), 8192-byte weight_buf, loading FSM, mode mux (Q8/Q4K/Q6_K/INT16). Q5_0 removed (handled by hp_fsm_top.v exclusively).
-- `verilog/matmul_q8_core.v` ‚Äî Q8_0 compute core: 8√ó512√ó8 wmem (BRAM banks), dequant LUT, 6-stage pipeline
-- `verilog/matmul_q4k_core.v` ‚Äî Q4_K block decode: 8064-byte block buffer (`block_buf [0:8063]`), S24.8 fixed-point, 56√ó256 tile
-- `verilog/matmul_q5_0_core.v` ‚Äî Q5_0 block decode: 4√ó896 tile, 2√ó parallel cores, block-streaming pipeline (SETUP_D‚ÜíCOMPUTE√ó32‚ÜíDRAIN), 1 DSP MAC/cycle, per-block wide register interface (blk_d/qh/qs), no hdr_packed LUTRAM, hierarchical result read
-- `verilog/matmul_q6_k_core.v` ‚Äî Q6_K block decode: 32√ó256 tile, 32 blocks/tile, super_scale + per-sub-block scales
-- `verilog/matmul_int16_core.v` ‚Äî General INT16√óINT16 core: 512√ó128-bit wmem, 3-stage FSM
+- `verilog/matmul_top.v` ‚Ä?Quad-core top: AXI4-Lite slave (inline, replaces orphan axilite_slave.v), 8192-byte weight_buf, loading FSM, mode mux (Q8/Q4K/Q6_K/INT16). Q5_0 removed (handled by hp_fsm_top.v exclusively).
+- `verilog/matmul_q8_core.v` ‚Ä?Q8_0 compute core: 8√ó512√ó8 wmem (BRAM banks), dequant LUT, 6-stage pipeline
+- `verilog/matmul_q4k_core.v` ‚Ä?Q4_K block decode: 8064-byte block buffer (`block_buf [0:8063]`), S24.8 fixed-point, 56√ó256 tile
+- `verilog/matmul_q5_0_core.v` ‚Ä?Q5_0 block decode: 4√ó896 tile, 2√ó parallel cores, block-streaming pipeline (SETUP_D‚ÜíCOMPUTE√ó32‚ÜíDRAIN), 1 DSP MAC/cycle, per-block wide register interface (blk_d/qh/qs), no hdr_packed LUTRAM, hierarchical result read
+- `verilog/matmul_q6_k_core.v` ‚Ä?Q6_K block decode: 32√ó256 tile, 32 blocks/tile, super_scale + per-sub-block scales
+- `verilog/matmul_int16_core.v` ‚Ä?General INT16√óINT16 core: 512√ó128-bit wmem, 3-stage FSM
 
 ### Verilog Testbenches
-- `verilog/tb_matmul_q8.v` ‚Äî Q8 core tests (6/6)
-- `verilog/tb_matmul_q4k.v` ‚Äî Q4K core tests (4/4)
-- `verilog/tb_minimal_q4k.v` ‚Äî Q4K smoke test
-- `verilog/tb_int16_smoke.v` ‚Äî INT16 smoke test
-- `verilog/tb_cosim.v` ‚Äî Q8_0 co-simulation (bank-major weight writes directly to core: `wt_addr=bank*64+col`; validates core logic, NOT the FSM's sequential DDR word write path)
-- `verilog/tb_cosim_q4k.v` ‚Äî Q4_K co-simulation
-- `verilog/tb_matmul_q5_0.v` ‚Äî Q5_0 core tests (fabricated patterns)
-- `verilog/tb_matmul_q6_k.v` ‚Äî Q6_K core tests (fabricated patterns, 97/97)
-- `verilog/tb_cosim_q5_0.v` ‚Äî Q5_0 co-simulation (waits for tile dump)
-- `verilog/tb_cosim_q6_k.v` ‚Äî Q6_K co-simulation (waits for tile dump)
-- `verilog/tb_hw_fsm_comprehensive.v` ‚Äî HP FSM all 10 tests (HEAD-based wait_done)
-- `verilog/tb_hp_fsm_q5_0.v` ‚Äî HP FSM Q5_0 dispatch test (10 tests: all-1s, chains, mixed CPU_OP, edge cases)
-- `verilog/tb_phaseb.v` ‚Äî PhaseB matmul_top descriptor-chain test (requires C++ tile dump)
-- `verilog/tb_q5_off_by_one.v` ‚Äî Q5_0 off-by-one BRAM bug verification (non-uniform patterns)
-- `verilog/tb_read_master.v`, `verilog/tb_write_master.v` ‚Äî AXI HP master loopback testbenches
-- `verilog/tb_ddr_check.v`, `verilog/tb_debug.v` ‚Äî DDR model / debug helpers
-- `verilog/sim_ddr_axi_hp.v` ‚Äî AXI HP DDR model for simulation
+- `verilog/tb_matmul_q8.v` ‚Ä?Q8 core tests (6/6)
+- `verilog/tb_matmul_q4k.v` ‚Ä?Q4K core tests (4/4)
+- `verilog/tb_minimal_q4k.v` ‚Ä?Q4K smoke test
+- `verilog/tb_int16_smoke.v` ‚Ä?INT16 smoke test
+- `verilog/tb_cosim.v` ‚Ä?Q8_0 co-simulation (bank-major weight writes directly to core: `wt_addr=bank*64+col`; validates core logic, NOT the FSM's sequential DDR word write path)
+- `verilog/tb_cosim_q4k.v` ‚Ä?Q4_K co-simulation
+- `verilog/tb_matmul_q5_0.v` ‚Ä?Q5_0 core tests (fabricated patterns)
+- `verilog/tb_matmul_q6_k.v` ‚Ä?Q6_K core tests (fabricated patterns, 97/97)
+- `verilog/tb_cosim_q5_0.v` ‚Ä?Q5_0 co-simulation (waits for tile dump)
+- `verilog/tb_cosim_q6_k.v` ‚Ä?Q6_K co-simulation (waits for tile dump)
+- `verilog/tb_hw_fsm_comprehensive.v` ‚Ä?HP FSM all 10 tests (HEAD-based wait_done)
+- `verilog/tb_hp_fsm_q5_0.v` ‚Ä?HP FSM Q5_0 dispatch test (10 tests: all-1s, chains, mixed CPU_OP, edge cases)
+- `verilog/tb_phaseb.v` ‚Ä?PhaseB matmul_top descriptor-chain test (requires C++ tile dump)
+- `verilog/tb_q5_off_by_one.v` ‚Ä?Q5_0 off-by-one BRAM bug verification (non-uniform patterns)
+- `verilog/tb_read_master.v`, `verilog/tb_write_master.v` ‚Ä?AXI HP master loopback testbenches
+- `verilog/tb_ddr_check.v`, `verilog/tb_debug.v` ‚Ä?DDR model / debug helpers
+- `verilog/sim_ddr_axi_hp.v` ‚Ä?AXI HP DDR model for simulation
 
 ### C++ Simulation
-- `sim/tmac_gguf.cpp` ‚Äî Full inference pipeline, dispatch by tensor type
-- `sim/fpga_sim.hpp` ‚Äî `MatmulAccel`, `axi_vecmul_tile_*` functions, decode logic
-- `sim/matmul_q8.cpp` ‚Äî Q8_0 logits path wrapper
-- `sim/test_integration.cpp` ‚Äî Integration tests
-- `sim/chat.py` ‚Äî Chat interface
+- `sim/tmac_gguf.cpp` ‚Ä?Full inference pipeline, dispatch by tensor type
+- `sim/fpga_sim.hpp` ‚Ä?`MatmulAccel`, `axi_vecmul_tile_*` functions, decode logic
+- `sim/matmul_q8.cpp` ‚Ä?Q8_0 logits path wrapper
+- `sim/test_integration.cpp` ‚Ä?Integration tests
+- `sim/chat.py` ‚Ä?Chat interface
 
 ### Scripts
-- `scripts/extract_tmac.py` ‚Äî GGUF‚ÜíTMAC converter
-- `scripts/ground_truth_v2.py` ‚Äî Ground truth generation
-- `scripts/verify_layers_fast.py` ‚Äî Layer verification
-- `scripts/design_iteration.sh` ‚Äî Vivado iteration loop
-- `scripts/feedback_parser.py` ‚Äî Report parser
-- `scripts/test_integration.sh` ‚Äî Test suite
+- `scripts/extract_tmac.py` ‚Ä?GGUF‚ÜíTMAC converter
+- `scripts/gguf_tok.py` ‚Ä?pure-Python Qwen2 tokenizer (encode/decode/chat/run; no deps)
+- `scripts/ground_truth_v2.py` ‚Ä?Ground truth generation
+- `scripts/verify_layers_fast.py` ‚Ä?Layer verification
+- `scripts/design_iteration.sh` ‚Ä?Vivado iteration loop
+- `scripts/feedback_parser.py` ‚Ä?Report parser
+- `scripts/test_integration.sh` ‚Ä?Test suite
 
 ### Documentation
-- `AGENTS.md` ‚Äî Full architecture, register map, descriptor protocol, debug guide
-- `vivado_integration/API.md` ‚Äî Hardware API: registers, descriptor format, DDR layouts
-- `verilog/DESIGN.md` ‚Äî Architecture, timing
-- `docs/architecture.md` ‚Äî Model, quantization formats
-- `docs/Q4_K_IMPLEMENTATION_PLAN.md` ‚Äî Original plan (outdated, kept as archive)
-- `linux/README.md` ‚Äî Linux-on-SD boot guide (WSL-only build + verified boot flow)
-- `docs/z7lite-vs-zc702.md` ‚Äî Z7-Lite vs zc702 reference board hardware differences
-- `linux/scripts/` ‚Äî JTAG bring-up helpers (boot/debug/verify U-Boot + kernel)
-- `vitis_bm/README.md` ‚Äî Vitis 2023.1 bare-metal workspace (UART serial console app)
+- `AGENTS.md` ‚Ä?Full architecture, register map, descriptor protocol, debug guide
+- `vivado_integration/API.md` ‚Ä?Hardware API: registers, descriptor format, DDR layouts
+- `verilog/DESIGN.md` ‚Ä?Architecture, timing
+- `docs/architecture.md` ‚Ä?Model, quantization formats
+- `docs/Q4_K_IMPLEMENTATION_PLAN.md` ‚Ä?Original plan (outdated, kept as archive)
+- `linux/README.md` ‚Ä?Linux-on-SD boot guide (WSL-only build + verified boot flow)
+- `docs/z7lite-vs-zc702.md` ‚Ä?Z7-Lite vs zc702 reference board hardware differences
+- `linux/scripts/` ‚Ä?JTAG bring-up helpers (boot/debug/verify U-Boot + kernel)
+- `vitis_bm/README.md` ‚Ä?Vitis 2023.1 bare-metal workspace (UART serial console app)
 
 ## Target Board: MicroPhase Z7-Lite
 
 - **Part**: `xc7z010clg400-1` (Zynq-7010, 28nm, 432 CLBs, 240 DSP48E1, 4.9 Mb BRAM)
 - **DDR3**: 512 MB, Micron **MT41J256M16 RE-125** (4 Gbit, 16-bit bus, 15 row √ó 10 col √ó 3 bank)
 - **DDR speed**: DDR3-1066F (533 MHz core, CL=7, CWL=6, tRCD=7, tRP=7, tRAS=35ns, tRC=48.91ns, tFAW=40ns)
-- **PS7 clock config**: 33.333 MHz crystal ‚Üí ARM=666.667 MHz, DDR=533.333 MHz, PL=100 MHz
+- **PS7 clock config**: 33.333 MHz crystal ‚Ü?ARM=666.667 MHz, DDR=533.333 MHz, PL=100 MHz
 - **UART console**: UART0 (MIO 14/15) at 115200 baud
 - **Debug**: JTAG via Digilent HS-2 on the onboard FTDI/JTAG bridge
 - **Peripherals**: No Ethernet, no SD card (bare-metal only)
@@ -850,16 +959,16 @@ python3 scripts/extract_tmac.py models/qwen2-0_5b-instruct-q4_k_m.gguf /tmp/mode
 ## Phase 1: AXI4-Lite + HP (High Performance Port)
 
 ### Status
-- **AXI4-Lite (GP0) control path** ‚úÖ Verified on hardware ‚Äî all register R/W correct
-- **HP0 write path** ‚úÖ Verified on hardware ‚Äî STATUS=0x1E, DEBUG=0x0F, correct data at DDR target
-- **HP0 read path** ‚úÖ Verified on hardware ‚Äî 16-beat burst (ARSIZE=2) returns correct data
-- **HP FSM descriptor-chain** ‚úÖ **PASSED (2026-06-25)** ‚Äî single descriptor: descriptor fetch ‚Üí act load ‚Üí result writeback, 8 words match, 19ms, ARSIZE=2/AWSIZE=2
-- **HP FSM comprehensive (7 tests)** ‚úÖ **ALL PASSED ON HARDWARE (2026-06-27)** ‚Äî basic 64B, min 8B, 128B 2-burst, 256B 4-burst, chain of 2 desc, chain of 3 desc, re-start from DONE. All STATUS=0x300, all patterns verified.
-- **Testbench fix: wait_done polls HEAD instead of STATUS bits** ‚Äî cumulative STATUS bits (rd_done/wr_done) stay set across descriptors, causing premature exit in chain tests. Fixed by polling HEAD register.
-- **ACP** üîÑ Not needed ‚Äî HP works reliably when PS7 is freshly initialized
-- **Phase 1 complete ‚Äî HP descriptor-chain DMA proven on hardware** across all edge cases (min/max sizes, chains, restart). Ready for Phase 2: Q8 compute integration.
-- **Phase 2 (Q8 compute)** ‚úÖ **ALL 9 TESTS PASS ON HARDWARE (uniform data)** ‚Äî Q8 pipeline timing fix (WNS +0.550), sc_byte_idx reset bug fixed, all-1s pattern. Three bugs fixed (q8_wt_din reg, col_group init, act_remaining). Test 9a multi-group 2-group 64√ó128 tile PASS (all 64 rows = 128) on 2026-07-02. **rd_ready handshake fix (2026-07-04):** Changed LOAD_WEIGHT_W from `rd_ready <= 1` to `rd_ready <= rd_valid`. All 9 HW tests pass after 64-bit word write change. Phase 2 complete. **2026-08-12: subsequent analysis found two latent bugs (address advancement + DDR weight layout) masked by uniform data ‚Äî see Key Fix section.**
-- **Q8 multi-group/multi-tile regression (2026-07-12):** Q5_0 clean-slate rewrite (2026-07-07) broke Q8 multi-group (Test 9a) and multi-tile (Test 10). Both FAIL on current bitstream. **Fixed (2026-07-12):** Test 9a ‚Äî weight buffer size changed from 4096 to `num_groups √ó 4096` (was leaving group 1 weight as scale data). Test 10 ‚Äî `Q10_ACT_ADDR=0x00109000` collided with tile 0 scales at `weight_addr+4096`, moved to `0x0010C000`; `Q10_RES_ADDR=0x0010A000` collided with tile 1 scales at `weight_addr+tile_stride+4096`, moved to `0x0010B000`. Both are test-data layout bugs, no RTL changes needed.
+- **AXI4-Lite (GP0) control path** ‚ú?Verified on hardware ‚Ä?all register R/W correct
+- **HP0 write path** ‚ú?Verified on hardware ‚Ä?STATUS=0x1E, DEBUG=0x0F, correct data at DDR target
+- **HP0 read path** ‚ú?Verified on hardware ‚Ä?16-beat burst (ARSIZE=2) returns correct data
+- **HP FSM descriptor-chain** ‚ú?**PASSED (2026-06-25)** ‚Ä?single descriptor: descriptor fetch ‚Ü?act load ‚Ü?result writeback, 8 words match, 19ms, ARSIZE=2/AWSIZE=2
+- **HP FSM comprehensive (7 tests)** ‚ú?**ALL PASSED ON HARDWARE (2026-06-27)** ‚Ä?basic 64B, min 8B, 128B 2-burst, 256B 4-burst, chain of 2 desc, chain of 3 desc, re-start from DONE. All STATUS=0x300, all patterns verified.
+- **Testbench fix: wait_done polls HEAD instead of STATUS bits** ‚Ä?cumulative STATUS bits (rd_done/wr_done) stay set across descriptors, causing premature exit in chain tests. Fixed by polling HEAD register.
+- **ACP** üîÑ Not needed ‚Ä?HP works reliably when PS7 is freshly initialized
+- **Phase 1 complete ‚Ä?HP descriptor-chain DMA proven on hardware** across all edge cases (min/max sizes, chains, restart). Ready for Phase 2: Q8 compute integration.
+- **Phase 2 (Q8 compute)** ‚ú?**ALL 9 TESTS PASS ON HARDWARE (uniform data)** ‚Ä?Q8 pipeline timing fix (WNS +0.550), sc_byte_idx reset bug fixed, all-1s pattern. Three bugs fixed (q8_wt_din reg, col_group init, act_remaining). Test 9a multi-group 2-group 64√ó128 tile PASS (all 64 rows = 128) on 2026-07-02. **rd_ready handshake fix (2026-07-04):** Changed LOAD_WEIGHT_W from `rd_ready <= 1` to `rd_ready <= rd_valid`. All 9 HW tests pass after 64-bit word write change. Phase 2 complete. **2026-08-12: subsequent analysis found two latent bugs (address advancement + DDR weight layout) masked by uniform data ‚Ä?see Key Fix section.**
+- **Q8 multi-group/multi-tile regression (2026-07-12):** Q5_0 clean-slate rewrite (2026-07-07) broke Q8 multi-group (Test 9a) and multi-tile (Test 10). Both FAIL on current bitstream. **Fixed (2026-07-12):** Test 9a ‚Ä?weight buffer size changed from 4096 to `num_groups √ó 4096` (was leaving group 1 weight as scale data). Test 10 ‚Ä?`Q10_ACT_ADDR=0x00109000` collided with tile 0 scales at `weight_addr+4096`, moved to `0x0010C000`; `Q10_RES_ADDR=0x0010A000` collided with tile 1 scales at `weight_addr+tile_stride+4096`, moved to `0x0010B000`. Both are test-data layout bugs, no RTL changes needed.
 
 ## Hardware Gotchas
 
@@ -872,18 +981,18 @@ python3 scripts/extract_tmac.py models/qwen2-0_5b-instruct-q4_k_m.gguf /tmp/mode
 ### Critical: ps7_init re-execution hang
 `ps7_pll_init_data_3_0` **hangs if PLLs are already configured** from a prior session. The PLL reset sequence (bypass‚Üípower-down‚Üíreset‚Üíwait-for-lock) can't re-lock when the PLLs are already locked from a previous session. This leaves the PS7 in a partially-configured state and all subsequent ps7_init attempts also hang (DDR init's `mask_poll 0xF8000B74 0x00002000` waits for calibration that depends on PLL clock).
 
-**Workaround:** Always power-cycle the board before running ps7_init via XSDB. A processor-only reset (`rst -processor`) is insufficient ‚Äî the PLLs must be in reset-init state for ps7_pll_init to succeed.
+**Workaround:** Always power-cycle the board before running ps7_init via XSDB. A processor-only reset (`rst -processor`) is insufficient ‚Ä?the PLLs must be in reset-init state for ps7_pll_init to succeed.
 
 **Key observation:** HP0 register reads return 0x00000000 after a failed ps7_init attempt, even though the OCM code wrote valid non-zero values. This is because the PS7 AHB interconnect enters an inconsistent state when PLLs are partially configured, and DAP read transactions return 0.
 
 ### PS7 HP0 is AXI3 (max 16 beats per burst)
-`ARLEN > 15` causes silent AR rejection ‚Äî the read master never receives RLAST. All HP FSM bursts are hard-limited to 16 beats (`rd_len/wr_len ‚â§ 15`).
+`ARLEN > 15` causes silent AR rejection ‚Ä?the read master never receives RLAST. All HP FSM bursts are hard-limited to 16 beats (`rd_len/wr_len ‚â?15`).
 
 ### `rst -processor` corrupts DAP irreversibly
 The JTAG DAP controller enters an unrecoverable state after `rst -processor`. Use `stop` instead to halt the CPU without resetting the debug infrastructure.
 
 ### FCLK_CLK0 enable requires ARM boot code
-DAP writes to `FPGA_CLK_CTRL[7]` (FCLK_CLK0 enable at `0xF8000170`) are ignored ‚Äî the register is locked to secure mode. The CPU must enable FCLK_CLK0 in its boot code before the PL clock can be used.
+DAP writes to `FPGA_CLK_CTRL[7]` (FCLK_CLK0 enable at `0xF8000170`) are ignored ‚Ä?the register is locked to secure mode. The CPU must enable FCLK_CLK0 in its boot code before the PL clock can be used.
 
 ### Batch Build Framework
 
@@ -910,54 +1019,54 @@ mwr -force 0xF8009008 0x00000001  ;# write channel enable
 mwr -force 0xF800900C 0x00000001  ;# read channel enable
 ```
 
-### HP Loopback Test ‚Äî ARSIZE=3 Rejected, ARSIZE=2 Proven (2026-06-20)
+### HP Loopback Test ‚Ä?ARSIZE=3 Rejected, ARSIZE=2 Proven (2026-06-20)
 
 **Initial hypothesis (WRONG):** ARSIZE=2/AWSIZE=2 (4-byte narrow transfers) on Zynq 64-bit HP interconnect was thought to cause byte lane remapping issues. Tried ARSIZE=3/AWSIZE=3.
 
-**Board test with ARSIZE=3: RDATA[63:32]=0** ‚Äî Zynq-7010 with x16 DDR3 caps HP0 at 32-bit. Upper 32 bits of each 8-byte beat are always 0, losing every other 32-bit word. ARSIZE=3 REJECTED for read master (upper 32 bits are garbage); write master later reverted to AWSIZE=3 because the Zynq HP port correctly handles 8-byte beats by performing two 32-bit DDR accesses internally (see current `axihp_write_master.v`).
+**Board test with ARSIZE=3: RDATA[63:32]=0** ‚Ä?Zynq-7010 with x16 DDR3 caps HP0 at 32-bit. Upper 32 bits of each 8-byte beat are always 0, losing every other 32-bit word. ARSIZE=3 REJECTED for read master (upper 32 bits are garbage); write master later reverted to AWSIZE=3 because the Zynq HP port correctly handles 8-byte beats by performing two 32-bit DDR accesses internally (see current `axihp_write_master.v`).
 
 | Fix Attempt | Result | Detail |
 |-----|--------|--------|
-| done bits sticky | ‚úÖ | `reg_status[15:8]` no longer cleared in DONE state |
-| ARSIZE=3 (read master) | ‚ùå REJECTED | RDATA[63:32]=0 on hardware, data corruption |
-| AWSIZE=3 (write master, later adopted) | ‚è≥ see below | Current write master uses AWSIZE=3 with 4-state FSM |
-| Bitstream rebuilt | ‚úÖ | 0 errors, synth 50s + impl 2:31 |
+| done bits sticky | ‚ú?| `reg_status[15:8]` no longer cleared in DONE state |
+| ARSIZE=3 (read master) | ‚ù?REJECTED | RDATA[63:32]=0 on hardware, data corruption |
+| AWSIZE=3 (write master, later adopted) | ‚è?see below | Current write master uses AWSIZE=3 with 4-state FSM |
+| Bitstream rebuilt | ‚ú?| 0 errors, synth 50s + impl 2:31 |
 
 **Actual fix (read master):** Reverted to ARSIZE=2, accepting the 32-bit nature of HP0 read on this board. Write master was later rewritten to use AWSIZE=3 with a simpler 4-state FSM (see current `axihp_write_master.v`).
 
-### 32-bit HP mode (2026-06-20) ‚Äî SUPERSEDED (see current write master below)
+### 32-bit HP mode (2026-06-20) ‚Ä?SUPERSEDED (see current write master below)
 
-**Finding: Zynq-7010 HP0 is 32-bit only with x16 DDR3.** Despite `PCW_S_AXI_HP0_DATA_WIDTH=64` set before `apply_bd_automation`, RDATA[63:32] is always 0 on hardware. The PS7 silicon ignores the 64-bit width parameter when the DDR bus is x16-wide. `AFI0_CTRL[7:6]` (64-bit enable) is also read-only ‚Äî confirmed by write-verify loop.
+**Finding: Zynq-7010 HP0 is 32-bit only with x16 DDR3.** Despite `PCW_S_AXI_HP0_DATA_WIDTH=64` set before `apply_bd_automation`, RDATA[63:32] is always 0 on hardware. The PS7 silicon ignores the 64-bit width parameter when the DDR bus is x16-wide. `AFI0_CTRL[7:6]` (64-bit enable) is also read-only ‚Ä?confirmed by write-verify loop.
 
 **Design change (later superseded by AWSIZE=3):** Switched to full 32-bit AXI mode:
 
 | Component | Change |
 |-----------|--------|
-| `axihp_read_master.v` | ARSIZE=2 (4 bytes/beat), always captures `m_axi_rdata[31:0]` (no beat[0] alternation since HP0 doesn't do narrow-transfer byte lane remapping ‚Äî RDATA[63:32] is always 0) |
-| `axihp_write_master.v` | AWSIZE=2 (5-state FSM, superseded by current AWSIZE=3, 4-state FSM ‚Äî see `axihp_write_master.v` for current design) |
+| `axihp_read_master.v` | ARSIZE=2 (4 bytes/beat), always captures `m_axi_rdata[31:0]` (no beat[0] alternation since HP0 doesn't do narrow-transfer byte lane remapping ‚Ä?RDATA[63:32] is always 0) |
+| `axihp_write_master.v` | AWSIZE=2 (5-state FSM, superseded by current AWSIZE=3, 4-state FSM ‚Ä?see `axihp_write_master.v` for current design) |
 | `hp_loopback_top.v` | Word_idx advances once per 64-bit word (single wready assertion). |
 | `run_hp_loopback.tcl` | REG_RD_LEN=15 (16 beats √ó 4 bytes = 64 bytes). AFI0_CTRL=0x01 (bits[7:6] omitted). |
 
-**Simulation:** 32-bit HP loopback **passes** in iVerilog ‚Äî reads 16 bytes (pattern 0x00..0x0F) into word_buf, writes 8 √ó 64-bit words to DDR offset 0x40, verifies W0_lo/W0_hi/W1_lo/W1_hi and DDR[8]/DDR[9] match expected values.
+**Simulation:** 32-bit HP loopback **passes** in iVerilog ‚Ä?reads 16 bytes (pattern 0x00..0x0F) into word_buf, writes 8 √ó 64-bit words to DDR offset 0x40, verifies W0_lo/W0_hi/W1_lo/W1_hi and DDR[8]/DDR[9] match expected values.
 
 | Section | Status |
 |---------|--------|
-| Read path (16 beats √ó 4 bytes) | ‚úÖ Verified ‚Äî byte stream correct, word assembly correct |
-| Write path (8 words, 16 √ó 32-bit AXI transactions) | ‚úÖ Verified ‚Äî lower/upper half split correct, DDR stored correctly |
-| Buffer dump registers | ‚úÖ Verified ‚Äî all 16 √ó 32-bit debug regs match expected |
-| DDR readback after write | ‚úÖ Verified ‚Äî all 8 words match source pattern |
+| Read path (16 beats √ó 4 bytes) | ‚ú?Verified ‚Ä?byte stream correct, word assembly correct |
+| Write path (8 words, 16 √ó 32-bit AXI transactions) | ‚ú?Verified ‚Ä?lower/upper half split correct, DDR stored correctly |
+| Buffer dump registers | ‚ú?Verified ‚Ä?all 16 √ó 32-bit debug regs match expected |
+| DDR readback after write | ‚ú?Verified ‚Ä?all 8 words match source pattern |
 
-**Bug fixed:** Write master previously asserted wready twice per word (in both W_L and W_U), causing `word_idx` to advance by 2 per word, skipping every other word. Fixed by removing wready assertion in AW_U/W_U ‚Äî W_U immediately sends `hold_wdata[63:32]` without handshake.
+**Bug fixed:** Write master previously asserted wready twice per word (in both W_L and W_U), causing `word_idx` to advance by 2 per word, skipping every other word. Fixed by removing wready assertion in AW_U/W_U ‚Ä?W_U immediately sends `hold_wdata[63:32]` without handshake.
 
 **Board test (2026-06-20):** HP loopback **PASSES** on hardware with Zynq-7010 x16 DDR3:
 | Test | Result |
 |------|--------|
-| Read path (16 beats √ó 4 bytes ARSIZE=2) | ‚úÖ All 16 debug registers match expected |
-| Write path (8 words, 16 √ó 32-bit AXI transactions) | ‚úÖ All 8 words at DDR destination match |
-| PATTERN_OFF 2-beat read | ‚úÖ DBG_LO=0xA5A5A5A5 DBG_HI=0x5A5A5A5A |
+| Read path (16 beats √ó 4 bytes ARSIZE=2) | ‚ú?All 16 debug registers match expected |
+| Write path (8 words, 16 √ó 32-bit AXI transactions) | ‚ú?All 8 words at DDR destination match |
+| PATTERN_OFF 2-beat read | ‚ú?DBG_LO=0xA5A5A5A5 DBG_HI=0x5A5A5A5A |
 | Timing | 9ms loopback (incl. read + write) |
 
-**Key insight for WSTRB:** On the 64-bit HP port with AWSIZE=2 (32-bit narrow writes), address bit A[2] selects byte lanes: A[2]=0 ‚Üí WDATA[31:0] with WSTRB[3:0], A[2]=1 ‚Üí WDATA[63:32] with WSTRB[7:4]. The original design sent both halves on WDATA[31:0] with WSTRB[3:0], corrupting the upper half write.
+**Key insight for WSTRB:** On the 64-bit HP port with AWSIZE=2 (32-bit narrow writes), address bit A[2] selects byte lanes: A[2]=0 ‚Ü?WDATA[31:0] with WSTRB[3:0], A[2]=1 ‚Ü?WDATA[63:32] with WSTRB[7:4]. The original design sent both halves on WDATA[31:0] with WSTRB[3:0], corrupting the upper half write.
 
 ### Latest Debug Session (2026-06-25)
 
@@ -965,28 +1074,28 @@ mwr -force 0xF800900C 0x00000001  ;# read channel enable
 
 | Test | Status | Detail |
 |------|--------|--------|
-| ps7_init (fresh power-cycle) | ‚úÖ | PLL_STATUS=0x3F (all locked), DDR calibration OK |
-| PL clock verified | ‚úÖ | Clock counter = 0x019D0C77 (~27M cycles) |
-| AFI config (DAP writes) | ‚úÖ | CTRL=0x05, STATUS=0x0F00 |
-| GP0 access | ‚úÖ | All register readbacks correct |
-| Descriptor fetch (HP read, 8 beats) | ‚úÖ | All 8 descriptor words parsed correctly |
-| Act load (HP read, 16 beats, 64 bytes) | ‚úÖ | Correct data from 0x00101000 |
-| Result writeback (HP write, 8 words) | ‚úÖ | All 8 result words match expected patterns |
-| Chain completion | ‚úÖ | STATUS=0x300 (rd_done=1, wr_done=1), DEBUG=0x70000F40 (state=7/DONE) |
+| ps7_init (fresh power-cycle) | ‚ú?| PLL_STATUS=0x3F (all locked), DDR calibration OK |
+| PL clock verified | ‚ú?| Clock counter = 0x019D0C77 (~27M cycles) |
+| AFI config (DAP writes) | ‚ú?| CTRL=0x05, STATUS=0x0F00 |
+| GP0 access | ‚ú?| All register readbacks correct |
+| Descriptor fetch (HP read, 8 beats) | ‚ú?| All 8 descriptor words parsed correctly |
+| Act load (HP read, 16 beats, 64 bytes) | ‚ú?| Correct data from 0x00101000 |
+| Result writeback (HP write, 8 words) | ‚ú?| All 8 result words match expected patterns |
+| Chain completion | ‚ú?| STATUS=0x300 (rd_done=1, wr_done=1), DEBUG=0x70000F40 (state=7/DONE) |
 | Timing | 19ms | Config overhead, negligible for production |
 
 **Key findings:**
-- ARSIZE=2/AWSIZE=2 proven end-to-end: descriptor fetch ‚Üí act load ‚Üí result writeback
+- ARSIZE=2/AWSIZE=2 proven end-to-end: descriptor fetch ‚Ü?act load ‚Ü?result writeback
 - HP FSM correctly sequences IDLE‚ÜíFETCH_DESC‚ÜíLOAD_ACT‚ÜíWRITE_RES‚ÜíDONE
-- GP0 write to REG_START auto-cleared by FSM (expected ‚Äî FSM leaves IDLE and clears start bit)
-- Previous "REG_ACT_INFO=0" failure was caused by ARSIZE=3 read master misaligning descriptor data ‚Äî 8-byte beat consumption with only 4 valid bytes/beat caused act_addr parsed from wrong position
+- GP0 write to REG_START auto-cleared by FSM (expected ‚Ä?FSM leaves IDLE and clears start bit)
+- Previous "REG_ACT_INFO=0" failure was caused by ARSIZE=3 read master misaligning descriptor data ‚Ä?8-byte beat consumption with only 4 valid bytes/beat caused act_addr parsed from wrong position
 
 **Implications:**
 - Phase 1 (AXI4-Lite + HP port) fully verified on hardware
 - HP FSM is ready as building block for weight loading in compute pipeline
 - Next: integrate HP read master with matmul_top's weight_buf loading, or proceed to single-layer compute
 
-## Lessons Learned ‚Äî Gating Pitfalls (cross-reference to Key Decisions)
+## Lessons Learned ‚Ä?Gating Pitfalls (cross-reference to Key Decisions)
 
 ### PS7 / Boot / Clock Config
 
@@ -994,7 +1103,7 @@ mwr -force 0xF800900C 0x00000001  ;# read channel enable
 |---|---------|----------------|---------|
 | 1 | `ps7_pll_init` re-lock hang | PLLs already locked by BootROM (SD mode, MIO[6]=0). Running ps7_init warm causes PLL reset to hang waiting for lock. | **Always power-cycle the board** before `ps7_init`. `rst -processor` is insufficient. MIO6 validated against UG585 "PS PLL Initialization". |
 | 2 | `rst -processor` corrupts DAP | JTAG DAP enters unrecoverable state after processor reset. All register reads return 0. | Use `stop` to halt the CPU. Fix requires board power-cycle. |
-| 3 | FCLK_CLK0 enable ignored via DAP | DAP writes to `FPGA_CLK_CTRL[7]` (0xF8000170) are dropped ‚Äî register locked to secure mode. | **ARM boot code must enable FCLK_CLK0**. In SD boot, U-Boot/Linux clock drivers handle it. |
+| 3 | FCLK_CLK0 enable ignored via DAP | DAP writes to `FPGA_CLK_CTRL[7]` (0xF8000170) are dropped ‚Ä?register locked to secure mode. | **ARM boot code must enable FCLK_CLK0**. In SD boot, U-Boot/Linux clock drivers handle it. |
 | 4 | AFI0 at 0xF800_8000, not 0xF800_9000 | Earlier AGENTS.md had the wrong address. | Correct AFI config: CTRL=0x05, PART=0x44, WRCHAN=0x01. See `AGENTS.md` HW Gotchas for full sequence. |
 | 5 | MIO6 = BootROM PLL lock gate | MIO6 (BOOT_MODE[4]) = 0 enables PLLs; BootROM waits for lock before proceeding. SD boot (MIO[8:6]=110) has MIO[6]=0. | PLL re-lock hang (pitfall #1) is a direct consequence of this Silicon feature. Documented in UG585. |
 
@@ -1002,47 +1111,47 @@ mwr -force 0xF800900C 0x00000001  ;# read channel enable
 
 | # | Pitfall | What went wrong | The fix |
 |---|---------|----------------|---------|
-| 6 | **SDIO0 not enabled in XSA** | `PCW_EN_SDIO0=0` in block design ‚Üí FSBL SD branch compiled OUT ‚Üí `ILLEGAL_BOOT_MODE` ‚Üí FsblFallback. This was the root cause of SD boot failure (KD #23). | `PCW_EN_SDIO0=1`, `PCW_SD0_PERIPHERAL_ENABLE=1`, `PCW_SD0_SD0_IO="MIO 40 .. 45"`, CD/WP off. Match MicroPhase `03_dma` reference. |
-| 7 | ps7_init.tcl FCLK patch after XSA export | `build_bd.tcl` patches FCLK in the Vivado project copy but **after** `write_hw_platform` ‚Üí XSA has unpatched ps7_init. | Not a real issue for SD boot (U-Boot/Linux re-enable FCLK). For JTAG bare-metal, ARM startup code must enable FCLK. |
-| 8 | SD card pin config (CSDN blog) | Third-party builder hit the same issue: custom Vivado project ‚Üí SD pins wrong ‚Üí no SD boot. | Use the `03_dma` reference config: SDIO0 on MIO 40..45, function 3, pull-ups enabled (0x1680 per pin). |
+| 6 | **SDIO0 not enabled in XSA** | `PCW_EN_SDIO0=0` in block design ‚Ü?FSBL SD branch compiled OUT ‚Ü?`ILLEGAL_BOOT_MODE` ‚Ü?FsblFallback. This was the root cause of SD boot failure (KD #23). | `PCW_EN_SDIO0=1`, `PCW_SD0_PERIPHERAL_ENABLE=1`, `PCW_SD0_SD0_IO="MIO 40 .. 45"`, CD/WP off. Match MicroPhase `03_dma` reference. |
+| 7 | ps7_init.tcl FCLK patch after XSA export | `build_bd.tcl` patches FCLK in the Vivado project copy but **after** `write_hw_platform` ‚Ü?XSA has unpatched ps7_init. | Not a real issue for SD boot (U-Boot/Linux re-enable FCLK). For JTAG bare-metal, ARM startup code must enable FCLK. |
+| 8 | SD card pin config (CSDN blog) | Third-party builder hit the same issue: custom Vivado project ‚Ü?SD pins wrong ‚Ü?no SD boot. | Use the `03_dma` reference config: SDIO0 on MIO 40..45, function 3, pull-ups enabled (0x1680 per pin). |
 
 ### FSBL Build
 
 | # | Pitfall | What went wrong | The fix |
 |---|---------|----------------|---------|
-| 9 | **`bsp setlib xilffs` on standalone_domain** | Creates a BSP without `sdps` driver ‚Üí `xsdps.h: No such file`. xilffs needs sdps for disk I/O. | `platform create` + `platform generate` only. This auto-creates the `zynq_fsbl` boot domain whose BSP auto-selects sdps from SD-enabled hardware. |
-| 10 | **`app config -name "zynq_fsbl"` for debug** | `zynq_fsbl` is a platform boot component, not a workspace app ‚Üí "project does not exist". | Edit `zynq_fsbl/Makefile` `CFLAGS := -DFSBL_DEBUG_INFO`; rebuild with `make_4.2.exe` (gnuwin `make.exe` crashes on CMD `SHELL=command.com`). Reference `03_dma` FSBL has no debug ‚Äî optional. |
+| 9 | **`bsp setlib xilffs` on standalone_domain** | Creates a BSP without `sdps` driver ‚Ü?`xsdps.h: No such file`. xilffs needs sdps for disk I/O. | `platform create` + `platform generate` only. This auto-creates the `zynq_fsbl` boot domain whose BSP auto-selects sdps from SD-enabled hardware. |
+| 10 | **`app config -name "zynq_fsbl"` for debug** | `zynq_fsbl` is a platform boot component, not a workspace app ‚Ü?"project does not exist". | Edit `zynq_fsbl/Makefile` `CFLAGS := -DFSBL_DEBUG_INFO`; rebuild with `make_4.2.exe` (gnuwin `make.exe` crashes on CMD `SHELL=command.com`). Reference `03_dma` FSBL has no debug ‚Ä?optional. |
 
 ### U-Boot Build / Console
 
 | # | Pitfall | What went wrong | The fix |
 |---|---------|----------------|---------|
-| 11 | **zc706 DTB ‚Üí UART1 (dead)** | Default `xilinx_zynq_virt_defconfig` targets zc706 with UART1 (MIO 48/49). Z7-Lite CH340 is on UART0 (MIO 14/15). | Switch to `zynq-zc702` DTB. |
-| 12 | **CONFIG_OF_SEPARATE** ‚Üí no DTB in ELF | Without DTB, U-Boot driver model can't enumerate serial port ‚Üí no banner. | `CONFIG_OF_EMBED=y`. |
-| 13 | **DTS `serial0 = &uart1`** | zc702 DTB aliases serial0 to uart1 ‚Üí console routed to dead UART1 even after DTB switch. | Patch DTS: `serial0 = &uart0`, replace `&uart1` block with `&uart0 { u-boot,dm-pre-reloc; status="okay"; }`. No pinctrl needed (ps7_init sets MIO). **Regex MUST consume `};`** ‚Äî early fix produced `};;` (dtc syntax error). |
+| 11 | **zc706 DTB ‚Ü?UART1 (dead)** | Default `xilinx_zynq_virt_defconfig` targets zc706 with UART1 (MIO 48/49). Z7-Lite CH340 is on UART0 (MIO 14/15). | Switch to `zynq-zc702` DTB. |
+| 12 | **CONFIG_OF_SEPARATE** ‚Ü?no DTB in ELF | Without DTB, U-Boot driver model can't enumerate serial port ‚Ü?no banner. | `CONFIG_OF_EMBED=y`. |
+| 13 | **DTS `serial0 = &uart1`** | zc702 DTB aliases serial0 to uart1 ‚Ü?console routed to dead UART1 even after DTB switch. | Patch DTS: `serial0 = &uart0`, replace `&uart1` block with `&uart0 { u-boot,dm-pre-reloc; status="okay"; }`. No pinctrl needed (ps7_init sets MIO). **Regex MUST consume `};`** ‚Ä?early fix produced `};;` (dtc syntax error). |
 | 14 | `debug_uart_init` runs AFTER `initf_dm` | DM serial probe (clock/reset/pinctrl) hangs before debug_uart output reaches the UART. | Python patch inserts `debug_uart_init_wrap` (int-returning wrapper) before `initf_dm` in `board_f.c`. |
-| 15 | `debug_uart_init` returns `void` | `init_sequence_f` entries must have `int (*)(void)` signature ‚Äî `-Werror=incompatible-pointer-types`. | Wrap with `debug_uart_init_wrap` returning 0. |
+| 15 | `debug_uart_init` returns `void` | `init_sequence_f` entries must have `int (*)(void)` signature ‚Ä?`-Werror=incompatible-pointer-types`. | Wrap with `debug_uart_init_wrap` returning 0. |
 | 16 | **PL310 L2 cache disable crash** | U-Boot `CONFIG_SYS_L2CACHE_OFF=n` triggers PL310 access fault (presence bit). | `CONFIG_SYS_L2CACHE_OFF=y`. |
 
 ### AXI HP / DDR
 
 | # | Pitfall | What went wrong | The fix |
 |---|---------|----------------|---------|
-| 17 | **ARSIZE=3 on x16 DDR3** | Zynq-7010 + MT41J256M16 x16 DDR3 ‚Üí HP0 capped at 32-bit. RDATA[63:32]=0 for every read beat, losing every other word. | Read master: ARSIZE=2 (4 bytes/beat). |
-| 18 | **AWSIZE=2 WSTRB byte-lane** | On 64-bit HP with AWSIZE=2, A[2] selects WSTRB lane: A[2]=0‚ÜíWSTRB[3:0], A[2]=1‚ÜíWSTRB[7:4]. Original sent both halves on WDATA[31:0]/WSTRB[3:0] ‚Üí upper corrupt. | Write master: AWSIZE=3 (8 bytes/beat, PS serializes internally to two 32-bit DDR accesses). Simpler, proven. |
+| 17 | **ARSIZE=3 on x16 DDR3** | Zynq-7010 + MT41J256M16 x16 DDR3 ‚Ü?HP0 capped at 32-bit. RDATA[63:32]=0 for every read beat, losing every other word. | Read master: ARSIZE=2 (4 bytes/beat). |
+| 18 | **AWSIZE=2 WSTRB byte-lane** | On 64-bit HP with AWSIZE=2, A[2] selects WSTRB lane: A[2]=0‚ÜíWSTRB[3:0], A[2]=1‚ÜíWSTRB[7:4]. Original sent both halves on WDATA[31:0]/WSTRB[3:0] ‚Ü?upper corrupt. | Write master: AWSIZE=3 (8 bytes/beat, PS serializes internally to two 32-bit DDR accesses). Simpler, proven. |
 
 ### JTAG Debug
 
 | # | Pitfall | What went wrong | The fix |
 |---|---------|----------------|---------|
-| 19 | **FSBL breakpoints move across builds** | Different XSA ‚Üí different FSBL binary ‚Üí different InitSD/FsblFallback addresses. | Current frozen addresses (from lscript.ld): InitSD=0x3908, FsblFallback=0x16A4, FsblHookFallback=0x5AC. Stable for this build; re-verify with `arm-none-eabi-nm` if XSA changes. |
-| 20 | MMU teardown corrupt abort state | Warm re-run without power-cycle leaves MMU/DDR in inconsistent state ‚Üí DAP reads at 0x04000000 return "MMU section translation fault". | Fix is power-cycle, not MMU teardown stub. |
+| 19 | **FSBL breakpoints move across builds** | Different XSA ‚Ü?different FSBL binary ‚Ü?different InitSD/FsblFallback addresses. | Current frozen addresses (from lscript.ld): InitSD=0x3908, FsblFallback=0x16A4, FsblHookFallback=0x5AC. Stable for this build; re-verify with `arm-none-eabi-nm` if XSA changes. |
+| 20 | MMU teardown corrupt abort state | Warm re-run without power-cycle leaves MMU/DDR in inconsistent state ‚Ü?DAP reads at 0x04000000 return "MMU section translation fault". | Fix is power-cycle, not MMU teardown stub. |
 
 ### Bare-Metal ARM
 
 | # | Pitfall | What went wrong | The fix |
 |---|---------|----------------|---------|
-| 21 | **FPU not enabled** | Cortex-A9 VFP disabled at reset ‚Üí any float instruction causes undefined exception. | Enable CP10/CP11 in CPACR, set FPEXC.EN=1 in startup.s. |
+| 21 | **FPU not enabled** | Cortex-A9 VFP disabled at reset ‚Ü?any float instruction causes undefined exception. | Enable CP10/CP11 in CPACR, set FPEXC.EN=1 in startup.s. |
 | 22 | **48-bit result sign extension** | Q8/Q5 cores output S24.8 fixed-point (48-bit acc), zero-extended to 64-bit words in DDR. Negative results appear as positive. | Manually sign-extend from bit 47: `if (raw & (1ull << 47)) raw \|= 0xFFFF000000000000ULL;` |
 | 23 | **`-O2` BSS layout on LLVM 7.0.1** | `-O2` build has a BSS layout issue on this toolchain version. | Use `-O1` for bare-metal compilation. |
 | 24 | Scratch buffer DDR addresses | Addresses above ~500 MB in DDR may have access issues. | Use addresses in first ~500 MB of DDR (0x1F000000 range verified). |
@@ -1051,22 +1160,22 @@ mwr -force 0xF800900C 0x00000001  ;# read channel enable
 
 | # | Pitfall | What went wrong | The fix |
 |---|---------|----------------|---------|
-| 25 | **devicetree-jtag.dtb for hand boot** | U-Boot-less JTAG boot (boot_linux_jtag.tcl) needs initramfs location ‚Üí otherwise kernel panics with "no root". | Python FDT patcher bakes `/chosen/linux,initrd-start/end` into DTB copy. Raw gzipped cpio (strip mkimage header). |
-| 26 | Ethernet PHY errors on boot | Z7-Lite uses RTL8201F PHY, but zc702 DTB expects MARVELL PHY. Kernel prints "Failed to read eth PHY id". | Cosmetic only ‚Äî no functional impact. Can be silenced by switching to a custom DTB matching the board's PHY. |
-| 29 | **"Starting kernel..." hang, no output** | Kernel died before the console driver; silent on UART. Multiple false suspects (load address, ramdisk). | Rebuild with `CONFIG_DEBUG_LL=y` + `DEBUG_ZYNQ_UART0` + `EARLY_PRINTK` ‚Üí early serial reveals the true fault (it was the DTB, not the kernel). |
-| 30 | **SDHCI probe hang (`sdhci-pltfm`)** | zc702 `&sdhci0` pinctrl remuxed MIO 15 ‚Üí sdio0_wp + MIO 0 ‚Üí sdio0_cd. On Z7-Lite CD/WP are off and MIO 15 is UART0 RX. | Remove sdhci pinctrl; add `xlnx,has-cd/power/wp = <0>`. See `docs/z7lite-vs-zc702.md`. |
-| 31 | **Dead UART RX (prompt shows, no input)** | zc702 `gpio@e000a000` pinctrl remuxed MIO 14 (UART0 TX) ‚Üí gpio0; `gpio-keys` used GPIO 14. U-Boot RX worked, kernel RX dead. | Remove GPIO node pinctrl; delete gpio-keys/leds nodes referencing MIO 14. Verify `devmem 0xE000002C` bit1 clears while typing. |
+| 25 | **devicetree-jtag.dtb for hand boot** | U-Boot-less JTAG boot (boot_linux_jtag.tcl) needs initramfs location ‚Ü?otherwise kernel panics with "no root". | Python FDT patcher bakes `/chosen/linux,initrd-start/end` into DTB copy. Raw gzipped cpio (strip mkimage header). |
+| 26 | Ethernet PHY errors on boot | Z7-Lite uses RTL8201F PHY, but zc702 DTB expects MARVELL PHY. Kernel prints "Failed to read eth PHY id". | Cosmetic only ‚Ä?no functional impact. Can be silenced by switching to a custom DTB matching the board's PHY. |
+| 29 | **"Starting kernel..." hang, no output** | Kernel died before the console driver; silent on UART. Multiple false suspects (load address, ramdisk). | Rebuild with `CONFIG_DEBUG_LL=y` + `DEBUG_ZYNQ_UART0` + `EARLY_PRINTK` ‚Ü?early serial reveals the true fault (it was the DTB, not the kernel). |
+| 30 | **SDHCI probe hang (`sdhci-pltfm`)** | zc702 `&sdhci0` pinctrl remuxed MIO 15 ‚Ü?sdio0_wp + MIO 0 ‚Ü?sdio0_cd. On Z7-Lite CD/WP are off and MIO 15 is UART0 RX. | Remove sdhci pinctrl; add `xlnx,has-cd/power/wp = <0>`. See `docs/z7lite-vs-zc702.md`. |
+| 31 | **Dead UART RX (prompt shows, no input)** | zc702 `gpio@e000a000` pinctrl remuxed MIO 14 (UART0 TX) ‚Ü?gpio0; `gpio-keys` used GPIO 14. U-Boot RX worked, kernel RX dead. | Remove GPIO node pinctrl; delete gpio-keys/leds nodes referencing MIO 14. Verify `devmem 0xE000002C` bit1 clears while typing. |
 | 32 | **`Failed to execute /init (error -8)` = ENOEXEC** | initramfs busybox was AArch64 (64-bit); Zynq-7010 is ARMv7 32-bit. | Rebuild busybox from source with `arm-linux-gnueabihf-gcc`, `CONFIG_STATIC=y`, `CONFIG_TC=n` (new kernel headers dropped `TCA_CBQ_*`). |
-| 33 | **Shell prompt but no keyboard input (initramfs)** | `/dev` dir empty in cpio ‚Üí kernel can't open `/dev/console` for init ‚Üí stdin=/dev/null. | Add `dev/console` (5,1), `dev/null` (1,3), `dev/tty` (5,0) to cpio via `gen_init_cpio` (no root needed). |
-| 34 | **`setsid: not found` ‚Üí `Attempted to kill init!`** | busybox applets `setsid`/`cttyhack` had no `/bin` symlinks. | Add symlinks; run `setsid cttyhack sh` to give the shell its controlling tty (fixes "can't access tty; job control off"). |
+| 33 | **Shell prompt but no keyboard input (initramfs)** | `/dev` dir empty in cpio ‚Ü?kernel can't open `/dev/console` for init ‚Ü?stdin=/dev/null. | Add `dev/console` (5,1), `dev/null` (1,3), `dev/tty` (5,0) to cpio via `gen_init_cpio` (no root needed). |
+| 34 | **`setsid: not found` ‚Ü?`Attempted to kill init!`** | busybox applets `setsid`/`cttyhack` had no `/bin` symlinks. | Add symlinks; run `setsid cttyhack sh` to give the shell its controlling tty (fixes "can't access tty; job control off"). |
 | 35 | **`boot.scr` loaded stale/hanging kernel** | auto-boot script referenced the old uImage; load address (0x00200000) differed from the proven 0x03000000. | Regenerate boot.scr from boot.cmd with `fatload uImage 0x03000000`; keep `uEnv.txt` `boot_targets=mmc0`. |
 
 ### SD Card
 
 | # | Pitfall | What went wrong | The fix |
 |---|---------|----------------|---------|
-| 27 | **SD card format** | FSBL's `f_mount` requires FAT32 MBR partition. exFAT, GPT, or unformatted ‚Üí `FR_DISK_ERR` ‚Üí InitSD fails. | Single FAT32 MBR partition. `BOOT.BIN` in root directory. |
-| 28 | Two-partition SD plan ‚Üí one works | Original design had p1 (128MB boot) + p2 (data). Windows only mounts first FAT32 partition on removable drives. | Single FAT32 partition works for both boot assets and model/tmac. Simpler. |
+| 27 | **SD card format** | FSBL's `f_mount` requires FAT32 MBR partition. exFAT, GPT, or unformatted ‚Ü?`FR_DISK_ERR` ‚Ü?InitSD fails. | Single FAT32 MBR partition. `BOOT.BIN` in root directory. |
+| 28 | Two-partition SD plan ‚Ü?one works | Original design had p1 (128MB boot) + p2 (data). Windows only mounts first FAT32 partition on removable drives. | Single FAT32 partition works for both boot assets and model/tmac. Simpler. |
 
 ## Phase 2: Q8 Compute on Hardware
 
@@ -1076,7 +1185,7 @@ mwr -force 0xF800900C 0x00000001  ;# read channel enable
 
 **Fix:** Split into two pipeline stages by adding intermediate `dq_deq[0:7]`/`dq_act`/`dq_row_base`/`dq_valid` registers between the dequant multiply and the p2_partial multiply. Also added `DRAIN3` state for the extra pipeline depth.
 
-**Result:** WNS improved to +0.550 ns ‚Äî timing closure achieved with 0 errors.
+**Result:** WNS improved to +0.550 ns ‚Ä?timing closure achieved with 0 errors.
 
 ### sc_byte_idx Reset Bug (2026-06-28)
 
@@ -1084,14 +1193,14 @@ mwr -force 0xF800900C 0x00000001  ;# read channel enable
 
 **Fix:** Removed the `sc_byte_idx <= 0` assignment between bursts (only keep it between column groups in READ_RES_ACC). The counter now persists across all 4 bursts within a group, correctly writing all 128 smem entries.
 
-**Board result:** Tests 1-7 (baseline DMA) all PASS unchanged. Test 8 (Q8 all-1s) now produces **all 64 rows = 64** ‚Äî previously rows 0-15 gave 32 (wrong) and rows 16-63 gave 0.
+**Board result:** Tests 1-7 (baseline DMA) all PASS unchanged. Test 8 (Q8 all-1s) now produces **all 64 rows = 64** ‚Ä?previously rows 0-15 gave 32 (wrong) and rows 16-63 gave 0.
 
 ### Multi-group Bug Fixes (2026-07-01)
 
-Three bugs fixed ‚Äî see **Key Decision #5** above for details (q8_wt_din unregistered, col_group reset in COMPUTE_W, act_remaining hardcoded). All three were found during iVerilog simulation of the comprehensive test suite.
+Three bugs fixed ‚Ä?see **Key Decision #5** above for details (q8_wt_din unregistered, col_group reset in COMPUTE_W, act_remaining hardcoded). All three were found during iVerilog simulation of the comprehensive test suite.
 
 **Other fixes:**
-- `tb_hw_fsm_comprehensive.v`: descriptor `tensor_type` was 0 (default), causing all 7 tests to enter LOAD_WEIGHT path and read X from address 0 instead of CPU_OP ‚Üí LOAD_ACT. Fixed to `32'h0000000F` (tensor_type=15).
+- `tb_hw_fsm_comprehensive.v`: descriptor `tensor_type` was 0 (default), causing all 7 tests to enter LOAD_WEIGHT path and read X from address 0 instead of CPU_OP ‚Ü?LOAD_ACT. Fixed to `32'h0000000F` (tensor_type=15).
 - `tb_hw_fsm_comprehensive.v`: added `$dumpfile`/`$dumpvars` for VCD waveform generation.
 - `matmul_q8_core.v`: added `__ICARUS__` simulation-only `initial` block to clear `wmem[0:511]` and `acc[0:63]`, preventing X on `res_dout`.
 - `Makefile`: added `matmul_q8_core.v` to `HPFSM_SRC` (was missing since Q8 integration into `hp_fsm_top`).
@@ -1103,13 +1212,13 @@ Three bugs fixed ‚Äî see **Key Decision #5** above for details (q8_wt_din unregi
 **Problem:** The original Q8 compute path only handled a single column group (64 columns). The full tile requires 14 groups √ó 64 cols = 896 columns.
 
 **Implementation in `hp_fsm_top.v`:**
-- Added `reg_q8_num_groups[3:0]` (R/W at address 0x40) ‚Äî number of column groups
-- Added `acc_buf[0:63]` (64 √ó 48-bit signed) ‚Äî running accumulator across groups
-- Added `col_group[3:0]` counter ‚Äî tracks which group is being processed
-- Added `READ_RES_ACC(16)` state ‚Äî first group stores directly, subsequent groups add
-- Added `COPY_ACC_TO_BUF(17)` state ‚Äî copies acc_buf to act_buf for DDR writeback after final group
+- Added `reg_q8_num_groups[3:0]` (R/W at address 0x40) ‚Ä?number of column groups
+- Added `acc_buf[0:63]` (64 √ó 48-bit signed) ‚Ä?running accumulator across groups
+- Added `col_group[3:0]` counter ‚Ä?tracks which group is being processed
+- Added `READ_RES_ACC(16)` state ‚Ä?first group stores directly, subsequent groups add
+- Added `COPY_ACC_TO_BUF(17)` state ‚Ä?copies acc_buf to act_buf for DDR writeback after final group
 - Scale/activation address calculations now include `col_group √ó 128/256` offset
-- FSM loops: LOAD_SCALES ‚Üí LOAD_ACT ‚Üí COPY_ACT_TO_CORE ‚Üí COMPUTE ‚Üí READ_RES_ACC (per group), then COPY_ACC_TO_BUF ‚Üí WRITE_RES
+- FSM loops: LOAD_SCALES ‚Ü?LOAD_ACT ‚Ü?COPY_ACT_TO_CORE ‚Ü?COMPUTE ‚Ü?READ_RES_ACC (per group), then COPY_ACC_TO_BUF ‚Ü?WRITE_RES
 
 **Status:** RTL complete, syntax-verified with iVerilog (0 errors). **Three bugs fixed (2026-07-01):** q8_wt_din unregistered (NBA timing), col_group reset in COMPUTE_W, act_remaining hardcoded to 128. Pending: build bitstream and hardware test.
 
@@ -1119,35 +1228,35 @@ Three bugs fixed ‚Äî see **Key Decision #5** above for details (q8_wt_din unregi
 
 | Test | Status | Detail |
 |------|--------|--------|
-| Load bitstream | ‚úÖ | `fpga -file` completes |
-| Full ps7_init | ‚úÖ | All 6 functions, PLL lock ~ms |
-| OCM AFI config | ‚úÖ | Marker at 256ms, AFI0_CTRL=0x05, PART=0x44 |
-| HP write (16 beats) | ‚úÖ | STATUS=0x1E, DEBUG=0x0F, DDR[0]=0xA5A5A5A5 |
+| Load bitstream | ‚ú?| `fpga -file` completes |
+| Full ps7_init | ‚ú?| All 6 functions, PLL lock ~ms |
+| OCM AFI config | ‚ú?| Marker at 256ms, AFI0_CTRL=0x05, PART=0x44 |
+| HP write (16 beats) | ‚ú?| STATUS=0x1E, DEBUG=0x0F, DDR[0]=0xA5A5A5A5 |
 
 **Critical findings:**
-- `ps7_pll_init_data_3_0` **hangs when PLLs are already configured** ‚Äî the reset+re-lock sequence fails because PLLs are already locked, leaving the system in a partial state
+- `ps7_pll_init_data_3_0` **hangs when PLLs are already configured** ‚Ä?the reset+re-lock sequence fails because PLLs are already locked, leaving the system in a partial state
 - `ps7_ddr_init_data_3_0` then hangs at `mask_poll 0xF8000B74 0x00002000` (DDR calibration status) because DDR PLL clock is not recovered
-- After a hang, ALL subsequent ps7_init attempts also fail ‚Äî PS7 has no clean recovery path without power-cycle
+- After a hang, ALL subsequent ps7_init attempts also fail ‚Ä?PS7 has no clean recovery path without power-cycle
 - When DAP reads return 0x00000000 for all PS7 registers (including AFI), it signals the AHB interconnect is broken from a partial PLL init
-- `HP_CLK_CTRL` (0xF800016C)=0x00000000 yet HP write works ‚Äî HP is clocked from DDR clock domain, not a separate gate
+- `HP_CLK_CTRL` (0xF800016C)=0x00000000 yet HP write works ‚Ä?HP is clocked from DDR clock domain, not a separate gate
 
 **Verilog/design implications:**
-- AFI0_FIFO_PARTITION is freely writable via OCM code (0x44 = 4R+4W) ‚Äî NOT locked by boot ROM
+- AFI0_FIFO_PARTITION is freely writable via OCM code (0x44 = 4R+4W) ‚Ä?NOT locked by boot ROM
 - The earlier "HP dead" diagnosis was a false positive caused by reading registers after failed ps7_init
 - ACP switch is unnecessary; HP0 will be used for all PL‚ÜîDDR traffic
 
 ### Relevant Files
 
-- `vivado_integration/build_bd.tcl`: Vivado batch build ‚Äî HP0 config (`PCW_S_AXI_HP0_DATA_WIDTH=64`) set before `apply_bd_automation`. Sources `hp_fsm_top.v` + `axihp_read_master.v` + `axihp_write_master.v`.
-- `vivado_integration/rtl/hp_fsm_top.v`: HP descriptor-chain FSM ‚Äî AXI4-Lite slave, desc_buf (32B), act_buf (512B), Q8/Q5_0 compute dispatch, 64-bit HP read/write masters. 28-state FSM (IDLE 0 through CPU_OP_WAIT 27). Q8 path: IDLE‚ÜíFETCH_DESC‚ÜíFETCH_DESC_W‚ÜíLOAD_WEIGHT‚ÜíLOAD_WEIGHT_W‚ÜíLOAD_SCALES‚ÜíLOAD_SCALES_W‚ÜíLOAD_ACT‚ÜíLOAD_ACT_W‚ÜíCOPY_ACT_TO_CORE‚ÜíCOMPUTE‚ÜíCOMPUTE_W‚ÜíREAD_RES/READ_RES_ACC‚ÜíCOPY_ACC_TO_BUF‚ÜíWRITE_RES‚ÜíWRITE_RES_BURST‚ÜíWRITE_RES_W‚ÜíDONE (20 states). Q5_0 path adds Q5_LOAD_NORM, Q5_LOAD_NORM_W, Q5_COPY_ACT, Q5_COPY_ACT_W, Q5_BLOCK_COMPUTE, Q5_BLOCK_COMPUTE_W, Q5_READ_RES (7 states). CPU_OP interrupt path adds CPU_OP_WAIT (1 state).
-- `vivado_integration/sw/run_hp_fsm_comprehensive.tcl`: XSDB flow ‚Äî all 7 HP FSM tests (basic, min 8B, 128B 2-burst, 256B 4-burst, chain of 2, chain of 3, re-start). Polls HEAD register for completion.
-- `vivado_integration/sw/run_hp_fsm_q5_0.tcl`: XSDB flow ‚Äî Q5_0 all-1s test. Loads weight/scales/acts, sets tensor_type=1 descriptor, verifies 4 rows = 896.
+- `vivado_integration/build_bd.tcl`: Vivado batch build ‚Ä?HP0 config (`PCW_S_AXI_HP0_DATA_WIDTH=64`) set before `apply_bd_automation`. Sources `hp_fsm_top.v` + `axihp_read_master.v` + `axihp_write_master.v`.
+- `vivado_integration/rtl/hp_fsm_top.v`: HP descriptor-chain FSM ‚Ä?AXI4-Lite slave, desc_buf (32B), act_buf (512B), Q8/Q5_0 compute dispatch, 64-bit HP read/write masters. 28-state FSM (IDLE 0 through CPU_OP_WAIT 27). Q8 path: IDLE‚ÜíFETCH_DESC‚ÜíFETCH_DESC_W‚ÜíLOAD_WEIGHT‚ÜíLOAD_WEIGHT_W‚ÜíLOAD_SCALES‚ÜíLOAD_SCALES_W‚ÜíLOAD_ACT‚ÜíLOAD_ACT_W‚ÜíCOPY_ACT_TO_CORE‚ÜíCOMPUTE‚ÜíCOMPUTE_W‚ÜíREAD_RES/READ_RES_ACC‚ÜíCOPY_ACC_TO_BUF‚ÜíWRITE_RES‚ÜíWRITE_RES_BURST‚ÜíWRITE_RES_W‚ÜíDONE (20 states). Q5_0 path adds Q5_LOAD_NORM, Q5_LOAD_NORM_W, Q5_COPY_ACT, Q5_COPY_ACT_W, Q5_BLOCK_COMPUTE, Q5_BLOCK_COMPUTE_W, Q5_READ_RES (7 states). CPU_OP interrupt path adds CPU_OP_WAIT (1 state).
+- `vivado_integration/sw/run_hp_fsm_comprehensive.tcl`: XSDB flow ‚Ä?all 7 HP FSM tests (basic, min 8B, 128B 2-burst, 256B 4-burst, chain of 2, chain of 3, re-start). Polls HEAD register for completion.
+- `vivado_integration/sw/run_hp_fsm_q5_0.tcl`: XSDB flow ‚Ä?Q5_0 all-1s test. Loads weight/scales/acts, sets tensor_type=1 descriptor, verifies 4 rows = 896.
 - `vivado_integration/sw/regs.h`: Register map
-- `vivado_integration/ps7_init.tcl`: Modified ‚Äî AFI1 + LVL_SHFTR_EN config in ps7_post_config
-- `verilog/axihp_read_master.v`: HP read master ‚Äî ARSIZE=2 (4 bytes/beat), always captures RDATA[31:0], byte-stream output. DRAIN state per-beat. 32-bit mode.
-- `verilog/axihp_write_master.v`: HP write master ‚Äî AWSIZE=2, splits 64-bit word into two 32-bit single-beat AXI writes. wready once per word. 5-state FSM.
+- `vivado_integration/ps7_init.tcl`: Modified ‚Ä?AFI1 + LVL_SHFTR_EN config in ps7_post_config
+- `verilog/axihp_read_master.v`: HP read master ‚Ä?ARSIZE=2 (4 bytes/beat), always captures RDATA[31:0], byte-stream output. DRAIN state per-beat. 32-bit mode.
+- `verilog/axihp_write_master.v`: HP write master ‚Ä?AWSIZE=2, splits 64-bit word into two 32-bit single-beat AXI writes. wready once per word. 5-state FSM.
 - `verilog/matmul_int16_core.v`: INT16 compute core (verified standalone)
-- `verilog/test_hp_loopback.v`: 32-bit mode simulation testbench ‚Äî DDR model with 32-bit read/write granularity. Passes full loopback. (removed in 2026-07-31 cleanup; superseded by `tb_read_master.v`/`tb_write_master.v`)
+- `verilog/test_hp_loopback.v`: 32-bit mode simulation testbench ‚Ä?DDR model with 32-bit read/write granularity. Passes full loopback. (removed in 2026-07-31 cleanup; superseded by `tb_read_master.v`/`tb_write_master.v`)
 - `vivado_integration/proj_bd/matmul_bd.runs/impl_1/system_wrapper.bit`: Synthesized bitstream (reordered PS7 config)
 - `D:/Users/u/workspace/tmac/Debug/tmac.elf`: Vitis ELF loaded by XSDB
 - `docs/debug_log.md`: Full debug history
@@ -1158,12 +1267,12 @@ Three bugs fixed ‚Äî see **Key Decision #5** above for details (q8_wt_din unregi
 - `linux/build_wsl.sh`: WSL build of kernel + DTB + initramfs (reproduces the committed boot artifacts)
 - `linux/clone_repos.sh`: Clones u-boot-xlnx + linux-xlnx (WSL)
 
-## Linux-on-SD Card Boot ‚úÖ VERIFIED (2026-08-11)
+## Linux-on-SD Card Boot ‚ú?VERIFIED (2026-08-11)
 
 U-Boot + Linux kernel + BusyBox initramfs + FPGA test program, built **in
-Windows WSL (Ubuntu 24.04)** and booting **end-to-end on hardware**: BootROM ‚Üí
-FSBL InitSD ‚Üí PCAP bitstream ‚Üí U-Boot (UART0 console) ‚Üí distro boot ‚Üí boot.scr
-‚Üí bootm ‚Üí Linux 6.6.0 ‚Üí initramfs ‚Üí interactive `/bin/sh` shell.
+Windows WSL (Ubuntu 24.04)** and booting **end-to-end on hardware**: BootROM ‚Ü?
+FSBL InitSD ‚Ü?PCAP bitstream ‚Ü?U-Boot (UART0 console) ‚Ü?distro boot ‚Ü?boot.scr
+‚Ü?bootm ‚Ü?Linux 6.6.0 ‚Ü?initramfs ‚Ü?interactive `/bin/sh` shell.
 
 **The verified-working boot artifacts are COMMITTED** in `linux/boot/` (JTAG
 bring-up helpers live in `linux/scripts/`). Rebuild only when sources change.
@@ -1178,23 +1287,29 @@ bring-up helpers live in `linux/scripts/`). Rebuild only when sources change.
 | `initramfs.cpio.gz` | 1,327,818 B | raw gzipped cpio (JTAG hand-boot) |
 | `BOOT.BIN` | 3,168,704 B | FSBL + bitstream + U-Boot (fused by Vivado `bootgen.bat`) |
 | `fsbl.elf` | 437,552 B | SD-capable, `-DFSBL_DEBUG_INFO` |
-| `tmac` | 494,252 B | Static ARM32 (mmaps FPGA at 0x43C00000) |
+| `tmac` | 468,988 B | Static ARM32 (mmaps FPGA at 0x43C00000); md5 05CFA064ff2f3c690957ffdbf9b48d3d (rebuilt 2026-08-14 with Q5 sign fix, S48 int32-truncation fix, Q8 warm-up mitigation) |
+
+**`tmac` CLI flags** (`./tmac model.tmac [flags] [token ...]`): `--cpu` force pure-CPU matmul path (skips FPGA init, so it can run host-side too); `--compare` run both CPU+FPGA per matmul and print diff; `--trace` per-layer hidden-state comparison (FPGA vs CPU, separate KV caches); `--selftest` minimal CPU_OP DDR copy (isolates PL DDR path from compute). `--trace` is the on-board A/B diagnostic used to verify the Q6_K dequant fix (layer norms vs sim ground truth). Multiple prompt tokens can be passed (e.g. `./tmac model.tmac 9707 0 2585 525 498 3351 30`) ‚Ä?up to 256; default remains a bare prompt token (151646, a PAD token ‚Ä?see below).
+
+**Tokenizer tool (2026-08-14):** `scripts/gguf_tok.py` is a pure-Python (no `transformers`/`tiktoken`/`gguf` packages needed) Qwen2 tokenizer that reads the tokenizer metadata directly from the GGUF. Supports `--encode` (text‚Üíids), `--decode` (ids‚Üítext), `--chat` (Qwen2 chat-template prompt‚Üíids), and `--run` (run the host sim and print the generated words). **Critical: token 151646 is a PAD token (`[PAD151646]`), NOT BOS ‚Ä?the GGUF says `bos_token_id=151643` (`<|endoftext|>`) with `add_bos_token=False`.** The old default prompt of `151646` therefore prompted the model with a padding token, which is why output was meaningless (`ÁöÑÔºåÊàëÂ∞±ÊòØÊàë`). To get readable output, encode a real prompt with `--chat "..."` and pass the resulting ids to `tmac`/the sim.
+
+**Generation protocol fix (2026-08-14):** `run_inference` in `tmac_linux.c` now matches the sim's `generate()`: it samples the first token from the *last prompt hidden state* (embedding BOS twice, at pos 0 then pos 1, caused a doubled-BOS offset vs the sim), then embeds the sampled token and forwards. Verified on host (x86 `gcc` build of `tmac_linux.c`, `--cpu` mode) ‚Ä?output matches the sim's greedy single-BOS reference bit-for-bit (`9370 3837 35946 99486 35946 3837 35946 3837 35946 35946`). Board CPU `--cpu` output previously showed the doubled-BOS sequence (`9370 2073 854 33108 ...`), which matched the sim exactly when fed `[BOS, BOS]` as prompt ‚Ä?confirming the forward pass was already bit-consistent. The `854, 854, ...` repetition is expected greedy-decoder behavior for a 0.5B model from a bare BOS, not a bug. Sim gained a `--greedy` flag (top_k=1) as the verification harness.
 
 **Tools in initramfs:** sh, mount, ls, cat, devmem, setsid, cttyhack, + busybox
 core set. `setsid cttyhack sh` gives the shell its controlling terminal.
 
-**Kernel:** CONFIG_DEVMEM=y ‚Äî FPGA registers accessible via `/dev/mem`.
+**Kernel:** CONFIG_DEVMEM=y ‚Ä?FPGA registers accessible via `/dev/mem`.
 Bootargs `console=ttyPS0,115200 root=/dev/ram0 rw iomem=relaxed`.
 
 **To reproduce:** See `linux/README.md` + `linux/build_wsl.sh` (WSL-only).
 
-### Windows ‚Äî everything (Vivado + WSL); no Mac/Lima
+### Windows ‚Ä?everything (Vivado + WSL); no Mac/Lima
 
-- `linux/build_wsl.sh` ‚Äî kernel + DTB + initramfs build (WSL)
-- `linux/clone_repos.sh` ‚Äî clone linux-xlnx + u-boot-xlnx (WSL)
-- Vivado `bootgen.bat` ‚Äî fuses `BOOT.BIN` from committed `fsbl.elf` +
+- `linux/build_wsl.sh` ‚Ä?kernel + DTB + initramfs build (WSL)
+- `linux/clone_repos.sh` ‚Ä?clone linux-xlnx + u-boot-xlnx (WSL)
+- Vivado `bootgen.bat` ‚Ä?fuses `BOOT.BIN` from committed `fsbl.elf` +
   `system_wrapper.bit` + `u-boot.elf`
-- `linux/build_fsbl.tcl` ‚Äî regenerates `fsbl.elf` from `matmul_bd.xsa` (only if HW changes)
+- `linux/build_fsbl.tcl` ‚Ä?regenerates `fsbl.elf` from `matmul_bd.xsa` (only if HW changes)
 
 **SD card** (single FAT32 partition, label `SD_BOOT`):
 `BOOT.BIN`, `uImage`, `devicetree.dtb`, `uramdisk.image.gz`, `boot.scr`,
@@ -1207,19 +1322,19 @@ Bootargs `console=ttyPS0,115200 root=/dev/ram0 rw iomem=relaxed`.
 setenv bootargs "console=ttyPS0,115200 root=/dev/ram0 rw iomem=relaxed"
 ```
 
-## Vitis Linux Workspace (2026-07-31, regenerable ‚Äî not committed)
+## Vitis Linux Workspace (2026-07-31, regenerable ‚Ä?not committed)
 
 The Vitis 2023.1 Linux platform + app (`z7_linux` + `hello_linux`) was built
 GUI-style and used for cross-compiling a Linux userspace app against the
 aarch32 sysroot. Because the board has no Ethernet, the standard GUI **Run**
-flow (TCF agent over Ethernet + UART login) is impossible ‚Äî execution is
+flow (TCF agent over Ethernet + UART login) is impossible ‚Ä?execution is
 verified via SD boot + DDR markers instead. The USB-UART works (UART0, MIO
-14/15, 115200 8N1) ‚Äî see Key Decision #16 (2026-07-31).
+14/15, 115200 8N1) ‚Ä?see Key Decision #16 (2026-07-31).
 
-**2026-08-11: `vitis_linux/` was removed** (see KD #27/28). Its unique value ‚Äî
-the JTAG bring-up scripts ‚Äî moved to `linux/scripts/`; the boot artifacts it
+**2026-08-11: `vitis_linux/` was removed** (see KD #27/28). Its unique value ‚Ä?
+the JTAG bring-up scripts ‚Ä?moved to `linux/scripts/`; the boot artifacts it
 mirrored now live only in `linux/boot/`. The Vitis workspace itself is
-regenerable via XSCT (see `linux/README.md` ‚Üí "Vitis GUI workspace") and is
+regenerable via XSCT (see `linux/README.md` ‚Ü?"Vitis GUI workspace") and is
 gitignored (`vitis_linux/workspace/`).
 
 **Key decisions (preserved from the original workspace):**
@@ -1230,29 +1345,29 @@ gitignored (`vitis_linux/workspace/`).
 
 ## Key Decisions (2026-07-30)
 
-14. **DCC integration for tmac_baremetal (2026-07-30, SUPERSEDED 2026-07-31):** UART0 debug output (`uart_puts`/`putc`/`puthex`/`putdec`) was redirected to JTAG DCC under the assumption that the CH340 was physically broken (PS7 TX works, FX reads pin is dead). Approach: modified `tmac_baremetal.h` to include `dcc_io.h` and replaced UART output function bodies with DCC wrappers. Added `dcc_putdec()` to `dcc_io.h`. `dcc_unlock()` added to `uart_init()`. `run_tmac_baremetal.tcl` updated to use `readjtaguart -start/-handle/-stop` for DCC output capture. **The "broken CH340" conclusion was wrong** ‚Äî the USB-UART works fine (verified with the reference MicroPhase project `03_dma` in Vitis GUI). The real bug was in `uart_init()` register programming. Reverted in Key Decision #16.
+14. **DCC integration for tmac_baremetal (2026-07-30, SUPERSEDED 2026-07-31):** UART0 debug output (`uart_puts`/`putc`/`puthex`/`putdec`) was redirected to JTAG DCC under the assumption that the CH340 was physically broken (PS7 TX works, FX reads pin is dead). Approach: modified `tmac_baremetal.h` to include `dcc_io.h` and replaced UART output function bodies with DCC wrappers. Added `dcc_putdec()` to `dcc_io.h`. `dcc_unlock()` added to `uart_init()`. `run_tmac_baremetal.tcl` updated to use `readjtaguart -start/-handle/-stop` for DCC output capture. **The "broken CH340" conclusion was wrong** ‚Ä?the USB-UART works fine (verified with the reference MicroPhase project `03_dma` in Vitis GUI). The real bug was in `uart_init()` register programming. Reverted in Key Decision #16.
 
 ## Key Decisions (2026-07-31)
 
-15. **Project cleanup + vitis_linux commit:** Deleted all generated artifacts (`.vvp`/`.vcd`, `vivado*.log/.jou`, `proj_bd/`, `.Xil/`, `xsim.dir/`, `sw/*.elf/.o/.bin` ‚Äî all regenerable). Removed one-off debug/scratch scripts (see git history). Deleted dead modules `verilog/dequant_lut.v` + `verilog/systolic_8x8.v` (never instantiated; removed from Makefile + test_integration.sh). Fixed `linux/README.md` merge-conflict markers that had been committed in 6fd08f5. Corrected layer count in AGENTS.md (28‚Üí24, matching `sim/tmac_gguf.cpp:142`). `vitis_linux/` committed (README + XSA + scripts + prebuilt) with `workspace/` gitignored. **Legacy dirs kept as archive:** `hls/`, `firmware/`, `descriptor-orchestrator/`, `sim/Transaction Tracer/`, `vivado/` ‚Äî superseded by current Verilog RTL + bare-metal code, kept for reference only.
+15. **Project cleanup + vitis_linux commit:** Deleted all generated artifacts (`.vvp`/`.vcd`, `vivado*.log/.jou`, `proj_bd/`, `.Xil/`, `xsim.dir/`, `sw/*.elf/.o/.bin` ‚Ä?all regenerable). Removed one-off debug/scratch scripts (see git history). Deleted dead modules `verilog/dequant_lut.v` + `verilog/systolic_8x8.v` (never instantiated; removed from Makefile + test_integration.sh). Fixed `linux/README.md` merge-conflict markers that had been committed in 6fd08f5. Corrected layer count in AGENTS.md (28‚Ü?4, matching `sim/tmac_gguf.cpp:142`). `vitis_linux/` committed (README + XSA + scripts + prebuilt) with `workspace/` gitignored. **Legacy dirs kept as archive:** `hls/`, `firmware/`, `descriptor-orchestrator/`, `sim/Transaction Tracer/`, `vivado/` ‚Ä?superseded by current Verilog RTL + bare-metal code, kept for reference only.
 
-16. **USB-UART works ‚Äî DCC redirect reverted (2026-07-31):** Running the reference MicroPhase project `D:\Users\u\microphase-z7\03_dma\arm` in Vitis GUI proved the CH340 USB-UART is **not** broken ‚Äî it prints on UART0 (0xE0000000, MIO 14/15, 115200 8N1). Its PS7 config (UART0, MIO 14/15) and ps7_init UART programming (BAUDGEN=0x7C, BAUDDIV=0x06, MR=0x20, CR=0x17) are identical to ours. **Root cause of our dead UART was `uart_init()` in `tmac_baremetal.h`:** (a) the final `CR` write was `0x20` = **TX_DIS** (TX_EN is bit 4 = 0x10), leaving the transmitter disabled; (b) the baud values were written to the wrong offsets ‚Äî `uart[8]`/`uart[9]` hit 0x20 (RXWM) and 0x24 (MODEMCR) instead of BAUDGEN 0x18 (uart[6]) and BAUDDIV 0x34 (uart[13]) ‚Äî the broken baud was masked because ps7_init had already set it; (c) all `uart_put*` bodies were DCC wrappers ("since CH340 UART is broken"), so nothing ever reached the TX FIFO. **Fix:** rewrote `uart_init()` with correct xuartps register programming (CR ends `0x14` = RX_EN|TX_EN) and restored real UART output (`uart_putc` polls SR[0x2C] bit 4 TXFULL, writes FIFO[0x30]). Removed `#include "dcc_io.h"` and deleted `dcc_io.h` (was kept as an unused fallback). `run_tmac_baremetal.tcl` no longer does DCC capture (`readjtaguart`) ‚Äî console output appears on the USB-UART terminal.
+16. **USB-UART works ‚Ä?DCC redirect reverted (2026-07-31):** Running the reference MicroPhase project `D:\Users\u\microphase-z7\03_dma\arm` in Vitis GUI proved the CH340 USB-UART is **not** broken ‚Ä?it prints on UART0 (0xE0000000, MIO 14/15, 115200 8N1). Its PS7 config (UART0, MIO 14/15) and ps7_init UART programming (BAUDGEN=0x7C, BAUDDIV=0x06, MR=0x20, CR=0x17) are identical to ours. **Root cause of our dead UART was `uart_init()` in `tmac_baremetal.h`:** (a) the final `CR` write was `0x20` = **TX_DIS** (TX_EN is bit 4 = 0x10), leaving the transmitter disabled; (b) the baud values were written to the wrong offsets ‚Ä?`uart[8]`/`uart[9]` hit 0x20 (RXWM) and 0x24 (MODEMCR) instead of BAUDGEN 0x18 (uart[6]) and BAUDDIV 0x34 (uart[13]) ‚Ä?the broken baud was masked because ps7_init had already set it; (c) all `uart_put*` bodies were DCC wrappers ("since CH340 UART is broken"), so nothing ever reached the TX FIFO. **Fix:** rewrote `uart_init()` with correct xuartps register programming (CR ends `0x14` = RX_EN|TX_EN) and restored real UART output (`uart_putc` polls SR[0x2C] bit 4 TXFULL, writes FIFO[0x30]). Removed `#include "dcc_io.h"` and deleted `dcc_io.h` (was kept as an unused fallback). `run_tmac_baremetal.tcl` no longer does DCC capture (`readjtaguart`) ‚Ä?console output appears on the USB-UART terminal.
 
-17. **vitis_bm ‚Äî bare-metal Vitis GUI workspace (2026-07-31):** Created `vitis_bm/` ‚Äî a Vitis 2023.1 bare-metal (standalone) workspace mirroring the reference MicroPhase `03_dma` project layout, so the GUI can Program-FPGA + run FSBL + run the app over JTAG with console on the USB-UART. The workspace IS `vitis_bm/` itself (like `03_dma/arm`); `build.tcl` regenerates the platform `z7_bm` (from `vitis_linux/matmul_bd.xsa`, `ps7_cortexa9_0`, standalone) + app `tmac_serial` (imports `vitis_bm/app/src/tmac_serial.c`). The app exercises both UART paths: direct xuartps register programming (identical to the fixed `uart_init()`) and the BSP `xil_printf` driver, then prints live FPGA registers (CLK_CNT/STATUS/DEBUG/Q8DBG) over AXI4-Lite and a 1 Hz tick loop. Verified headless: `xsct.bat build.tcl` ‚Üí EXIT=0, `tmac_serial.elf` built, app disassembly shows correct UART registers (BAUDGEN=124, CR=0x14, FIFO=0x30). `scripts/run_serial.tcl` is the XSDB headless runner (loads `sw/uart_test.elf`). Added standalone `sw/uart_test.c` + `uart_test.elf` to the clang Makefile flow (serial smoke test without a model); removed dead `hp_baremetal.elf`/`test_int16.elf` Makefile targets whose sources were deleted in the cleanup. **Next increment: Linux** ‚Äî migrate the kernel console from JTAG DCC capture to UART0 (ttyPS0): rebuilt kernel with `CONFIG_CMDLINE=console=ttyPS0,115200 ...` and U-Boot with stock defconfig (no DCC additions); `boot_linux_jtag.tcl` no longer captures via `readjtaguart` (see `linux/README.md`).
+17. **vitis_bm ‚Ä?bare-metal Vitis GUI workspace (2026-07-31):** Created `vitis_bm/` ‚Ä?a Vitis 2023.1 bare-metal (standalone) workspace mirroring the reference MicroPhase `03_dma` project layout, so the GUI can Program-FPGA + run FSBL + run the app over JTAG with console on the USB-UART. The workspace IS `vitis_bm/` itself (like `03_dma/arm`); `build.tcl` regenerates the platform `z7_bm` (from `vitis_linux/matmul_bd.xsa`, `ps7_cortexa9_0`, standalone) + app `tmac_serial` (imports `vitis_bm/app/src/tmac_serial.c`). The app exercises both UART paths: direct xuartps register programming (identical to the fixed `uart_init()`) and the BSP `xil_printf` driver, then prints live FPGA registers (CLK_CNT/STATUS/DEBUG/Q8DBG) over AXI4-Lite and a 1 Hz tick loop. Verified headless: `xsct.bat build.tcl` ‚Ü?EXIT=0, `tmac_serial.elf` built, app disassembly shows correct UART registers (BAUDGEN=124, CR=0x14, FIFO=0x30). `scripts/run_serial.tcl` is the XSDB headless runner (loads `sw/uart_test.elf`). Added standalone `sw/uart_test.c` + `uart_test.elf` to the clang Makefile flow (serial smoke test without a model); removed dead `hp_baremetal.elf`/`test_int16.elf` Makefile targets whose sources were deleted in the cleanup. **Next increment: Linux** ‚Ä?migrate the kernel console from JTAG DCC capture to UART0 (ttyPS0): rebuilt kernel with `CONFIG_CMDLINE=console=ttyPS0,115200 ...` and U-Boot with stock defconfig (no DCC additions); `boot_linux_jtag.tcl` no longer captures via `readjtaguart` (see `linux/README.md`).
 
-18. **JTAG initrd mechanism ‚Äî `devicetree-jtag.dtb` via `linux/patch_dtb_initrd.py` (2026-07-31):** The U-Boot-less hand boot (`boot_linux_jtag.tcl`) needs the initramfs to reach a login shell, and U-Boot `bootm` isn't in that path. Added a dependency-free Python FDT rewriter `linux/patch_dtb_initrd.py` that bakes `/chosen/linux,initrd-start/end` (u32 physical addresses) into a copy of `devicetree.dtb`, plus a raw gzipped cpio `initramfs.cpio.gz` (strips any 64-byte mkimage header if buildroot ever adds one). The kernel then locates the initrd loaded at 0x03000000 entirely from the DTB. Patch script validated: algorithm first prototyped in PowerShell and verified by re-walk + canonical prop diff (only the two new `/chosen` props differ among 557); then the shipped Python produced a **byte-identical** 17216-byte `devicetree-jtag.dtb` (SHA256 `E385FE92‚Ä¶`). `linux/build_all.sh` now generates both artifacts after buildroot and mirrors them to `vitis_linux/prebuilt/`; `boot_linux_jtag.tcl` loads `devicetree-jtag.dtb` + `initramfs.cpio.gz`. Console stays on ttyPS0 (`/chosen/bootargs` empty ‚Üí baked-in `CONFIG_CMDLINE`). Note: the Python closure trap (`strings_new +=` inside `add_string` shadowed the outer name ‚Üí `UnboundLocalError`) was fixed with `nonlocal`. **Status: the U-Boot-less JTAG boot was NEVER verified on hardware (see KD #26); SD boot is the only proven path ‚Äî the artifacts are kept for consistency only.**
+18. **JTAG initrd mechanism ‚Ä?`devicetree-jtag.dtb` via `linux/patch_dtb_initrd.py` (2026-07-31):** The U-Boot-less hand boot (`boot_linux_jtag.tcl`) needs the initramfs to reach a login shell, and U-Boot `bootm` isn't in that path. Added a dependency-free Python FDT rewriter `linux/patch_dtb_initrd.py` that bakes `/chosen/linux,initrd-start/end` (u32 physical addresses) into a copy of `devicetree.dtb`, plus a raw gzipped cpio `initramfs.cpio.gz` (strips any 64-byte mkimage header if buildroot ever adds one). The kernel then locates the initrd loaded at 0x03000000 entirely from the DTB. Patch script validated: algorithm first prototyped in PowerShell and verified by re-walk + canonical prop diff (only the two new `/chosen` props differ among 557); then the shipped Python produced a **byte-identical** 17216-byte `devicetree-jtag.dtb` (SHA256 `E385FE92‚Ä¶`). `linux/build_all.sh` now generates both artifacts after buildroot and mirrors them to `vitis_linux/prebuilt/`; `boot_linux_jtag.tcl` loads `devicetree-jtag.dtb` + `initramfs.cpio.gz`. Console stays on ttyPS0 (`/chosen/bootargs` empty ‚Ü?baked-in `CONFIG_CMDLINE`). Note: the Python closure trap (`strings_new +=` inside `add_string` shadowed the outer name ‚Ü?`UnboundLocalError`) was fixed with `nonlocal`. **Status: the U-Boot-less JTAG boot was NEVER verified on hardware (see KD #26); SD boot is the only proven path ‚Ä?the artifacts are kept for consistency only.**
 
-19. **SD boot is primary ‚Äî auto-run `boot.scr`, JTAG stays as fallback (2026-07-31):** User has an SD writer on the Mac, so the natural Zynq boot path is FSBL ‚Üí U-Boot ‚Üí `bootm` from SD (exactly what the MicroPhase reference repo assumes; `xilinx_zynq_virt_defconfig` has `CONFIG_DISTRO_DEFAULTS=y`, so U-Boot auto-runs `boot.scr` from the FAT32 partition ‚Äî no interactive prompt). Added committed `linux/boot/boot.cmd` (the source; fatloads uImage@0x03000000, dtb@0x02A00000, uramdisk@0x02000000, then `bootm` ‚Äî matching the README manual boot) and `linux/build_all.sh` now generates `boot.scr` from it with U-Boot's own `./tools/mkimage` (NOT kernel u-boot-tools) right after the U-Boot build. `.gitignore` covers `linux/boot/boot.scr` + the already-untracked `initramfs.cpio.gz`/`devicetree-jtag.dtb`. SD card is now two FAT32 partitions (p1 boot: BOOT.BIN/uImage/devicetree.dtb/uramdisk.image.gz/boot.scr; p2 data: model.tmac + tmac ‚Äî vfat keeps macOS tools sufficient, no ext4 needed; the initramfs `mount /dev/mmcblk0p2 /root` auto-detects) written on the Mac with `diskutil partitionDisk /dev/diskX MBR FAT32 SD_BOOT 128M FAT32 SD_DATA R`. Boot mode jumper is **J1** (not a DIP). The JTAG initrd mechanism (#18) is kept as the bring-up fallback. Docs updated: `linux/README.md` (manual-flow mkimage step, corrected `boot.bif` contents ‚Äî FSBL path `fsbl.elf`+`system_wrapper.bit`+`u-boot.elf`, not the stale SPL snippet), `AGENTS.md` SD section, `linux/build_all.sh` summary. **Mac-agent clarity:** `build_all.sh` is now host-agnostic (guards `HOSTCC=clang`/brew openssl and the `/tmp/arm-toolchain/elf.h` requirement behind `uname -s = Darwin`), so it runs in the Lima Ubuntu VM (apt gcc-arm-linux-gnueabihf) or on the macOS host (clang wrapper); the README opens with a step-by-step "Quickstart: automated build" (`clone` ‚Üí `clone_repos.sh` ‚Üí `build_all.sh` ‚Üí artifact verification table ‚Üí SD card prep) plus a note that `model.tmac` is NOT in the repo (gitignored, ask the user / copy from Windows `models/`).
+19. **SD boot is primary ‚Ä?auto-run `boot.scr`, JTAG stays as fallback (2026-07-31):** User has an SD writer on the Mac, so the natural Zynq boot path is FSBL ‚Ü?U-Boot ‚Ü?`bootm` from SD (exactly what the MicroPhase reference repo assumes; `xilinx_zynq_virt_defconfig` has `CONFIG_DISTRO_DEFAULTS=y`, so U-Boot auto-runs `boot.scr` from the FAT32 partition ‚Ä?no interactive prompt). Added committed `linux/boot/boot.cmd` (the source; fatloads uImage@0x03000000, dtb@0x02A00000, uramdisk@0x02000000, then `bootm` ‚Ä?matching the README manual boot) and `linux/build_all.sh` now generates `boot.scr` from it with U-Boot's own `./tools/mkimage` (NOT kernel u-boot-tools) right after the U-Boot build. `.gitignore` covers `linux/boot/boot.scr` + the already-untracked `initramfs.cpio.gz`/`devicetree-jtag.dtb`. SD card is now two FAT32 partitions (p1 boot: BOOT.BIN/uImage/devicetree.dtb/uramdisk.image.gz/boot.scr; p2 data: model.tmac + tmac ‚Ä?vfat keeps macOS tools sufficient, no ext4 needed; the initramfs `mount /dev/mmcblk0p2 /root` auto-detects) written on the Mac with `diskutil partitionDisk /dev/diskX MBR FAT32 SD_BOOT 128M FAT32 SD_DATA R`. Boot mode jumper is **J1** (not a DIP). The JTAG initrd mechanism (#18) is kept as the bring-up fallback. Docs updated: `linux/README.md` (manual-flow mkimage step, corrected `boot.bif` contents ‚Ä?FSBL path `fsbl.elf`+`system_wrapper.bit`+`u-boot.elf`, not the stale SPL snippet), `AGENTS.md` SD section, `linux/build_all.sh` summary. **Mac-agent clarity:** `build_all.sh` is now host-agnostic (guards `HOSTCC=clang`/brew openssl and the `/tmp/arm-toolchain/elf.h` requirement behind `uname -s = Darwin`), so it runs in the Lima Ubuntu VM (apt gcc-arm-linux-gnueabihf) or on the macOS host (clang wrapper); the README opens with a step-by-step "Quickstart: automated build" (`clone` ‚Ü?`clone_repos.sh` ‚Ü?`build_all.sh` ‚Ü?artifact verification table ‚Ü?SD card prep) plus a note that `model.tmac` is NOT in the repo (gitignored, ask the user / copy from Windows `models/`).
 
-20. **BOOT.BIN produced on the Mac ‚Äî buildroot `host-bootgen` (2026-07-31, SUPERSEDED by #27):** The last Windows-only step in the SD flow ‚Äî fusing `BOOT.BIN` ‚Äî was removed. Buildroot (already cloned by `clone_repos.sh`) ships a `host-bootgen` package (package `bootgen`, Xilinx/bootgen `xilinx_v2026.1`, deps host-openssl + host-pkgconf auto-built) that installs `bootgen` into `/tmp/arm-build/buildroot/output/host/bin/bootgen` via `make host-bootgen`. Added `linux/build_bootbin.sh`: builds bootgen via buildroot (fallback: direct clone of `Xilinx/bootgen` + `make LIBS=$(pkg-config --libs libssl libcrypto)`), then fuses `BOOT.BIN` from `fsbl.elf` + `system_wrapper.bit` + `u-boot.elf` using the committed `boot.bif` (`bootgen -image boot.bif -o BOOT.BIN -w`, run in `linux/boot/` so the relative BIF paths resolve ‚Äî same invocation as the old Windows step). Committed `linux/boot/fsbl.elf` (227784 B, built from `matmul_bd.xsa` via the z7_linux workspace ‚Äî un-ignored in `.gitignore` with a `!linux/boot/fsbl.elf` override); it only changes if the HW design does. `linux/build_all.sh` step [4/4] now calls `build_bootbin.sh`, so a single VM command produces `u-boot.elf` + `boot.scr` + `uImage` + dtb + initramfs **and** `BOOT.BIN`. README + AGENTS.md updated: the flow is now single-machine (Mac/Lima VM), Windows/Vivado only to rebuild bitstream/FSBL on HW changes; Windows `bootgen.bat` kept as a documented fallback. Note: `bootgen` on the Mac produces a Zynq-7000 image with the same `boot.bif` (FSBL path) ‚Äî SPL is not used.
+20. **BOOT.BIN produced on the Mac ‚Ä?buildroot `host-bootgen` (2026-07-31, SUPERSEDED by #27):** The last Windows-only step in the SD flow ‚Ä?fusing `BOOT.BIN` ‚Ä?was removed. Buildroot (already cloned by `clone_repos.sh`) ships a `host-bootgen` package (package `bootgen`, Xilinx/bootgen `xilinx_v2026.1`, deps host-openssl + host-pkgconf auto-built) that installs `bootgen` into `/tmp/arm-build/buildroot/output/host/bin/bootgen` via `make host-bootgen`. Added `linux/build_bootbin.sh`: builds bootgen via buildroot (fallback: direct clone of `Xilinx/bootgen` + `make LIBS=$(pkg-config --libs libssl libcrypto)`), then fuses `BOOT.BIN` from `fsbl.elf` + `system_wrapper.bit` + `u-boot.elf` using the committed `boot.bif` (`bootgen -image boot.bif -o BOOT.BIN -w`, run in `linux/boot/` so the relative BIF paths resolve ‚Ä?same invocation as the old Windows step). Committed `linux/boot/fsbl.elf` (227784 B, built from `matmul_bd.xsa` via the z7_linux workspace ‚Ä?un-ignored in `.gitignore` with a `!linux/boot/fsbl.elf` override); it only changes if the HW design does. `linux/build_all.sh` step [4/4] now calls `build_bootbin.sh`, so a single VM command produces `u-boot.elf` + `boot.scr` + `uImage` + dtb + initramfs **and** `BOOT.BIN`. README + AGENTS.md updated: the flow is now single-machine (Mac/Lima VM), Windows/Vivado only to rebuild bitstream/FSBL on HW changes; Windows `bootgen.bat` kept as a documented fallback. Note: `bootgen` on the Mac produces a Zynq-7000 image with the same `boot.bif` (FSBL path) ‚Ä?SPL is not used.
 
-21. **U-Boot DTB switched to `zynq-zc702` + `CONFIG_OF_EMBED=y` + `CONFIG_DEBUG_UART_ZYNQ` (2026-07-31):** The stock `xilinx_zynq_virt_defconfig` uses `zynq-zc706` DTB by default, which routes the console to UART1 (MIO 48/49). The Z7-Lite board has the CH340 USB-UART on UART0 (MIO 14/15), so U-Boot with the zc706 DTB prints to a dead serial port ‚Äî confirmed via JTAG: U-Boot loaded and started but produced no output on UART0, while a bare-metal test (`uart_test.elf`) and raw DAP FIFO writes both produced visible output on UART0. **Second bug:** `xilinx_zynq_virt_defconfig` uses `CONFIG_OF_SEPARATE`, so the DTB is a separate file and `u-boot.elf` has no device tree. Without the DTB the U-Boot driver model can't enumerate the serial port, so even with the zc702 switch the banner never prints (UART0 FIFO still works after boot ‚Äî U-Boot simply never touches it). **Third bug:** Even with zc702 + OF_EMBED, the DTB-vs-hardware mismatch (ps7_init from Z7-Lite XSA vs. zc702 board DTB) can cause the driver model serial probe to fail silently. Fix: after `make xilinx_zynq_virt_defconfig`, `echo 'CONFIG_DEFAULT_DEVICE_TREE="zynq-zc702"' >> .config && echo 'CONFIG_OF_EMBED=y' >> .config && echo 'CONFIG_DEBUG_UART=y' >> .config && echo 'CONFIG_DEBUG_UART_ZYNQ=y' >> .config && echo 'CONFIG_DEBUG_UART_BASE=0xE0000000' >> .config && echo 'CONFIG_DEBUG_UART_CLOCK=100000000' >> .config && make olddefconfig` (1) switches to zc702 DTB for UART0/serial0 on MIO 14/15, (2) embeds it in the ELF, and (3) enables early boot output via DEBUG_UART_ZYNQ which writes directly to UART0 registers before the driver model initializes ‚Äî no clocks, pinctrl, or DTB dependencies. **Fourth bug:** Even with DEBUG_UART enabled, `debug_uart_init` runs AFTER `initf_dm` in the init sequence, so the DM serial probe (which probes the zc702 UART via clock/reset/pinctrl drivers) hangs before debug output is reached. Fix: Python patch in `build_all.sh` inserts `debug_uart_init_wrap` (an `int`-returning wrapper around the `void` `debug_uart_init`) before `initf_dm,` in `common/board_f.c` via regex substitution, plus adds `#include <debug_uart.h>` to `board_f.c`, guaranteeing output before any DM init. (The Windows agent's original patch inserted `debug_uart_init,` directly, which fails to compile: `init_sequence_f` entries are `int (*)(void)` but `debug_uart_init` returns `void` ‚Äî `-Werror=incompatible-pointer-types`. Fixed 2026-08-01 on the Mac side with the wrapper approach.) Applied to `linux/build_all.sh` (automated build) + `linux/README.md` (manual build section + console table). **Note: #21's console was still bound to UART1 ‚Äî the DTS `serial0=uart0` reroute is the definitive fix in #22 (2026-08-02).**
+21. **U-Boot DTB switched to `zynq-zc702` + `CONFIG_OF_EMBED=y` + `CONFIG_DEBUG_UART_ZYNQ` (2026-07-31):** The stock `xilinx_zynq_virt_defconfig` uses `zynq-zc706` DTB by default, which routes the console to UART1 (MIO 48/49). The Z7-Lite board has the CH340 USB-UART on UART0 (MIO 14/15), so U-Boot with the zc706 DTB prints to a dead serial port ‚Ä?confirmed via JTAG: U-Boot loaded and started but produced no output on UART0, while a bare-metal test (`uart_test.elf`) and raw DAP FIFO writes both produced visible output on UART0. **Second bug:** `xilinx_zynq_virt_defconfig` uses `CONFIG_OF_SEPARATE`, so the DTB is a separate file and `u-boot.elf` has no device tree. Without the DTB the U-Boot driver model can't enumerate the serial port, so even with the zc702 switch the banner never prints (UART0 FIFO still works after boot ‚Ä?U-Boot simply never touches it). **Third bug:** Even with zc702 + OF_EMBED, the DTB-vs-hardware mismatch (ps7_init from Z7-Lite XSA vs. zc702 board DTB) can cause the driver model serial probe to fail silently. Fix: after `make xilinx_zynq_virt_defconfig`, `echo 'CONFIG_DEFAULT_DEVICE_TREE="zynq-zc702"' >> .config && echo 'CONFIG_OF_EMBED=y' >> .config && echo 'CONFIG_DEBUG_UART=y' >> .config && echo 'CONFIG_DEBUG_UART_ZYNQ=y' >> .config && echo 'CONFIG_DEBUG_UART_BASE=0xE0000000' >> .config && echo 'CONFIG_DEBUG_UART_CLOCK=100000000' >> .config && make olddefconfig` (1) switches to zc702 DTB for UART0/serial0 on MIO 14/15, (2) embeds it in the ELF, and (3) enables early boot output via DEBUG_UART_ZYNQ which writes directly to UART0 registers before the driver model initializes ‚Ä?no clocks, pinctrl, or DTB dependencies. **Fourth bug:** Even with DEBUG_UART enabled, `debug_uart_init` runs AFTER `initf_dm` in the init sequence, so the DM serial probe (which probes the zc702 UART via clock/reset/pinctrl drivers) hangs before debug output is reached. Fix: Python patch in `build_all.sh` inserts `debug_uart_init_wrap` (an `int`-returning wrapper around the `void` `debug_uart_init`) before `initf_dm,` in `common/board_f.c` via regex substitution, plus adds `#include <debug_uart.h>` to `board_f.c`, guaranteeing output before any DM init. (The Windows agent's original patch inserted `debug_uart_init,` directly, which fails to compile: `init_sequence_f` entries are `int (*)(void)` but `debug_uart_init` returns `void` ‚Ä?`-Werror=incompatible-pointer-types`. Fixed 2026-08-01 on the Mac side with the wrapper approach.) Applied to `linux/build_all.sh` (automated build) + `linux/README.md` (manual build section + console table). **Note: #21's console was still bound to UART1 ‚Ä?the DTS `serial0=uart0` reroute is the definitive fix in #22 (2026-08-02).**
 
-22. **U-Boot console fixed: DM serial bound to UART1 (dead) - DTS reroute to UART0 (2026-08-02):** Confirmed via embedded-DTB dump of the current build that the U-Boot driver-model console was bound to `serial@e0001000` (UART1, MIO 48/49) with UART0 (`serial@e0000000`) left `status="disabled"` ‚Äî so even after the zc702 DTB switch (#21) the banner never reached the CH340 on UART0 (MIO 14/15); only the hardcoded `debug_uart` (0xE0000000) ever emitted there. The earlier RAM-size fix (#21) was real and necessary (relocation landed at unpopulated 0x3FF00000), but the console was still routed to a dead UART1 afterward. Fix: in `arch/arm/dts/zynq-zc702.dts` (1) `aliases { serial0 = &uart1; }` -> `serial0 = &uart0;`, (2) replace the `&uart1 { u-boot,dm-pre-reloc; status="okay"; pinctrl uart1_10_grp; }` block with `&uart0 { u-boot,dm-pre-reloc; status="okay"; }` (no pinctrl needed ‚Äî ps7_init configures MIO 14/15, matching the `zynq-cc108.dts` UART0 pattern). The U-Boot serial driver probes UART0 successfully and debug_uart's 115200 config is preserved (probe early-returns if CR&TX_EN). Rebuilt: embedded DTB now shows UART0 okay + dm-pre-reloc, UART1 disabled (verified at ELF offset 0xc9690, 17192 bytes). Build scripts: `build_all.sh` + `build_uboot.sh` both mirror the patch via Python re.sub (idempotent). NOTE: the regex must consume the closing `};` not just `}` ‚Äî an early version produced `};;` which is a real dtc syntax error (found 2026-08-02 via `make dts`). New `vitis_linux/scripts/verify_uboot_console.tcl` loads u-boot.elf via JTAG (ps7_init PLL-guarded), runs 25 s so the terminal can show the banner + autoboot countdown, then dumps PC/regs/UART0. `debug_uboot_jtag.tcl` BSS_START updated to 0x040da760 (new build `__bss_start`). Helpers added in WSL: `dtb_find.py` (scans ELF for dtb magic + parses), `dts_serial.py` (prints serial0/status/pre-reloc). VERIFIED on HW 2026-08-02 via `verify_uboot_console.tcl`: full banner on CH340 at 115200 with `In/Out/Err: serial@e0000000`, `DRAM: 512 MiB`, `MMC: mmc@e0100000: 0` (no card present). U-Boot then falls through JTAG/QSPI/NAND/NOR boot attempts (expected - no media; GEM/USB/QSPI probe errors are cosmetic on this board). Next: U-Boot `mmc list`/`fatls mmc 0:1` SD test; then rebuild BOOT.BIN (new u-boot.elf) + BOOT.BIN SD boot.
+22. **U-Boot console fixed: DM serial bound to UART1 (dead) - DTS reroute to UART0 (2026-08-02):** Confirmed via embedded-DTB dump of the current build that the U-Boot driver-model console was bound to `serial@e0001000` (UART1, MIO 48/49) with UART0 (`serial@e0000000`) left `status="disabled"` ‚Ä?so even after the zc702 DTB switch (#21) the banner never reached the CH340 on UART0 (MIO 14/15); only the hardcoded `debug_uart` (0xE0000000) ever emitted there. The earlier RAM-size fix (#21) was real and necessary (relocation landed at unpopulated 0x3FF00000), but the console was still routed to a dead UART1 afterward. Fix: in `arch/arm/dts/zynq-zc702.dts` (1) `aliases { serial0 = &uart1; }` -> `serial0 = &uart0;`, (2) replace the `&uart1 { u-boot,dm-pre-reloc; status="okay"; pinctrl uart1_10_grp; }` block with `&uart0 { u-boot,dm-pre-reloc; status="okay"; }` (no pinctrl needed ‚Ä?ps7_init configures MIO 14/15, matching the `zynq-cc108.dts` UART0 pattern). The U-Boot serial driver probes UART0 successfully and debug_uart's 115200 config is preserved (probe early-returns if CR&TX_EN). Rebuilt: embedded DTB now shows UART0 okay + dm-pre-reloc, UART1 disabled (verified at ELF offset 0xc9690, 17192 bytes). Build scripts: `build_all.sh` + `build_uboot.sh` both mirror the patch via Python re.sub (idempotent). NOTE: the regex must consume the closing `};` not just `}` ‚Ä?an early version produced `};;` which is a real dtc syntax error (found 2026-08-02 via `make dts`). New `vitis_linux/scripts/verify_uboot_console.tcl` loads u-boot.elf via JTAG (ps7_init PLL-guarded), runs 25 s so the terminal can show the banner + autoboot countdown, then dumps PC/regs/UART0. `debug_uboot_jtag.tcl` BSS_START updated to 0x040da760 (new build `__bss_start`). Helpers added in WSL: `dtb_find.py` (scans ELF for dtb magic + parses), `dts_serial.py` (prints serial0/status/pre-reloc). VERIFIED on HW 2026-08-02 via `verify_uboot_console.tcl`: full banner on CH340 at 115200 with `In/Out/Err: serial@e0000000`, `DRAM: 512 MiB`, `MMC: mmc@e0100000: 0` (no card present). U-Boot then falls through JTAG/QSPI/NAND/NOR boot attempts (expected - no media; GEM/USB/QSPI probe errors are cosmetic on this board). Next: U-Boot `mmc list`/`fatls mmc 0:1` SD test; then rebuild BOOT.BIN (new u-boot.elf) + BOOT.BIN SD boot.
 
-23. **SD-capable FSBL rebuild ‚Äî the "official" build method is `platform create` + `platform generate` only (2026-08-04, gating):** The old `linux/boot/fsbl.elf` (227,784 B) had the SD boot path compiled OUT because it was built from a block design with `PCW_EN_SDIO0=0`. **Root cause at BD level:** our `matmul_bd` XSA lacked the SD0 config that the MicroPhase reference (`03_dma`) has. Fix chain: (1) added SDIO0 to `vivado_integration/build_bd.tcl` (`PCW_EN_SDIO0=1`, `PCW_SD0_PERIPHERAL_ENABLE=1`, `PCW_SD0_SD0_IO="MIO 40 .. 45"`, CD/WP off ‚Äî matches `03_dma`), (2) rebuilt bitstream + XSA (write_hw_platform at line ~184; MIO 40-45 verified in generated ps7_init: `EMIT_MASKWRITE(0XF80007A0..B4, ..., 0x00001680)` = SDIO function 3), (3) rebuilt FSBL. **The correct, standard XSCT flow (proven by studying `03_dma/arm/platform_dma`):** do NOT hand-create an FSBL app on `standalone_domain` with `bsp setlib -name xilffs` ‚Äî that BSP lacks the `sdps` driver and fails with `xsdps.h: No such file` when xilffs builds. Instead `platform create -name fsbl_platform -hw matmul_bd.xsa -proc ps7_cortexa9_0 -os standalone` auto-generates a **`zynq_fsbl` boot domain** (BSP `zynq_fsbl_bsp`, libs xilffs + xilrsa); a plain `platform generate` then auto-selects the **`sdps` driver** (bound to `ps7_sd_0`, version v4_1 in our install) from the SD-enabled hardware and builds the FSBL. Results: `fsbl_platform/zynq_fsbl/fsbl.elf` (437,552 B) contains `InitSD`/`SDAccess`/`f_mount`/`f_open` in `sd.o` and the SD branch is live because the guard `#if defined(XPAR_PS7_SD_0_S_AXI_BASEADDR) || defined(XPAR_XSDPS_0_BASEADDR)` (main.c:430) is now satisfied. **FSBL_DEBUG_INFO caveat:** `app config -name "zynq_fsbl"` FAILS (`zynq_fsbl` is a platform boot component, not a workspace app). To add debug output, edit `fsbl_platform/zynq_fsbl/Makefile` `CFLAGS := -DFSBL_DEBUG_INFO` and rebuild with `make_4.2.exe` (the `gnuwin` `make.exe` crashes with `0xc0000005` on the CMD `SHELL=command.com`; `make_4.2.exe` works when `SHELL` resolves to an sh.exe). New `linux/boot/fsbl.elf` (437,552 B) verified: strings `Boot mode is SD`, `Boot mode is JTAG`, `InitSD`, `BOOT.BIN` present. **BOOT.BIN rebuilt** (3,168,704 B, gitignored) from new `fsbl.elf` + new `system_wrapper.bit` (SHA256 `F5FC70B4...`, SD-config PS7) + `u-boot.elf` via `bootgen -image boot.bif -o BOOT.BIN -w` run in `linux/boot/`; first 8 bytes `FE FF FF EA` = ARM boot header, FSBL partition at offset ~0x11000. Note: the reference `03_dma` shipped FSBL has **no** FSBL_DEBUG either ‚Äî debug output is optional (bring-up aid only). Next: JTAG-verify the FSBL takes the SD branch (`vitis_linux/scripts/debug_fsbl_sdmode_jtag.tcl`), then U-Boot `mmc list`/`fatls`, then flip the board to SD boot.
+23. **SD-capable FSBL rebuild ‚Ä?the "official" build method is `platform create` + `platform generate` only (2026-08-04, gating):** The old `linux/boot/fsbl.elf` (227,784 B) had the SD boot path compiled OUT because it was built from a block design with `PCW_EN_SDIO0=0`. **Root cause at BD level:** our `matmul_bd` XSA lacked the SD0 config that the MicroPhase reference (`03_dma`) has. Fix chain: (1) added SDIO0 to `vivado_integration/build_bd.tcl` (`PCW_EN_SDIO0=1`, `PCW_SD0_PERIPHERAL_ENABLE=1`, `PCW_SD0_SD0_IO="MIO 40 .. 45"`, CD/WP off ‚Ä?matches `03_dma`), (2) rebuilt bitstream + XSA (write_hw_platform at line ~184; MIO 40-45 verified in generated ps7_init: `EMIT_MASKWRITE(0XF80007A0..B4, ..., 0x00001680)` = SDIO function 3), (3) rebuilt FSBL. **The correct, standard XSCT flow (proven by studying `03_dma/arm/platform_dma`):** do NOT hand-create an FSBL app on `standalone_domain` with `bsp setlib -name xilffs` ‚Ä?that BSP lacks the `sdps` driver and fails with `xsdps.h: No such file` when xilffs builds. Instead `platform create -name fsbl_platform -hw matmul_bd.xsa -proc ps7_cortexa9_0 -os standalone` auto-generates a **`zynq_fsbl` boot domain** (BSP `zynq_fsbl_bsp`, libs xilffs + xilrsa); a plain `platform generate` then auto-selects the **`sdps` driver** (bound to `ps7_sd_0`, version v4_1 in our install) from the SD-enabled hardware and builds the FSBL. Results: `fsbl_platform/zynq_fsbl/fsbl.elf` (437,552 B) contains `InitSD`/`SDAccess`/`f_mount`/`f_open` in `sd.o` and the SD branch is live because the guard `#if defined(XPAR_PS7_SD_0_S_AXI_BASEADDR) || defined(XPAR_XSDPS_0_BASEADDR)` (main.c:430) is now satisfied. **FSBL_DEBUG_INFO caveat:** `app config -name "zynq_fsbl"` FAILS (`zynq_fsbl` is a platform boot component, not a workspace app). To add debug output, edit `fsbl_platform/zynq_fsbl/Makefile` `CFLAGS := -DFSBL_DEBUG_INFO` and rebuild with `make_4.2.exe` (the `gnuwin` `make.exe` crashes with `0xc0000005` on the CMD `SHELL=command.com`; `make_4.2.exe` works when `SHELL` resolves to an sh.exe). New `linux/boot/fsbl.elf` (437,552 B) verified: strings `Boot mode is SD`, `Boot mode is JTAG`, `InitSD`, `BOOT.BIN` present. **BOOT.BIN rebuilt** (3,168,704 B, gitignored) from new `fsbl.elf` + new `system_wrapper.bit` (SHA256 `F5FC70B4...`, SD-config PS7) + `u-boot.elf` via `bootgen -image boot.bif -o BOOT.BIN -w` run in `linux/boot/`; first 8 bytes `FE FF FF EA` = ARM boot header, FSBL partition at offset ~0x11000. Note: the reference `03_dma` shipped FSBL has **no** FSBL_DEBUG either ‚Ä?debug output is optional (bring-up aid only). Next: JTAG-verify the FSBL takes the SD branch (`vitis_linux/scripts/debug_fsbl_sdmode_jtag.tcl`), then U-Boot `mmc list`/`fatls`, then flip the board to SD boot.
 
-24. **SD boot VERIFIED on hardware (2026-08-04):** After updating the SD card with the new BOOT.BIN (3,168,704 B, containing the SD-capable FSBL + new SD-config bitstream + U-Boot), the Z7-Lite board boots Linux from SD. Full chain: BootROM (MIO[8:6]=110 = SD mode) ÔøΩÔøΩ FSBL InitSD("BOOT.BIN") ÔøΩÔøΩ PCAP loads bitstream ÔøΩÔøΩ U-Boot loaded from SD ÔøΩÔøΩ U-Boot distro boot (oot.scr) ÔøΩÔøΩ Linux kernel 6.6.0 ÔøΩÔøΩ initramfs shell. Kernel output confirmed on CH340 USB-UART at 115200 8N1 (Ethernet PHY errors are cosmetic ÔøΩÔøΩ Z7-Lite's RTL8201F PHY doesn't match the zc702 DTB's MARVELL PHY). **FSBL frozen:** linux/boot/fsbl.elf = 437,552 B, built 2026-08-04 11:50 ÔøΩÔøΩ SD-capable with -DFSBL_DEBUG_INFO, strings Boot mode is SD, InitSD, BOOT.BIN, SDAccess, _mount, _open present. **U-Boot frozen:** linux/boot/u-boot.elf = 1,063,480 B (u-boot.img = 1,165,456 B), built 2026-08-02 16:26 ÔøΩÔøΩ UART0 console via zc702 DTB + DEBUG_UART_ZYNQ + DTS serial0=uart0 patch, CONFIG_OF_EMBED=y. **Bitstream frozen:** linux/boot/system_wrapper.bit = 2,083,850 B, SHA256 F5FC70B4DDB03540446A702D340828FC121D959CEAC566FE5BAB391BEFF2819 ÔøΩÔøΩ SD-config PS7 (MIO40-45 SDIO function 3 with pull-ups). **XSA frozen:** linux/boot/matmul_bd.xsa = 659,139 B ÔøΩÔøΩ PCW_EN_SDIO0=1, SD0 on MIO 40..45, CD/WP off. **BOOT.BIN** (3,168,704 B, gitignored) = fsbl.elf + system_wrapper.bit + u-boot.elf fused via ootgen -image boot.bif -o BOOT.BIN -w. **SD card:** single FAT32 partition, 8 files (BOOT.BIN + uImage + devicetree.dtb + uramdisk.image.gz + boot.scr + tmac + model.tmac). **Build pipeline:** (1) Vivado uild_bd.tcl ÔøΩÔøΩ XSA+bit, (2) XSCT platform create + platform generate ÔøΩÔøΩ auto SD-capable zynq_fsbl.elf, (3) optional make_4.2 -DFSBL_DEBUG_INFO for debug banner, (4) bootgen fuse oot.bif ÔøΩÔøΩ BOOT.BIN, (5) copy to FAT32 SD card. **JTAG debug breakpoints** (valid for current FSBL): InitSD=0x3908, FsblFallback=0x16A4, FsblHookFallback=0x5AC ÔøΩÔøΩ addresses stable across builds (lscript.ld places FSBL app code at fixed offsets). BootModeReg (0xF800025C) reads 0x05 (SD) on this board.
+24. **SD boot VERIFIED on hardware (2026-08-04):** After updating the SD card with the new BOOT.BIN (3,168,704 B, containing the SD-capable FSBL + new SD-config bitstream + U-Boot), the Z7-Lite board boots Linux from SD. Full chain: BootROM (MIO[8:6]=110 = SD mode) ÔøΩÔøΩ FSBL InitSD("BOOT.BIN") ÔøΩÔøΩ PCAP loads bitstream ÔøΩÔøΩ U-Boot loaded from SD ÔøΩÔøΩ U-Boot distro boot (oot.scr) ÔøΩÔøΩ Linux kernel 6.6.0 ÔøΩÔøΩ initramfs shell. Kernel output confirmed on CH340 USB-UART at 115200 8N1 (Ethernet PHY errors are cosmetic ÔøΩÔøΩ Z7-Lite's RTL8201F PHY doesn't match the zc702 DTB's MARVELL PHY). **FSBL frozen:** linux/boot/fsbl.elf = 437,552 B, built 2026-08-04 11:50 ÔøΩÔøΩ SD-capable with -DFSBL_DEBUG_INFO, strings Boot mode is SD, InitSD, BOOT.BIN, SDAccess, _mount, _open present. **U-Boot frozen:** linux/boot/u-boot.elf = 1,063,480 B (u-boot.img = 1,165,456 B), built 2026-08-02 16:26 ÔøΩÔøΩ UART0 console via zc702 DTB + DEBUG_UART_ZYNQ + DTS serial0=uart0 patch, CONFIG_OF_EMBED=y. **Bitstream rebuilt for Q8/Q5 fixes (2026-08-12/13):** linux/boot/system_wrapper.bit = 2,083,850 B, SHA256 ABE0231AFF69E61DC6445940574294F9AF04B8E630B9216740FD958EC14DAEF2 (committed 2026-08-13, replaces the 2026-08-04 F5FC70B4DDB03540446A702D340828FC121D959CEAC566FE5BAB391BEFF2819; re-fused into BOOT.BIN after each rebuild). Note: the working-tree bitstream has since been rebuilt once more (COMMITTED 2026-08-14: SHA256 E6A2E4472C15F3A86DD031F6A81D16F3609ED7E541489986A013F2389402ED71 with the Q5_0 sign fix - see resource table) ‚Ä?verify and commit before further board work. ÔøΩÔøΩ SD-config PS7 (MIO40-45 SDIO function 3 with pull-ups). **XSA frozen:** linux/boot/matmul_bd.xsa = 659,139 B ÔøΩÔøΩ PCW_EN_SDIO0=1, SD0 on MIO 40..45, CD/WP off. **BOOT.BIN** (3,168,704 B, gitignored) = fsbl.elf + system_wrapper.bit + u-boot.elf fused via ootgen -image boot.bif -o BOOT.BIN -w. **SD card:** single FAT32 partition, 8 files (BOOT.BIN + uImage + devicetree.dtb + uramdisk.image.gz + boot.scr + tmac + model.tmac). **Build pipeline:** (1) Vivado uild_bd.tcl ÔøΩÔøΩ XSA+bit, (2) XSCT platform create + platform generate ÔøΩÔøΩ auto SD-capable zynq_fsbl.elf, (3) optional make_4.2 -DFSBL_DEBUG_INFO for debug banner, (4) bootgen fuse oot.bif ÔøΩÔøΩ BOOT.BIN, (5) copy to FAT32 SD card. **JTAG debug breakpoints** (valid for current FSBL): InitSD=0x3908, FsblFallback=0x16A4, FsblHookFallback=0x5AC ÔøΩÔøΩ addresses stable across builds (lscript.ld places FSBL app code at fixed offsets). BootModeReg (0xF800025C) reads 0x05 (SD) on this board.
 
 25. **Linux kernel + DTB + initramfs rebuilt in WSL; SD boot now reaches interactive shell (2026-08-11):** The previously-committed kernel ("Starting kernel..." hang), DTB (SDHCI/UART broken) and initramfs (AArch64 busybox) were all rebuilt/fixed in WSL and the SD boot now runs end-to-end to an interactive `~ #` shell with working keyboard input. Three independent root causes, each fixed:
     - **DTB (SDHCI hang):** zc702 `&sdhci0` carried a CD/WP pinctrl that remuxed MIO 15 ÔøΩÔøΩ sdio0_wp + MIO 0 ÔøΩÔøΩ sdio0_cd; SDHCI probe hung at `sdhci-pltfm`. Fixed with `xlnx,has-cd/power/wp = <0>` (matching `smir-top.dts`).
@@ -1266,10 +1381,10 @@ gitignored (`vitis_linux/workspace/`).
 
 28. **Verified boot artifacts are now committed (2026-08-11):** `linux/boot/` previously ignored `uImage`/`devicetree.dtb`/`uramdisk.image.gz`/`boot.scr`/`u-boot.elf` as "rebuilt on Mac". Since the WSL build is the only environment and the artifacts are verified, they are now committed. `.gitignore` updated: only truly-regenerable files stay ignored (`BOOT.BIN`, `*.img`, `*.bin`, `u-boot-spl.bin`, `zImage`, `ps7_init*`, `fsbl_platform/`).
 
-29. **`vitis_linux/` merged into `linux/` ‚Äî single source of truth (2026-08-11):** `vitis_linux/` had grown into a stale duplicate of `linux/boot/` (its `prebuilt/` + `matmul_bd.xsa` were byte-identical copies that drifted out of sync). Deleted the whole directory and consolidated:
-    - `vitis_linux/scripts/*.tcl` (7 JTAG bring-up helpers: boot/debug/verify U-Boot + kernel) ‚Üí **`linux/scripts/`**, paths re-pointed to `linux/boot/`
-    - The Vitis GUI cross-compile workflow doc ‚Üí folded into `linux/README.md` ‚Üí "Vitis GUI workspace"
-    - `vitis_linux/prebuilt/` + `vitis_linux/matmul_bd.xsa` ‚Üí deleted (were dupes of `linux/boot/`)
+29. **`vitis_linux/` merged into `linux/` ‚Ä?single source of truth (2026-08-11):** `vitis_linux/` had grown into a stale duplicate of `linux/boot/` (its `prebuilt/` + `matmul_bd.xsa` were byte-identical copies that drifted out of sync). Deleted the whole directory and consolidated:
+    - `vitis_linux/scripts/*.tcl` (7 JTAG bring-up helpers: boot/debug/verify U-Boot + kernel) ‚Ü?**`linux/scripts/`**, paths re-pointed to `linux/boot/`
+    - The Vitis GUI cross-compile workflow doc ‚Ü?folded into `linux/README.md` ‚Ü?"Vitis GUI workspace"
+    - `vitis_linux/prebuilt/` + `vitis_linux/matmul_bd.xsa` ‚Ü?deleted (were dupes of `linux/boot/`)
     - The regenerable Vitis workspace is now created by XSCT into `vitis_linux/workspace/` (gitignored)
     - Cross-references updated: root `README.md`, `docs/README.md`, `AGENTS.md`, `vitis_bm/build.tcl` (+ README), `vivado_integration/TOOLCHAIN.md`, `linux/patch_dtb_initrd.py`, `linux/build_wsl.sh`
     One source of truth for Linux boot: `linux/boot/` (artifacts) + `linux/scripts/` (tools) + `linux/README.md` (docs).

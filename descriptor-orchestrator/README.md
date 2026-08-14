@@ -28,7 +28,7 @@ This approach: Declarative JSON configuration that's:
 │  ┌──────────────────────────────────────────────────┐ │
 │  │ model.json                                        │ │
 │  │ ├── embedding stage                              │ │
-│  │ ├── 28 layer references                        │ │
+ │  │ ├── 24 layer references                        │ │
 │  │ └── logits stage                               │ │
 │  └──────────────────────────────────────────────────┘ │
 └──────────────────────────────────────────────────────────┘
@@ -59,7 +59,7 @@ This approach: Declarative JSON configuration that's:
 | `layer_config.schema.json` | JSON Schema for layer configs |
 | `examples/model.json` | Full Qwen2-0.5B pipeline config |
 | `examples/stages/` | Embedding and logits stage definitions |
-| `examples/layers/` | 28 layer configurations |
+| `examples/layers/` | 28 placeholder layer configs (model has 24 layers, indices 0-23) |
 
 ## Usage
 
@@ -83,7 +83,7 @@ python3 compiler.py examples/layers/layer_00.json -o out.bin
 python3 compiler.py examples/layer.yaml -o out.bin
 ```
 
-### Build Multi-Layer Chain (all 28 layers)
+### Build Multi-Layer Chain (all 24 layers)
 
 ```bash
 python3 build_chain.py -o /tmp/full_chain.bin
@@ -92,8 +92,8 @@ python3 build_chain.py -o /tmp/full_chain.bin
 ### Build Individual Layers
 
 ```bash
-# Generate all 28 layer configs
-for i in $(seq 0 27); do
+# Generate all 24 layer configs
+for i in $(seq 0 23); do
     python3 build_chain.py -n 1 -o layer_$i.json
 done
 ```
@@ -107,7 +107,7 @@ Top-level pipeline configuration:
 ```json
 {
   "model": "qwen2-0.5b",          // Model name
-  "num_layers": 28,               // Number of transformer layers
+  "num_layers": 24,               // Number of transformer layers
   "hidden_dim": 896,             // Hidden dimension (H)
   "intermediate_dim": 4864,      // FFN intermediate dimension
   "vocab_size": 151936,          // Vocabulary size
@@ -160,7 +160,7 @@ Each layer is a separate file:
 ```json
 {
   "layer": 0,
-  "ffn_down_type": "Q6_K",    // Even layers: Q6_K, Odd: Q4_K
+  "ffn_down_type": "Q6_K",    // Layers {0,1,3,6,7,8,9,10,13,16,19,21}: Q6_K; others: Q4_K (NOT even/odd)
   "ops": [
     {"name": "rms_norm", ...},
     {"name": "matmul_q", ...},

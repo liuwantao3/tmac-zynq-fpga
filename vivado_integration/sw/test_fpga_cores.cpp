@@ -383,6 +383,160 @@ static void test_q8_wpattern(const char* name, int idx, int mode) {
 static float p_all1(int r, int c) { (void)r; (void)c; return 1.0f; }
 static float p_allm1(int r, int c) { (void)r; (void)c; return -1.0f; }
 
+// ===== Q8 multi-group test: 14 groups, group-dependent scales =====
+// Weights all 1, acts all 1, scale = 256+g*256 (dequant = 1+g per group).
+// Expected result[r] = 64 * sum_g(1+g) = 64*105 = 6720 (isolates scale loading).
+static void test_q8_multigroup_scales(const char* name, int idx) {
+    OUT(2, 0x80000000 | idx);
+    uint32_t wt = 0x1F004000, act_a = 0x1F002000, res = 0x1F003000, desc = 0x1F001000;
+    uint8_t* W = (uint8_t*)(uintptr_t)wt;
+    uint16_t* sc = (uint16_t*)(uintptr_t)(wt + 14*4096);
+    int16_t* aq = (int16_t*)(uintptr_t)act_a;
+    int g, r, c;
+
+    for (g = 0; g < 14; g++)
+        for (r = 0; r < 64; r++)
+            for (c = 0; c < 64; c++)
+                W[g*4096 + (r>>3)*512 + c*8 + (r&7)] = 1;
+    // Group-dependent scales: sc[g][r][h] = 256 + g*256
+    for (g = 0; g < 14; g++)
+        for (r = 0; r < 64; r++)
+            for (int h = 0; h < 2; h++)
+                sc[g*128 + ((r>>3)<<4)|((r&7)<<1)|h] = (uint16_t)(256 + g*256);
+    for (c = 0; c < 896; c++) aq[c] = 1;
+
+    uint32_t* d = (uint32_t*)(uintptr_t)desc;
+    d[0]=0; d[1]=wt; d[2]=act_a; d[3]=res; d[4]=0; d[5]=0x0001000E; d[6]=128; d[7]=0;
+    reg_write32(0x10, 14);
+    reg_write32(0x18, desc);
+    __asm__ volatile("dsb" ::: "memory");
+    reg_write32(0x00, 1);
+    uint32_t tout = 50000;
+    while (tout--) { if (!(reg_read32(0x14) & 0x8000)) break; }
+
+    uint32_t* r32 = (uint32_t*)(uintptr_t)res;
+    int ok = 1;
+    for (r = 0; r < 64; r++) {
+        long long fpga = read48(r32, r);
+        if (r < 16) OUT(176 + r, (uint32_t)(int32_t)fpga);
+        if (fpga != 6720) { ok = 0; break; }  // 64 * 105
+    }
+    OUT(12+idx, ok?1u:0u);
+    uart_init();
+    uart_puts("\n[Q8_MG_SCALES] ");
+    uart_puts(name);
+    if (ok) uart_puts(" PASS\n");
+    else {
+        uart_puts(" FAIL  fpga[0..15]= ");
+        for (r = 0; r < 16; r++) { uart_putdec((int)read48(r32, r)); uart_putc(' '); }
+        uart_puts("\n");
+    }
+    if (ok) g_npassed++; else g_nfailed++;
+    g_ntests++;
+}
+
+// ===== Q8 multi-group test: 14 groups, group-dependent weights =====
+// Weights W[g][r][c]=g (0..13), scale=256, act=1.
+// Expected result[r] = 64 * sum_g(g) = 64*91 = 5824 (isolates weight loading).
+static void test_q8_multigroup_weights(const char* name, int idx) {
+    OUT(2, 0x80000000 | idx);
+    uint32_t wt = 0x1F004000, act_a = 0x1F002000, res = 0x1F003000, desc = 0x1F001000;
+    uint8_t* W = (uint8_t*)(uintptr_t)wt;
+    uint16_t* sc = (uint16_t*)(uintptr_t)(wt + 14*4096);
+    int16_t* aq = (int16_t*)(uintptr_t)act_a;
+    int g, r, c;
+
+    for (g = 0; g < 14; g++)
+        for (r = 0; r < 64; r++)
+            for (c = 0; c < 64; c++)
+                W[g*4096 + (r>>3)*512 + c*8 + (r&7)] = (uint8_t)(int8_t)g;
+    for (g = 0; g < 14; g++)
+        for (r = 0; r < 64; r++)
+            for (int h = 0; h < 2; h++)
+                sc[g*128 + ((r>>3)<<4)|((r&7)<<1)|h] = 0x0100;
+    for (c = 0; c < 896; c++) aq[c] = 1;
+
+    uint32_t* d = (uint32_t*)(uintptr_t)desc;
+    d[0]=0; d[1]=wt; d[2]=act_a; d[3]=res; d[4]=0; d[5]=0x0001000E; d[6]=128; d[7]=0;
+    reg_write32(0x10, 14);
+    reg_write32(0x18, desc);
+    __asm__ volatile("dsb" ::: "memory");
+    reg_write32(0x00, 1);
+    uint32_t tout = 50000;
+    while (tout--) { if (!(reg_read32(0x14) & 0x8000)) break; }
+
+    uint32_t* r32 = (uint32_t*)(uintptr_t)res;
+    int ok = 1;
+    for (r = 0; r < 64; r++) {
+        long long fpga = read48(r32, r);
+        if (r < 16) OUT(192 + r, (uint32_t)(int32_t)fpga);
+        if (fpga != 5824) { ok = 0; break; }  // 64 * 91
+    }
+    OUT(12+idx, ok?1u:0u);
+    uart_init();
+    uart_puts("\n[Q8_MG_WEIGHTS] ");
+    uart_puts(name);
+    if (ok) uart_puts(" PASS\n");
+    else {
+        uart_puts(" FAIL  fpga[0..15]= ");
+        for (r = 0; r < 16; r++) { uart_putdec((int)read48(r32, r)); uart_putc(' '); }
+        uart_puts("\n");
+    }
+    if (ok) g_npassed++; else g_nfailed++;
+    g_ntests++;
+}
+
+// ===== Q8 multi-group test: 14 groups, group-dependent acts =====
+// Weights all 1, scale=256, act[c]=c+1 (0..895, fits int16).
+// Expected result[r] = sum_c(c+1) = 896*897/2 = 401856 (isolates act loading).
+static void test_q8_multigroup_acts(const char* name, int idx) {
+    OUT(2, 0x80000000 | idx);
+    uint32_t wt = 0x1F004000, act_a = 0x1F002000, res = 0x1F003000, desc = 0x1F001000;
+    uint8_t* W = (uint8_t*)(uintptr_t)wt;
+    uint16_t* sc = (uint16_t*)(uintptr_t)(wt + 14*4096);
+    int16_t* aq = (int16_t*)(uintptr_t)act_a;
+    int g, r, c;
+
+    for (g = 0; g < 14; g++)
+        for (r = 0; r < 64; r++)
+            for (c = 0; c < 64; c++)
+                W[g*4096 + (r>>3)*512 + c*8 + (r&7)] = 1;
+    for (g = 0; g < 14; g++)
+        for (r = 0; r < 64; r++)
+            for (int h = 0; h < 2; h++)
+                sc[g*128 + ((r>>3)<<4)|((r&7)<<1)|h] = 0x0100;
+    for (c = 0; c < 896; c++) aq[c] = (int16_t)(c + 1);
+
+    uint32_t* d = (uint32_t*)(uintptr_t)desc;
+    d[0]=0; d[1]=wt; d[2]=act_a; d[3]=res; d[4]=0; d[5]=0x0001000E; d[6]=128; d[7]=0;
+    reg_write32(0x10, 14);
+    reg_write32(0x18, desc);
+    __asm__ volatile("dsb" ::: "memory");
+    reg_write32(0x00, 1);
+    uint32_t tout = 50000;
+    while (tout--) { if (!(reg_read32(0x14) & 0x8000)) break; }
+
+    uint32_t* r32 = (uint32_t*)(uintptr_t)res;
+    int ok = 1;
+    for (r = 0; r < 64; r++) {
+        long long fpga = read48(r32, r);
+        if (r < 16) OUT(208 + r, (uint32_t)(int32_t)fpga);
+        if (fpga != 401856) { ok = 0; break; }  // 896*897/2
+    }
+    OUT(12+idx, ok?1u:0u);
+    uart_init();
+    uart_puts("\n[Q8_MG_ACTS] ");
+    uart_puts(name);
+    if (ok) uart_puts(" PASS\n");
+    else {
+        uart_puts(" FAIL  fpga[0..15]= ");
+        for (r = 0; r < 16; r++) { uart_putdec((int)read48(r32, r)); uart_putc(' '); }
+        uart_puts("\n");
+    }
+    if (ok) g_npassed++; else g_nfailed++;
+    g_ntests++;
+}
+
 // ===== Q8 multi-group test: 14 groups, row-pattern, expect 896*(r+1) =====
 static void test_q8_multigroup(const char* name, int idx) {
     OUT(2, 0x80000000 | idx);
@@ -451,6 +605,9 @@ extern "C" int main(void) {
     test_q5("Q5 val=-1", 7, -1);
     test_q8_wpattern("col-weights", 8, 1);
     test_q8_multigroup("14-group-col", 10);
+    test_q8_multigroup_scales("14-group-scales", 11);
+    test_q8_multigroup_weights("14-group-weights", 12);
+    test_q8_multigroup_acts("14-group-acts", 13);
     test_q5_golden("distinct", 9);
     OUT(0, 0xBAD1u);
     OUT(9, (uint32_t)g_ntests);

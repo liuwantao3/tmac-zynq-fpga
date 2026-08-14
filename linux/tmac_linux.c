@@ -110,6 +110,11 @@ static float* g_scratch = NULL;
 static volatile uint32_t* g_gp0 = NULL;  /* 0x43C00000 */
 static float g_kcache[NUM_LAYERS][MAX_SEQ_LEN][K_DIM];
 static float g_vcache[NUM_LAYERS][MAX_SEQ_LEN][V_DIM];
+static float g_kcache_cpu[NUM_LAYERS][MAX_SEQ_LEN][K_DIM];
+static float g_vcache_cpu[NUM_LAYERS][MAX_SEQ_LEN][V_DIM];
+/* active KV cache (path selectable for --trace dual-path runs) */
+static float (*g_akc)[MAX_SEQ_LEN][K_DIM] = g_kcache;
+static float (*g_avc)[MAX_SEQ_LEN][V_DIM] = g_vcache;
 
 // ===== /dev/mem Access =====
 #include <sys/syscall.h>   /* cacheflush syscall (ARM) */
@@ -121,9 +126,13 @@ static float g_vcache[NUM_LAYERS][MAX_SEQ_LEN][V_DIM];
  * CACHEFLUSH_DL1=1 flush (clean+invalidate) dcache, CACHEFLUSH_DL2=2,
  * CACHEFLUSH_DI=4 flush icache. NOTE flags=0 does NOTHING on ARM. */
 #define CACHEFLUSH_DL1 1
+#if defined(__arm__)
 static inline void dcache_range(void* addr, size_t size) {
     syscall(__ARM_NR_cacheflush, (long)addr, (long)addr + size, CACHEFLUSH_DL1);
 }
+#else
+static inline void dcache_range(void* addr, size_t size) { (void)addr; (void)size; }
+#endif
 static inline void dcache_flush(void* addr, size_t size) { dcache_range(addr, size); }
 static inline void dcache_inval(void* addr, size_t size) { dcache_range(addr, size); }
 
@@ -206,9 +215,12 @@ static Tensor* get_tensor(const char* name) {
 
 static inline float f16_to_f32(uint16_t v) {
     uint32_t sign = (v >> 15) & 1, exp = (v >> 10) & 0x1F, mant = v & 0x3FF;
-    if (exp == 0) return (mant==0)?0.0f:((sign?-1:1)*mant/1024.0f*0.00006103515625f);
+    /* Use float ternary for sign so -1.0f*mant does NOT wrap unsigned:
+     * (sign?-1:1)*mant (int * uint32) overflows for negative subnormals,
+     * decoding e.g. 0x80ac as +256.0 instead of -1.03e-5. Matches sim. */
+    if (exp == 0) return (mant==0)?0.0f:((sign ? -1.0f : 1.0f) * (mant / 1024.0f) * 0.00006103515625f);
     if (exp==31) return mant?0.0f:(sign?-INFINITY:INFINITY);
-    return (sign?-1:1)*ldexpf(1.0f+mant/1024.0f, (int)exp-15);
+    return (sign?-1.0f:1.0f)*ldexpf(1.0f+mant/1024.0f, (int)exp-15);
 }
 
 static float dequant(const Tensor* t, uint64_t idx) {
@@ -237,12 +249,14 @@ static float dequant(const Tensor* t, uint64_t idx) {
         float super = f16_to_f32(*(uint16_t*)(d+bo+208));
         uint64_t wi = idx%256;
         int half=wi/128, pos=wi%128, l=pos%32, sub=pos/32;
-        int lo = half*64 + l + (sub%2)*32;
+        /* ql/qh/scale reads MUST add bo (block base): only the super scale
+         * did before, so blocks >= 1 read block 0's ql/qh/scales -> garbage. */
+        int lo = bo + half*64 + l + (sub%2)*32;
         int ql = (d[lo]>>((sub<2)?0:4)) & 0xF;
-        int qh = (d[128+half*32+l]>>(sub*2)) & 3;
+        int qh = (d[bo+128+half*32+l]>>(sub*2)) & 3;
         /* `-32` applies to the FULL (qh<<4)|ql value (fixes | vs - precedence) */
         int q = (int)((qh<<4)|ql) - 32;
-        return super * (float)(int8_t)d[192+half*8+(l/16)+sub*2] * (float)q;
+        return super * (float)(int8_t)d[bo+192+half*8+(l/16)+sub*2] * (float)q;
     }
     if (t->type == TENSOR_Q4_K) {
         uint64_t bo = (idx/256)*144;
@@ -398,13 +412,20 @@ static float quantize(const float* x, int16_t* xq, int n) {
 // These replicate the exact integer/fixed-point arithmetic of the Q8/Q5 cores,
 // so FPGA raw accumulators can be compared against a float-free reference.
 
-// f16 -> S24.16 (1.0 -> 65536), sign-agnostic, bit-exact port of the Verilog.
+// f16 -> S24.16 (1.0 -> 65536), bit-exact port of the Verilog f16_decode.
+// SIGN-HANDLING (2026-08-14): llama.cpp quantizes Q5_0 with the negative-d
+// trick (d = max/-16); ~50% of real blocks have negative d, and dequant
+// (q-16)·d requires the sign. Bit 15 negates the magnitude (matches the fixed
+// matmul_q5_0_core.v f16_decode; was previously sign-agnostic and flipped the
+// sign of every weight in negative-d blocks).
 static inline int32_t f16_decode_s2416(uint16_t f16) {
     int32_t exp  = (f16 >> 10) & 0x1F;
     int32_t mant = f16 & 0x3FF;
-    if (exp == 0 || exp == 31) return 0;
-    if (exp >= 9) return (1024 + mant) << (exp - 9);
-    return ((1024 + mant) + (1 << (8 - exp))) >> (9 - exp);
+    int32_t mag;
+    if (exp == 0 || exp == 31) mag = 0;
+    else if (exp >= 9) mag = (1024 + mant) << (exp - 9);
+    else mag = ((1024 + mant) + (1 << (8 - exp))) >> (9 - exp);
+    return (f16 & 0x8000) ? -mag : mag;
 }
 
 // Q8 combined scale for weight (row, col): UQ8.8 = round(block_scale/row_scale*256).
@@ -494,6 +515,30 @@ static int fpga_q8_tile(const Tensor* A, const uint8_t* wt, const int16_t* xq,
 
     uint32_t* r = (uint32_t*)ddr(FPGA_WEIGHT_REFMT+Q8_TILE_STRIDE+0x10000);
     dcache_inval(r, nrows*8);
+
+    /* ---- Q8 first-run warm-up (2026-08-14) ----
+     * Root cause (hardware-verified): a Q8 descriptor processed immediately
+     * after a Q5_0 descriptor produces corrupted results on rows 16-63 (acc
+     * bank groups g=2..7). Re-running the identical descriptor produces
+     * bit-exact correct results (verified via rerun + per-group isolation:
+     * grp14 fpga == golden exactly). The corruption is stale FSM/core state
+     * left by the Q5->Q8 transition that is cleared by the first Q8 compute.
+     *
+     * Mitigation: run every Q8 descriptor twice (warm-up + real). The first
+     * run clears the stale state and its result is discarded; the second run
+     * is bit-exact correct. This adds one extra chain_run per Q8 tile (2x
+     * cost on Q8 matmuls: attn_v + logits), which is small vs the Q5/Q6/Q4
+     * CPU-side work. */
+    {
+        /* The descriptor and DDR data are already set up above (weights/scales/
+         * acts copied + flushed, descriptor written). Run once as warm-up to
+         * clear any stale FSM state left by a preceding Q5_0 descriptor. */
+        if (chain_run(DESC_CHAIN_BASE, 1) < 0) return -1;
+    }
+
+    if (chain_run(DESC_CHAIN_BASE, 1) < 0) return -1;
+    dcache_inval(r, nrows*8);
+
     int64_t max_raw_diff = 0; int max_raw_row = -1;
     for (int i=0; i<nrows; i++) {
         uint64_t raw = (uint64_t)r[i*2] | ((uint64_t)r[i*2+1]<<32);
@@ -507,8 +552,10 @@ static int fpga_q8_tile(const Tensor* A, const uint8_t* wt, const int16_t* xq,
                    (double)row_scale[i]);
         /* raw = dequant*act sum. scales include row_inv normalization.
          * dequant = (q8 * sc) >> 8 already removes the UQ8.8 factor,
-         * so no /256 needed (unlike Q5 which accumulates at 256x). */
-        y[row0+i] += (float)(int32_t)raw_s * x_scale * row_scale[i];
+         * so no /256 needed (unlike Q5 which accumulates at 256x).
+         * raw_s is S48; cast to float directly (not int32) so large row sums
+         * (|raw| > 2^31) do not wrap. */
+        y[row0+i] += (float)raw_s * x_scale * row_scale[i];
     }
     if (g_compare && max_raw_diff > 0)
         printf("    [q8 RAWDIFF] max=%lld at row=%d\n",
@@ -548,8 +595,10 @@ static int fpga_q5_tile(const Tensor* A, int row0, const int16_t* xq,
             printf("    [q5 r0=%d] acc=%lld gold=%lld  xs=%.6f\n",
                    row0, raw_s, (long long)gold[i], (double)x_scale);
         /* d_pre = f16_decode(d) = 65536·d (S24.16, ri=1.0). raw = Σ 65536·d·q5·act.
-         * y = raw·x_scale/65536 = Σ d·q5·x. */
-        y[row0+i] += (float)(int32_t)raw_s * x_scale / 65536.0f;
+         * y = raw·x_scale/65536 = Σ d·q5·x.
+         * raw_s is S48; cast to float directly (not int32) so large row sums
+         * (|raw| > 2^31) do not wrap. */
+        y[row0+i] += (float)raw_s * x_scale / 65536.0f;
     }
     if (g_compare && max_raw_diff > 0)
         printf("    [q5 RAWDIFF] max=%lld at row=%d\n",
@@ -654,7 +703,7 @@ static void attention(float* ctx, float* qv, int layer, int pos, int seqlen) {
         float scores[MAX_SEQ_LEN];
         float ms = -1e10f;
         for (int p=0; p<=pos; p++) {
-            float* kc = g_kcache[layer][p] + kv*HEAD_DIM;
+            float* kc = g_akc[layer][p] + kv*HEAD_DIM;
             float s = 0;
             for (int d=0; d<HEAD_DIM; d++) s += qd[d] * kc[d];
             scores[p] = s / sqrtf(HEAD_DIM);
@@ -664,7 +713,7 @@ static void attention(float* ctx, float* qv, int layer, int pos, int seqlen) {
         for (int p=0; p<=pos; p++) se += expf(scores[p] - ms);
         float ls = logf(se) + ms;
         for (int p=0; p<=pos; p++) {
-            float* vc = g_vcache[layer][p] + kv*HEAD_DIM;
+            float* vc = g_avc[layer][p] + kv*HEAD_DIM;
             float w = expf(scores[p] - ls);
             for (int d=0; d<HEAD_DIM; d++) ch[d] += w * vc[d];
         }
@@ -724,8 +773,8 @@ static void forward_layer(float* hidden, int layer, int pos) {
     }
 
     rope(qv, kv, pos);
-    memcpy(g_kcache[layer][pos], kv, K_DIM*4);
-    memcpy(g_vcache[layer][pos], vv, V_DIM*4);
+    memcpy(g_akc[layer][pos], kv, K_DIM*4);
+    memcpy(g_avc[layer][pos], vv, V_DIM*4);
     attention(ctx, qv, layer, pos, pos+1);
 
     if ((t = get_tensor((fmt_name(name,layer,"attn_output.weight"),name))))
@@ -751,6 +800,42 @@ static void forward_layer(float* hidden, int layer, int pos) {
 }
 
 // ===== Inference Loop =====
+/* --trace: run FPGA + CPU paths per layer with separate KV caches, print
+ * a one-line hidden-state summary per layer so we can see where they diverge. */
+static int run_trace(const int* prompt, int np) {
+    memset(g_kcache, 0, sizeof(g_kcache));
+    memset(g_vcache, 0, sizeof(g_vcache));
+    memset(g_kcache_cpu, 0, sizeof(g_kcache_cpu));
+    memset(g_vcache_cpu, 0, sizeof(g_vcache_cpu));
+
+    Tensor* emb = get_tensor("token_embd.weight");
+    if (!emb) { fprintf(stderr,"No token_embd.weight\n"); return -1; }
+    float hidden[HIDDEN_DIM];      /* FPGA path running state */
+    float h_cpu[HIDDEN_DIM];       /* CPU  path running state */
+    for (int i=0;i<HIDDEN_DIM;i++)
+        hidden[i] = h_cpu[i] = dequant(emb, (uint64_t)prompt[0]*HIDDEN_DIM+i);
+
+    printf("Trace: per-layer hidden state, FPGA vs CPU (token %d)\n", prompt[0]);
+    printf("      %-4s %-22s %-22s %s\n", "L", "fpga", "cpu", "maxdiff");
+    for (int l=0; l<NUM_LAYERS; l++) {
+        g_use_cpu = 0; g_akc = g_kcache;      g_avc = g_vcache;
+        forward_layer(hidden, l, 0);
+        g_use_cpu = 1; g_akc = g_kcache_cpu;  g_avc = g_vcache_cpu;
+        forward_layer(h_cpu, l, 0);
+
+        double nf=0, nc=0; float md=0;
+        for (int i=0;i<HIDDEN_DIM;i++) {
+            nf += (double)hidden[i]*hidden[i];
+            nc += (double)h_cpu[i]*h_cpu[i];
+            float d = hidden[i]-h_cpu[i]; if (d<0) d=-d; if (d>md) md=d;
+        }
+        printf("  %-4d n=%9.2f h0=%+9.5f n=%9.2f h0=%+9.5f %12.5f\n",
+               l, sqrt(nf), hidden[0], sqrt(nc), h_cpu[0], md);
+        fflush(stdout);
+    }
+    return 0;
+}
+
 static int run_inference(const int* prompt, int np) {
     memset(g_kcache, 0, sizeof(g_kcache));
     memset(g_vcache, 0, sizeof(g_vcache));
@@ -767,23 +852,14 @@ static int run_inference(const int* prompt, int np) {
         for (int l=0; l<NUM_LAYERS; l++) forward_layer(hidden, l, t);
     }
 
-    int seqlen = np;
     int ntokens = 0;
     int output[MAX_SEQ_LEN*2];
-    int token = 151646; /* BOS */
 
     for (int gen=0; gen<10; gen++) {
         int pos = np + gen;
         if (pos >= MAX_SEQ_LEN) break;
 
-        Tensor* emb = get_tensor("token_embd.weight");
-        if (emb) for (int i=0;i<HIDDEN_DIM;i++)
-            hidden[i] = dequant(emb, (uint64_t)token*HIDDEN_DIM+i);
-        else memset(hidden, 0, sizeof(hidden));
-
-        for (int l=0; l<NUM_LAYERS; l++) forward_layer(hidden, l, pos);
-
-        /* Logits */
+        /* Logits from current hidden state (prompt's last token on gen 0) */
         Tensor* norm = get_tensor("output_norm.weight");
         float norm_hid[HIDDEN_DIM];
         if (norm) rms_norm(norm_hid, hidden, HIDDEN_DIM, norm);
@@ -792,7 +868,6 @@ static int run_inference(const int* prompt, int np) {
         Tensor* emb_w = get_tensor("token_embd.weight");
         if (!emb_w) { fprintf(stderr,"No token_embd.weight\n"); break; }
 
-        /* Compute logits for first few tokens only (sampling) */
         int best=0; float best_v=-1e10f;
         for (int i=0; i<VOCAB_SIZE; i++) {
             float s=0;
@@ -801,10 +876,18 @@ static int run_inference(const int* prompt, int np) {
             logits[i] = s;
             if (s > best_v) { best_v=s; best=i; }
         }
-        token = best;
-        output[ntokens++] = token;
-        printf("  token %d: %d\n", gen, token);
-        if (token == 151643) break; /* EOS */
+
+        output[ntokens++] = best;
+        printf("  token %d: %d\n", gen, best);
+        if (best == 151643) break; /* EOS */
+
+        /* Embed the sampled token and forward at pos for the next iteration */
+        Tensor* emb = get_tensor("token_embd.weight");
+        if (emb) for (int i=0;i<HIDDEN_DIM;i++)
+            hidden[i] = dequant(emb, (uint64_t)best*HIDDEN_DIM+i);
+        else memset(hidden, 0, sizeof(hidden));
+
+        for (int l=0; l<NUM_LAYERS; l++) forward_layer(hidden, l, pos);
     }
     return ntokens;
 }
@@ -815,89 +898,105 @@ int main(int argc, char** argv) {
 
     /* --cpu flag: run every matmul on the CPU (no FPGA) for A/B comparison */
     /* --compare flag: run both CPU+FPGA per matmul and print the diff */
+    /* --trace flag: per-layer hidden-state comparison (FPGA vs CPU) */
     /* --selftest: minimal CPU_OP DDR copy (isolates PL DDR path from compute) */
     const char* model_path = NULL;
-    int prompt_token = 151646;
+    int prompt[256];
+    int np = 0;
     int do_selftest = 0;
+    int do_trace = 0;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--cpu") == 0) {
             g_use_cpu = 1;
         } else if (strcmp(argv[i], "--compare") == 0) {
             g_compare = 1;
+        } else if (strcmp(argv[i], "--trace") == 0) {
+            do_trace = 1;
         } else if (strcmp(argv[i], "--selftest") == 0) {
             do_selftest = 1;
         } else if (model_path == NULL) {
             model_path = argv[i];          /* first non-flag arg = model */
-        } else {
-            prompt_token = atoi(argv[i]);  /* optional token id */
+        } else if (np < 256) {
+            prompt[np++] = atoi(argv[i]);  /* optional prompt token ids */
         }
     }
+    if (np == 0) prompt[np++] = 151646;    /* default: bare prompt token */
     if (g_use_cpu) printf("CPU-only mode (--cpu): FPGA matmuls forced to CPU\n");
     if (g_compare) printf("Compare mode (--compare): CPU vs FPGA per matmul\n");
-
-    g_gp0 = map_mem(IP_BASE, 0x10000);
-    if (!g_gp0) return 1;
-    if (map_ddr() < 0) return 1;
+    if (do_trace) printf("Trace mode (--trace): per-layer hidden-state FPGA vs CPU\n");
+    printf("Prompt tokens: %d (", np);
+    for (int i = 0; i < np; i++) printf("%s%d", i ? " " : "", prompt[i]);
+    printf(")\n");
 
     g_scratch = (float*)malloc(0x40000); /* 256KB scratch */
     if (!g_scratch) { fprintf(stderr,"No memory\n"); return 1; }
 
-    /* Init FPGA CPU_OP registers */
-    reg_write(REG_Q8_NUM_GROUPS, 14);
-    reg_write(REG_CHAIN_CTRL, CHAIN_CTRL_INTR_ENABLE);
-    reg_write(REG_GIE, 1);
-    reg_write(REG_ISR, 1);
-    printf("FPGA initialized: CHAIN_CTRL=0x%08x\n", reg_read(REG_CHAIN_CTRL));
+    if (g_use_cpu) {
+        printf("CPU-only mode: skipping FPGA init\n");
+    } else {
+        g_gp0 = map_mem(IP_BASE, 0x10000);
+        if (!g_gp0) return 1;
+        if (map_ddr() < 0) return 1;
 
-    /* Enable AFI0 HP0 slave port (both read and write channels). SD boot
-     * does not configure AFI — only bare-metal JTAG scripts do. Without
-     * this the PL's HP0 port cannot reach DDR at all.
-     * NOTE: AFI0 registers are at SLCR offset 0x8000-0x8008 — the SLCR
-     * map must cover 0x10000 (64KB) to reach them (not just 0x1000!). */
-    {
-        volatile uint32_t* slcr = map_mem(0xF8000000, 0x10000);
-        if (!slcr) { fprintf(stderr,"Cannot map SLCR\n"); return 1; }
-        slcr[0x0008/4] = 0x0000DF0D;      /* unlock SLCR (SLCR_UNLOCK) */
-        slcr[0x8000/4] = 0x00000005;      /* AFI0_CTRL: enable + SLVERR */
-        slcr[0x8008/4] = 0x00000001;      /* AFI0_WRCHAN: write enable */
-        slcr[0x0004/4] = 0x0000767B;      /* lock SLCR (SLCR_LOCK) */
-        printf("AFI0 enabled (CTRL=0x%08lx WRCHAN=0x%08lx)\n",
-               (unsigned long)slcr[0x8000/4], (unsigned long)slcr[0x8008/4]);
-    }
+        /* Init FPGA CPU_OP registers */
+        reg_write(REG_Q8_NUM_GROUPS, 14);
+        reg_write(REG_CHAIN_CTRL, CHAIN_CTRL_INTR_ENABLE);
+        reg_write(REG_GIE, 1);
+        reg_write(REG_ISR, 1);
+        printf("FPGA initialized: CHAIN_CTRL=0x%08x\n", reg_read(REG_CHAIN_CTRL));
 
-    if (do_selftest) {
-        /* passthrough mode: clear intr-enable so CPU_OP does plain copy */
-        reg_write(REG_CHAIN_CTRL, 0);
-        uint32_t act  = 0x1F002000;
-        uint32_t res  = 0x1F003000;
-        /* write 8 known words to act */
-        for (int i = 0; i < 8; i++) *(uint32_t*)ddr(act + i*4) = 0x11110000 + i;
-        /* sentinel in result */
-        for (int i = 0; i < 8; i++) *(uint32_t*)ddr(res + i*4) = 0xDEADBEEF;
-        dcache_flush(ddr(act), 32);
-        dcache_flush(ddr(res), 32);
-
-        Descriptor* d = (Descriptor*)ddr(DESC_CHAIN_BASE);
-        desc_write(d, 0, 0, act, res, DESC_CPU_OP, 0, 1, 32);
-        if (chain_run(DESC_CHAIN_BASE, 1) < 0) return 1;
-        dcache_inval(ddr(res), 32);
-        int ok = 1;
-        printf("CPU_OP selftest: act[0..7] -> res[0..7]\n");
-        for (int i = 0; i < 8; i++) {
-            uint32_t a = *(uint32_t*)ddr(act + i*4);
-            uint32_t r = *(uint32_t*)ddr(res + i*4);
-            printf("  [%d] act=0x%08x res=0x%08x %s\n", i, a, r,
-                   (a == r) ? "OK" : "** MISMATCH **");
-            if (a != r) ok = 0;
+        /* Enable AFI0 HP0 slave port (both read and write channels). SD boot
+         * does not configure AFI — only bare-metal JTAG scripts do. Without
+         * this the PL's HP0 port cannot reach DDR at all.
+         * NOTE: AFI0 registers are at SLCR offset 0x8000-0x8008 — the SLCR
+         * map must cover 0x10000 (64KB) to reach them (not just 0x1000!). */
+        {
+            volatile uint32_t* slcr = map_mem(0xF8000000, 0x10000);
+            if (!slcr) { fprintf(stderr,"Cannot map SLCR\n"); return 1; }
+            slcr[0x0008/4] = 0x0000DF0D;      /* unlock SLCR (SLCR_UNLOCK) */
+            slcr[0x8000/4] = 0x00000005;      /* AFI0_CTRL: enable + SLVERR */
+            slcr[0x8008/4] = 0x00000001;      /* AFI0_WRCHAN: write enable */
+            slcr[0x0004/4] = 0x0000767B;      /* lock SLCR (SLCR_LOCK) */
+            printf("AFI0 enabled (CTRL=0x%08lx WRCHAN=0x%08lx)\n",
+                   (unsigned long)slcr[0x8000/4], (unsigned long)slcr[0x8008/4]);
         }
-        printf("CPU_OP selftest: %s\n", ok ? "PASS" : "FAIL");
-        return ok ? 0 : 1;
+
+        if (do_selftest) {
+            /* passthrough mode: clear intr-enable so CPU_OP does plain copy */
+            reg_write(REG_CHAIN_CTRL, 0);
+            uint32_t act  = 0x1F002000;
+            uint32_t res  = 0x1F003000;
+            /* write 8 known words to act */
+            for (int i = 0; i < 8; i++) *(uint32_t*)ddr(act + i*4) = 0x11110000 + i;
+            /* sentinel in result */
+            for (int i = 0; i < 8; i++) *(uint32_t*)ddr(res + i*4) = 0xDEADBEEF;
+            dcache_flush(ddr(act), 32);
+            dcache_flush(ddr(res), 32);
+
+            Descriptor* d = (Descriptor*)ddr(DESC_CHAIN_BASE);
+            desc_write(d, 0, 0, act, res, DESC_CPU_OP, 0, 1, 32);
+            if (chain_run(DESC_CHAIN_BASE, 1) < 0) return 1;
+            dcache_inval(ddr(res), 32);
+            int ok = 1;
+            printf("CPU_OP selftest: act[0..7] -> res[0..7]\n");
+            for (int i = 0; i < 8; i++) {
+                uint32_t a = *(uint32_t*)ddr(act + i*4);
+                uint32_t r = *(uint32_t*)ddr(res + i*4);
+                printf("  [%d] act=0x%08x res=0x%08x %s\n", i, a, r,
+                       (a == r) ? "OK" : "** MISMATCH **");
+                if (a != r) ok = 0;
+            }
+            printf("CPU_OP selftest: %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
     }
 
-    if (!model_path) { fprintf(stderr,"Usage: %s [--cpu|--compare|--selftest] model.tmac [token]\n", argv[0]); return 1; }
+    if (!model_path) { fprintf(stderr,"Usage: %s [--cpu|--compare|--trace|--selftest] model.tmac [token ...]\n", argv[0]); return 1; }
     if (load_model(model_path) < 0) return 1;
 
-    int tokens = run_inference(&prompt_token, 1);
+    if (do_trace) return run_trace(prompt, np);
+
+    int tokens = run_inference(prompt, np);
     printf("\nGenerated %d tokens\n", tokens);
     return 0;
 }

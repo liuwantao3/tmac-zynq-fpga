@@ -3,7 +3,7 @@
 Multi-core Verilog RTL accelerator for Qwen2-0.5B-Instruct inference on the
 MicroPhase Z7-Lite (xc7z010clg400-1). All 6 compute cores + HP descriptor-chain
 DMA engine **synthesized and verified on hardware**: 10 comprehensive HW tests
-PASS, 5/5 bare-metal FPGA-core tests PASS, 18 HP FSM simulation tests + core
+PASS, 13 bare-metal FPGA-core tests PASS, 22 HP FSM simulation tests + core
 unit tests PASS.
 
 | Component | Status |
@@ -14,7 +14,7 @@ unit tests PASS.
 | Q4_K core (56×256 block decode) | 4/4 sim |
 | Q6_K core (32×256 block decode) | 97/97 sim |
 | INT16 core (64×64 general) | Sim only (pre-existing wmem bug) |
-| Bare-metal ARM port (`vivado_integration/sw/tmac_baremetal`) | `test_fpga_cores` 5/5 HW PASS |
+| Bare-metal ARM port (`vivado_integration/sw/tmac_baremetal`) | `test_fpga_cores` 13 tests in source (10 HW-verified through 2026-08-13, incl. bit-exact Q5 golden + Q8 patterns) |
 | C++ inference engine (`sim/tmac_gguf`) | FP32 < 0.0003 vs ground truth |
 | Linux-on-SD boot (`linux/`) | SD boot verified on HW to interactive shell (2026-08-11) |
 | JTAG bring-up helpers (`linux/scripts/`) | U-Boot/kernel debug scripts (SD boot is the proven path) |
