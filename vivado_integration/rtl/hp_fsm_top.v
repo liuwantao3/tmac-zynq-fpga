@@ -291,12 +291,29 @@ module hp_fsm_top (
     reg [15:0] q5_blk_d1;
     reg [31:0] q5_blk_qh1;
     reg [127:0] q5_blk_qs1;
+    // ---- Step 3b: second unpack buffer (B) + buffer management ----
+    reg [15:0] q5_blkB_d0;
+    reg [31:0] q5_blkB_qh0;
+    reg [127:0] q5_blkB_qs0;
+    reg [15:0] q5_blkB_d1;
+    reg [31:0] q5_blkB_qh1;
+    reg [127:0] q5_blkB_qs1;
+    reg        q5_bufA_busy;   // A committed to a block (filling or full-undispatched)
+    reg        q5_bufA_full;   // A holds a complete 6-word block
+    reg        q5_bufB_busy;
+    reg        q5_bufB_full;
+    reg [5:0]  q5_bufA_blk;    // block index read into A
+    reg [5:0]  q5_bufB_blk;    // block index read into B
+    reg [5:0]  q5_unpack_blk;  // block index whose data is currently unpacking
+    reg        q5_pulse_buf;   // buffer whose data is being pulsed to the cores
+    reg        q5_pulse_arm;   // pulse armed (buffer selected); pulse next cycle
+    reg [5:0]  q5_pulse_blk;   // block index being pulsed
     reg        q5_blk_valid;
     reg        q5_blk_valid_pulsed;
     reg        q5_act_we;
     reg [9:0]  q5_act_addr;
     reg [15:0] q5_act_din;
-    reg [5:0]  q5_blk_counter;      // block counter (0..55)
+    reg [5:0]  q5_blk_counter;      // fetch pointer: next block to read (0..55)
     reg [15:0] q5_num_tiles;        // total tiles per descriptor
     reg [15:0] q5_tile_counter;     // current tile index
 
@@ -315,12 +332,21 @@ module hp_fsm_top (
     wire [4:0]  q5_core0_wi,     q5_core1_wi;
     wire [47:0] q5_core0_res0, q5_core0_res1, q5_core1_res0, q5_core1_res1;
 
+    // Core blk_d/qh/qs come from the buffer selected by q5_pulse_buf (set in the
+    // arm cycle before the blk_valid pulse, so the mux is stable at the pulse).
+    wire [15:0]  q5_core0_d  = q5_pulse_buf ? q5_blkB_d0 : q5_blk_d0;
+    wire [31:0]  q5_core0_qh = q5_pulse_buf ? q5_blkB_qh0 : q5_blk_qh0;
+    wire [127:0] q5_core0_qs = q5_pulse_buf ? q5_blkB_qs0 : q5_blk_qs0;
+    wire [15:0]  q5_core1_d  = q5_pulse_buf ? q5_blkB_d1 : q5_blk_d1;
+    wire [31:0]  q5_core1_qh = q5_pulse_buf ? q5_blkB_qh1 : q5_blk_qh1;
+    wire [127:0] q5_core1_qs = q5_pulse_buf ? q5_blkB_qs1 : q5_blk_qs1;
+
     matmul_q5_0_core u_q5_core0 (
         .clk(clk), .rst_n(rst_n),
         .core_id(1'b0),
         .done(q5_done0), .busy(q5_busy0),
         .norm_we(q5_norm_we), .norm_addr(q5_norm_addr), .norm_din(q5_norm_din),
-        .blk_d(q5_blk_d0), .blk_qh(q5_blk_qh0), .blk_qs(q5_blk_qs0),
+        .blk_d(q5_core0_d), .blk_qh(q5_core0_qh), .blk_qs(q5_core0_qs),
         .blk_valid(q5_blk_valid),
         .act_we(q5_act_we), .act_addr(q5_act_addr), .act_din(q5_act_din),
         .clr_acc(q5_clr_acc),
@@ -336,7 +362,7 @@ module hp_fsm_top (
         .core_id(1'b1),
         .done(q5_done1), .busy(q5_busy1),
         .norm_we(q5_norm_we), .norm_addr(q5_norm_addr), .norm_din(q5_norm_din),
-        .blk_d(q5_blk_d1), .blk_qh(q5_blk_qh1), .blk_qs(q5_blk_qs1),
+        .blk_d(q5_core1_d), .blk_qh(q5_core1_qh), .blk_qs(q5_core1_qs),
         .blk_valid(q5_blk_valid),
         .act_we(q5_act_we), .act_addr(q5_act_addr), .act_din(q5_act_din),
         .clr_acc(q5_clr_acc),
@@ -433,7 +459,7 @@ module hp_fsm_top (
             if (q5_blk_valid && !q5_blk_valid_r && q5_wi_arm) begin
                 reg_q5_dbg_wi_start <= {q5_core0_wi, q5_core1_wi,
                                         3'b0, 3'b0,
-                                        10'b0, q5_blk_counter[5:0]};
+                                        10'b0, q5_pulse_blk[5:0]};
                 q5_wi_arm <= 0;
             end
         end
@@ -447,6 +473,8 @@ module hp_fsm_top (
     reg [9:0]  q5_copy_act_idx;     // activation copy index (0..895)
     reg [3:0]  q5_unpack_word;      // which 64-bit rd_data word being captured (0..5)
     reg [5:0]  q5_dispatched;       // block index last pulsed to the cores (63 = none)
+    // Next block the cores expect, in dispatch order (core act addressing is pulse-order).
+    wire [5:0] q5_next_expected = (q5_dispatched == 6'd63) ? 6'd0 : q5_dispatched + 6'd1;
     reg        q5_done_pending;     // latched core-compute-done (q5_done_rise) for overlap dispatch
     reg        q5_last_pulsed;      // set when block 55 is dispatched (no more fetches)
 
@@ -650,6 +678,12 @@ module hp_fsm_top (
             q5_norm_we      <= 0; q5_norm_addr <= 0; q5_norm_din <= 0;
             q5_blk_d0       <= 16'd0; q5_blk_qh0 <= 32'd0; q5_blk_qs0 <= 128'd0;
             q5_blk_d1       <= 16'd0; q5_blk_qh1 <= 32'd0; q5_blk_qs1 <= 128'd0;
+            q5_blkB_d0      <= 16'd0; q5_blkB_qh0 <= 32'd0; q5_blkB_qs0 <= 128'd0;
+            q5_blkB_d1      <= 16'd0; q5_blkB_qh1 <= 32'd0; q5_blkB_qs1 <= 128'd0;
+            q5_bufA_busy    <= 0; q5_bufA_full <= 0; q5_bufA_blk <= 0;
+            q5_bufB_busy    <= 0; q5_bufB_full <= 0; q5_bufB_blk <= 0;
+            q5_unpack_blk   <= 0; q5_pulse_buf <= 0; q5_pulse_arm <= 0;
+            q5_pulse_blk    <= 0;
             q5_blk_valid    <= 0;
             q5_blk_valid_pulsed <= 0;
             q5_act_we       <= 0; q5_act_addr <= 0; q5_act_din <= 0;
@@ -1080,24 +1114,28 @@ module hp_fsm_top (
                 end
 
                 Q5_BLOCK_COMPUTE: begin
-                    // Issue the FIRST block read (block 0). Subsequent reads are
-                    // issued by the overlap dispatch in Q5_BLOCK_COMPUTE_W while the
-                    // previous block computes (Step 2, 2026-08-17).
-                    rd_addr <= weight_addr + q5_tile_counter * 2696 + q5_blk_counter * 48;
-                    rd_len <= 8'd11;    // 12 beats × 4 bytes = 48 bytes
+                    // Issue the FIRST block read (block 0 into buffer A). Subsequent
+                    // reads are issued by the read-ahead in Q5_BLOCK_COMPUTE_W as
+                    // buffers free up (Step 3b, 2026-08-17).
+                    rd_addr <= weight_addr + q5_tile_counter * 2696;   // block 0
+                    rd_len <= 8'd11;    // 12 beats x 4 bytes = 48 bytes
                     rd_start <= 1;      // pulse start for read master
                     q5_unpack_cnt <= 0;
                     q5_unpack_word <= 0;
                     q5_blk_valid_pulsed <= 0;
-                    q5_dispatched <= 6'd63;  // no block dispatched yet
+                    q5_bufA_busy <= 1; q5_bufA_full <= 0; q5_bufA_blk <= 6'd0;
+                    q5_bufB_busy <= 0; q5_bufB_full <= 0;
+                    q5_unpack_blk  <= 6'd0;    // block 0 data unpacks first
+                    q5_pulse_arm   <= 0;
+                    q5_pulse_buf   <= 1'b0;
+                    q5_dispatched  <= 6'd63;   // no block dispatched yet
                     q5_done_pending <= 0;
                     q5_last_pulsed <= 0;
+                    q5_blk_counter <= 6'd1;    // next block to read (block 0 in flight)
                     sc_burst_done <= 0;
-                    timeout_cnt <= 0;   // reset timeout counter at entry
-                    if (q5_blk_counter == 0) begin
-                        q5_clr_acc <= 1;  // DSP flush: prod forced to 0 while set
-                        q5_clr_acc_cnt <= 16;  // hold for 16 more cycles
-                    end
+                    timeout_cnt <= 0;
+                    q5_clr_acc <= 1;           // DSP flush (always at tile start)
+                    q5_clr_acc_cnt <= 16;
                     state <= Q5_BLOCK_COMPUTE_W;
                 end
 
@@ -1108,8 +1146,42 @@ module hp_fsm_top (
                     end else begin
                         q5_clr_acc <= 0;
                     end
-                    // rd_start stays high until read master accepts (default clears it next cycle)
-                    // Capture rd_data words and unpack into core d/qh/qs
+
+                    // ---- read-ahead: issue the next block read as soon as its
+                    //      target buffer is free, so consecutive 48-B reads pipeline
+                    //      through the (3a) read master. Block N -> buffer N%2.
+                    //      Gate on !rd_start: the read master accepts a start on its
+                    //      rising edge, and the block-0 issue in Q5_BLOCK_COMPUTE
+                    //      leaves rd_start high for exactly one cycle. Without the
+                    //      gap, the block-1 issue collides and its start is silently
+                    //      dropped (master reads 0,2,3,...,55 -> pipeline shifts by 1,
+                    //      block 55 never fills -> timeout). Steady state is unaffected
+                    //      (buffers free >= 34 cycles apart).
+                    if (!rd_start &&
+                        q5_blk_counter < 56 &&
+                        ((q5_blk_counter[0] == 1'b0 && !q5_bufA_busy) ||
+                         (q5_blk_counter[0] == 1'b1 && !q5_bufB_busy))) begin
+                        rd_addr   <= weight_addr + q5_tile_counter * 2696
+                                   + q5_blk_counter * 48;
+                        rd_len    <= 8'd11;
+                        rd_start  <= 1;
+                        q5_unpack_cnt <= 0;
+                        sc_burst_done <= 0;
+                        timeout_cnt   <= 0;
+                        if (q5_blk_counter[0] == 1'b0) begin
+                            q5_bufA_busy <= 1;
+                            q5_bufA_blk  <= q5_blk_counter;
+                        end else begin
+                            q5_bufB_busy <= 1;
+                            q5_bufB_blk  <= q5_blk_counter;
+                        end
+                        q5_blk_counter <= q5_blk_counter + 1;
+                    end
+
+                    // ---- capture rd_data words and unpack into the target buffer.
+                    //      The target is derived EXPLICITLY from the block index being
+                    //      unpacked (q5_unpack_blk), not a free-running flip, so the
+                    //      buffer assignment (N%2) can never drift.
                     if (!rd_unpack_active && q5_unpack_word < 6) begin
                         rd_ready <= rd_valid;
                         if (rd_valid && rd_ready) begin
@@ -1118,74 +1190,122 @@ module hp_fsm_top (
                         end
                     end else if (rd_unpack_active && q5_unpack_word < 6) begin
                         rd_ready <= 0;
-                        case (q5_unpack_word)
-                            0: begin q5_blk_d0   <= rd_unpack_buf[15:0];
-                                   q5_blk_qh0[15:0]  <= rd_unpack_buf[31:16];
-                                   q5_blk_qh0[31:16] <= rd_unpack_buf[47:32];
-                                   q5_blk_qs0[15:0]  <= rd_unpack_buf[63:48]; end
-                            1: begin q5_blk_qs0[31:16] <= rd_unpack_buf[15:0];
-                                   q5_blk_qs0[47:32]  <= rd_unpack_buf[31:16];
-                                   q5_blk_qs0[63:48]  <= rd_unpack_buf[47:32];
-                                   q5_blk_qs0[79:64]  <= rd_unpack_buf[63:48]; end
-                            2: begin q5_blk_qs0[95:80]  <= rd_unpack_buf[15:0];
-                                   q5_blk_qs0[111:96] <= rd_unpack_buf[31:16];
-                                   q5_blk_qs0[127:112]<= rd_unpack_buf[47:32];
-                                   q5_blk_d1        <= rd_unpack_buf[63:48]; end
-                            3: begin q5_blk_qh1         <= rd_unpack_buf[31:0];
-                                   q5_blk_qs1[15:0]  <= rd_unpack_buf[47:32];
-                                   q5_blk_qs1[31:16] <= rd_unpack_buf[63:48]; end
-                            4: begin q5_blk_qs1[47:32]  <= rd_unpack_buf[15:0];
-                                   q5_blk_qs1[63:48]  <= rd_unpack_buf[31:16];
-                                   q5_blk_qs1[79:64]  <= rd_unpack_buf[47:32];
-                                   q5_blk_qs1[95:80]  <= rd_unpack_buf[63:48]; end
-                            5: begin q5_blk_qs1[111:96] <= rd_unpack_buf[15:0];
-                                   q5_blk_qs1[127:112]<= rd_unpack_buf[31:16]; end
-                        endcase
+                        if (q5_unpack_blk[0] == 1'b0) begin
+                            case (q5_unpack_word)
+                                0: begin q5_blk_d0   <= rd_unpack_buf[15:0];
+                                       q5_blk_qh0[15:0]  <= rd_unpack_buf[31:16];
+                                       q5_blk_qh0[31:16] <= rd_unpack_buf[47:32];
+                                       q5_blk_qs0[15:0]  <= rd_unpack_buf[63:48]; end
+                                1: begin q5_blk_qs0[31:16] <= rd_unpack_buf[15:0];
+                                       q5_blk_qs0[47:32]  <= rd_unpack_buf[31:16];
+                                       q5_blk_qs0[63:48]  <= rd_unpack_buf[47:32];
+                                       q5_blk_qs0[79:64]  <= rd_unpack_buf[63:48]; end
+                                2: begin q5_blk_qs0[95:80]  <= rd_unpack_buf[15:0];
+                                       q5_blk_qs0[111:96] <= rd_unpack_buf[31:16];
+                                       q5_blk_qs0[127:112]<= rd_unpack_buf[47:32];
+                                       q5_blk_d1        <= rd_unpack_buf[63:48]; end
+                                3: begin q5_blk_qh1         <= rd_unpack_buf[31:0];
+                                       q5_blk_qs1[15:0]  <= rd_unpack_buf[47:32];
+                                       q5_blk_qs1[31:16] <= rd_unpack_buf[63:48]; end
+                                4: begin q5_blk_qs1[47:32]  <= rd_unpack_buf[15:0];
+                                       q5_blk_qs1[63:48]  <= rd_unpack_buf[31:16];
+                                       q5_blk_qs1[79:64]  <= rd_unpack_buf[47:32];
+                                       q5_blk_qs1[95:80]  <= rd_unpack_buf[63:48]; end
+                                5: begin q5_blk_qs1[111:96] <= rd_unpack_buf[15:0];
+                                       q5_blk_qs1[127:112]<= rd_unpack_buf[31:16]; end
+                            endcase
+                        end else begin
+                            case (q5_unpack_word)
+                                0: begin q5_blkB_d0  <= rd_unpack_buf[15:0];
+                                       q5_blkB_qh0[15:0]  <= rd_unpack_buf[31:16];
+                                       q5_blkB_qh0[31:16] <= rd_unpack_buf[47:32];
+                                       q5_blkB_qs0[15:0]  <= rd_unpack_buf[63:48]; end
+                                1: begin q5_blkB_qs0[31:16] <= rd_unpack_buf[15:0];
+                                       q5_blkB_qs0[47:32]  <= rd_unpack_buf[31:16];
+                                       q5_blkB_qs0[63:48]  <= rd_unpack_buf[47:32];
+                                       q5_blkB_qs0[79:64]  <= rd_unpack_buf[63:48]; end
+                                2: begin q5_blkB_qs0[95:80]  <= rd_unpack_buf[15:0];
+                                       q5_blkB_qs0[111:96] <= rd_unpack_buf[31:16];
+                                       q5_blkB_qs0[127:112]<= rd_unpack_buf[47:32];
+                                       q5_blkB_d1        <= rd_unpack_buf[63:48]; end
+                                3: begin q5_blkB_qh1         <= rd_unpack_buf[31:0];
+                                       q5_blkB_qs1[15:0]  <= rd_unpack_buf[47:32];
+                                       q5_blkB_qs1[31:16] <= rd_unpack_buf[63:48]; end
+                                4: begin q5_blkB_qs1[47:32]  <= rd_unpack_buf[15:0];
+                                       q5_blkB_qs1[63:48]  <= rd_unpack_buf[31:16];
+                                       q5_blkB_qs1[79:64]  <= rd_unpack_buf[47:32];
+                                       q5_blkB_qs1[95:80]  <= rd_unpack_buf[63:48]; end
+                                5: begin q5_blkB_qs1[111:96] <= rd_unpack_buf[15:0];
+                                       q5_blkB_qs1[127:112]<= rd_unpack_buf[31:16]; end
+                            endcase
+                        end
                         q5_unpack_word <= q5_unpack_word + 1;
                         rd_unpack_active <= 0;
+                        // 6th word: buffer full, advance the unpack block index,
+                        // restart the word counter for the next block.
+                        if (q5_unpack_word == 5) begin
+                            if (q5_unpack_blk[0] == 1'b0) q5_bufA_full <= 1;
+                            else                       q5_bufB_full <= 1;
+                            q5_unpack_blk  <= q5_unpack_blk + 1;
+                            q5_unpack_word <= 0;
+                        end
                     end
+
                     // Burst tracking: reset timeout on read completion (like LOAD_ACT_W)
                     if (rd_done_rise) begin
                         sc_burst_done <= 1;
                         timeout_cnt <= 0;
                     end
-                    // Latch core-compute-done for the overlap dispatch
-                    // (q5_done_rise is a 1-cycle pulse).
+
+                    // Latch core-compute-done for dispatch (q5_done_rise is 1 cycle).
                     if (q5_done_rise) q5_done_pending <= 1;
-                    // Overlap dispatch (Step 2, 2026-08-17): when the loaded block's
-                    // 6 words are unpacked AND nothing is computing (first block) or
-                    // the previous block's compute is done, pulse blk_valid and
-                    // immediately start fetching the next block. The cores latch
-                    // d/qh/qs on the blk_valid pulse, so the q5_blk_* regs are free
-                    // to be reused - the block g+1 DDR read runs behind block g's
-                    // 37-cycle compute instead of after it.
-                    if (q5_unpack_word == 6 && q5_blk_counter != q5_dispatched &&
-                        (q5_dispatched == 6'd63 || q5_done_pending)) begin
-                        q5_blk_valid <= 1;            // 1-cycle pulse (default-off)
-                        q5_done_pending <= 0;
-                        if (q5_blk_counter < 55) begin
-                            q5_dispatched   <= q5_blk_counter;
-                            q5_blk_counter  <= q5_blk_counter + 1;
-                            rd_addr         <= weight_addr + q5_tile_counter * 2696
-                                             + (q5_blk_counter + 1) * 48;
-                            rd_start        <= 1;     // fetch g+1 while g computes
-                            rd_len          <= 8'd11;
-                            q5_unpack_cnt   <= 0;
-                            q5_unpack_word  <= 0;     // restart unpack for g+1
-                            sc_burst_done   <= 0;
-                            timeout_cnt     <= 0;
-                        end else begin
-                            q5_dispatched   <= 6'd55;
-                            q5_last_pulsed  <= 1;     // block 55 dispatched; no more fetches
-                            timeout_cnt     <= 0;
+
+                    // ---- dispatch: arm the pulse when a full buffer is ready ----
+                    //      First block: no compute to wait; else wait for done_pending.
+                    //      The arm sets q5_pulse_buf one cycle before the pulse so the
+                    //      core-port mux selects the correct buffer at the pulse edge.
+                    //      In-order guard (2026-08-17): the Q5 core addresses activations
+                    //      by its internal pulse-order blk_counter, so blocks MUST pulse
+                    //      strictly in order 0..55. Reads can fill both buffers ahead of
+                    //      compute; the old A-first preference then dispatched block N+2
+                    //      (in A) before block N+1 (in B), multiplying block N+2's weights
+                    //      against the wrong activation segment. Only dispatch the buffer
+                    //      holding the next expected block.
+                    if (!q5_pulse_arm) begin
+                        if (q5_bufA_full && (q5_bufA_blk == q5_next_expected) &&
+                            (q5_dispatched == 6'd63 || q5_done_pending)) begin
+                            q5_pulse_buf <= 1'b0;
+                            q5_pulse_blk <= q5_bufA_blk;
+                            q5_pulse_arm <= 1;
+                        end else if (q5_bufB_full && (q5_bufB_blk == q5_next_expected) &&
+                                     (q5_dispatched == 6'd63 || q5_done_pending)) begin
+                            q5_pulse_buf <= 1'b1;
+                            q5_pulse_blk <= q5_bufB_blk;
+                            q5_pulse_arm <= 1;
                         end
+                    end else begin
+                        // Pulse blk_valid with the selected buffer's data; free it.
+                        q5_blk_valid <= 1;
+                        q5_pulse_arm <= 0;
+                        if (q5_pulse_buf == 1'b0) begin
+                            q5_bufA_busy <= 0;
+                            q5_bufA_full <= 0;
+                        end else begin
+                            q5_bufB_busy <= 0;
+                            q5_bufB_full <= 0;
+                        end
+                        q5_dispatched  <= q5_pulse_blk;
+                        q5_done_pending <= 0;
+                        if (q5_pulse_blk == 6'd55) q5_last_pulsed <= 1;
                     end
+
                     // Last block dispatched: wait for its compute to finish, then
                     // read the results.
                     if (q5_last_pulsed && q5_done_rise) begin
                         q5_unpack_word <= 0;
                         state <= Q5_READ_RES;
                     end
+
                     // Timeout (stall detector): count cycles with no unpack active
                     if (&timeout_cnt && !rd_unpack_active) begin
                         timeout_cnt <= 0;

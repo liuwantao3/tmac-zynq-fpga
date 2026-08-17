@@ -153,9 +153,88 @@ result before the next step begins.
   ~528M -> ~374M (~5.3s -> ~3.7s @ 100 MHz). Bitstream B1E46B14 md5 / BOOT.BIN
   A588409D (deployed to SD).
 
+- **Step 3 (COMPLETE 2026-08-17):** pipeline the Q5 block reads so the ~50-cycle
+  DDR latency per 48-B burst is amortized into a continuous stream (the board was
+  read-bound: per-block ~70 cyc = latency + 12 beats + 6 words, and 56 x 70 ~=
+  the measured non-compute tile cost). Implemented in two coordinated changes
+  (3a read master + 3b FSM), after one reverted attempt that exposed a subtle
+  buffer-tracking bug (see below). Verified on silicon: every `[q5 acc=gold]` and
+  `[q8 acc=gold]` bit-exact, no `[q8 RAWDIFF]`, generation starts `9370 3837`
+  (matches sim greedy reference). Bitstream `A5C1505757285D013FF42839EC310B1F222
+  BAB0A8764B1AB37E162767596A848` / BOOT.BIN `ED866A07...` (deployed to SD).
+
+- **Step 3a (COMPLETE 2026-08-17):** pipelined AR support in `axihp_read_master.v`.
+  A 1-deep start queue accepts `start_rise` while a burst drains; the next burst's
+  AR is issued as soon as the AR channel is free (SEND_AR), or completes its
+  handshake while the current burst drains in READ_BEAT/PRESENT, so consecutive
+  bursts pipeline on the PS7 HP0. `done` pulses per burst (even when a queued
+  burst is promoted), so per-burst consumers (Q5 blocks, Q8 weight bursts) are
+  unchanged; single-flight callers (Q8, CPU_OP) are unaffected. New focused test
+  `tb_read_master_pipe.v` PASSED.
+
+- **Step 3b (COMPLETE 2026-08-17):** Q5 read-ahead + double-buffered unpack in
+  hp_fsm_top.v. Added buffer B (q5_blkB_*), explicit per-block buffer tracking
+  (`q5_unpack_blk` follows the block index being unpacked, NOT a free-running
+  flip - this is the fix over the reverted attempt below), an arm/pulse dispatch
+  (`q5_pulse_arm`/`q5_pulse_buf`), and read-ahead issuing gated on `!rd_start`
+  (the block-0 issue in Q5_BLOCK_COMPUTE leaves `rd_start` high for one cycle;
+  without the gap the block-1 issue collides and is silently dropped, shifting the
+  pipeline and stalling on block 55). Two correctness guards:
+  - **Read-ahead gate** `!rd_start` prevents a dropped `start` when the master is
+    still busy with the just-issued burst.
+  - **In-order dispatch guard** (`q5_next_expected = dispatched+1`): the Q5 core
+    addresses activations by its internal pulse-order `blk_counter` (`act_blk =
+    row_high ? blk_counter-28 : blk_counter`, `act_mem[0:1023]`), so blocks MUST
+    pulse strictly 0..55. The old A-first preference dispatched block N+2 (in A)
+    before block N+1 (in B) once reads ran ahead, multiplying block N+2's weights
+    against the wrong activation segment (invisible under all-1s tests, exposed by
+    21-run in-order tracing in sim). Only the buffer holding `q5_next_expected`
+    may dispatch.
+
+  **Sim verification:** 21 runs x 56 blocks strictly in-order; `tb_hp_fsm_q5_0`
+  10/10 + `tb_hw_fsm_comprehensive` 10/10 + `tb_matmul_q8` 6/6 + `tb_q5_negd`
+  ALL PASS; no `$display` debug left in the RTL.
+  **Vivado:** first build WNS -0.751 (263 fail) -> recovered via
+  `vivado_integration/improve_timing.tcl` (Performance_Explore + ExtraTimingOpt
+  place + AggressiveExplore route + phys_opt) to **WNS -0.343, 6 failing
+  endpoints** (comparable to the documented working -0.209/7 build; critical path
+  is the pre-existing Q5-core `wi_reg -> act_mem -> q5 -> acc` route). Slice
+  4,349 (98.84%).
+
+- **Step 3 first attempt (ATTEMPTED + REVERTED 2026-08-17):** an earlier 3b used
+  a `q5_unpack_buf` flip to select the unpack target. **BUG FOUND in sim:** the
+  flip desynchronized from the block-to-buffer assignment (`q5_blk_counter%2`)
+  partway through a tile - block 54's data unpacked into the wrong buffer, the
+  last block never dispatched, and the FSM stalled. Reverted to the verified
+  Step 2 state. **Lesson applied:** track the unpack buffer explicitly per block
+  index (as the final 3b does with `q5_unpack_blk`) rather than a free-running
+  flip.
+
+- **D1 (ATTEMPTED + REVERTED 2026-08-17):** FSM buffers -> LUTRAM. Tried the
+  simple approach (`ram_style = "distributed"` hint on act_buf/acc_buf + serialize
+  Q5_READ_RES's 4 simultaneous writes). **FAILED:** Vivado ignored the hint (FF
+  count unchanged at 14,076, LUT-as-Memory unchanged at 177) because the access
+  pattern is not single-write-port / single-read-port (act_buf has 4 write
+  sources, acc_buf has 2 read addresses) - distributed-RAM inference needs ONE
+  muxed write port + ONE muxed read port. The build even regressed (slice 4,243
+  -> 4,310, timing 7 -> 53 failing) from the added serialization logic at the
+  congested edge. Reverted. **A proper conversion needs an explicit single-port
+  restructure (mux all write/read sources into one port each) - moderate effort,
+  and AGENTS.md already flags D1 as ~50-70 slices ("not the bottleneck": the
+  slice limit is the 307 control sets + carry/mux, not FFs).**
+
 ## Decisions log
 
 - 2026-08-17: priority = throughput; end goal = faster/leaner Q5/Q8 (not
   re-fitting Q4/Q6).
 - 2026-08-17 (Phase 1 result): Q5 is ~99.7% of FPGA cycles and 72% DDR-bound;
   re-ranked Phase 2 to Q5-first, Q8 widening deprioritized (0.3% impact).
+- 2026-08-17 (Step 3 attempt): Q5 read-ahead + read-master pipelining attempted
+  and REVERTED - the double-buffer unpack-target flip desynced mid-tile in sim.
+  Cleaner buffer/target tracking needed before re-attempting.
+- 2026-08-17 (Step 3 re-attempt, COMPLETE): unpack target tracked per block index
+  (`q5_unpack_blk`) instead of a free-running flip; read-ahead gated on `!rd_start`;
+  in-order dispatch guard added after out-of-order pulses (block N+2 before N+1)
+  were seen once reads ran ahead. All sim regressions PASS, board `--compare`
+  bit-exact, generation `9370 3837`. Bitstream A5C15057 (WNS -0.343 via
+  improve_timing.tcl) / BOOT.BIN ED866A07 deployed.
