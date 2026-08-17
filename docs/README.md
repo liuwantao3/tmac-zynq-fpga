@@ -4,6 +4,8 @@
 - [architecture.md](architecture.md) — Full system architecture: model dimensions, quantization types, dequant formulas, bugs found, inference pipeline
 - [AGENTS.md](AGENTS.md) — FPGA development workflow + full architecture, register map, debug guide
 - [infrastructure.md](infrastructure.md) — Board infrastructure & lessons learned: UART0 console, DDR3/AXI HP0, PS7 clocks/PLL, JTAG/DAP
+- [debug_experiences.md](debug_experiences.md) — Debugging toolbox: ILA (Integrated Logic Analyzer) implementation + runtime + analysis (first ILA campaign 2026-08-16), iVerilog sim discipline, on-board compare/trace, golden models, host-side repros
+- [debug_procedures.md](debug_procedures.md) — XSDB/DAP/ps7_init quick reference, AFI regs, FSM-hang decode
 - [Q4_K_IMPLEMENTATION_PLAN.md](Q4_K_IMPLEMENTATION_PLAN.md) — Q4_K implementation plan (archived post-implementation)
 - [PROGRESS_SUMMARY.md](PROGRESS_SUMMARY.md) — Historical progress tracking (INT4 era, kept for reference)
 - [hls_q8_kernel_explanation.md](hls_q8_kernel_explanation.md) — Legacy HLS Q8 kernel line-by-line explanation

@@ -26,7 +26,7 @@ module tb_hw_fsm_comprehensive;
     wire [63:0] m_axi_rdata;    wire [1:0]  m_axi_rresp;
     wire [5:0]  m_axi_rid;      wire m_axi_rvalid, m_axi_rready, m_axi_rlast;
 
-    reg [63:0] ddr_mem [0:524287];
+    reg [63:0] ddr_mem [0:1048575];
 
     task ddr_write32(input [31:0] addr, input [31:0] val);
         if (addr[2])
@@ -41,7 +41,7 @@ module tb_hw_fsm_comprehensive;
             ddr_read32 = ddr_mem[addr[31:3]][31:0];
     endfunction
 
-    // Write state machine — supports INCR burst (awlen > 0, wlast)
+    // Write state machine �?supports INCR burst (awlen > 0, wlast)
     localparam WR_IDLE = 0, WR_WRITE = 1, WR_WAIT_B = 2;
     reg [1:0] wr_state;
     reg [31:0] wr_addr_cur;
@@ -81,7 +81,7 @@ module tb_hw_fsm_comprehensive;
         end
     end
 
-    // Read state machine — ARSIZE=2, data on RDATA[31:0]
+    // Read state machine �?ARSIZE=2, data on RDATA[31:0]
     reg [7:0]  rd_beats_done, rd_beats_total;
     reg [31:0] rd_addr_base;
     reg        rd_busy;
@@ -144,6 +144,10 @@ module tb_hw_fsm_comprehensive;
 
     reg [31:0] rd_val;
     integer i, pass_count, fail_count, test_num;
+    integer gf, gok;
+    integer qt;
+    reg [63:0] gold_val, got64;
+    reg [31:0] got_lo, got_hi;
 
     task axil_write(input [15:0] addr, input [31:0] data);
         @(negedge clk);
@@ -272,6 +276,67 @@ module tb_hw_fsm_comprehensive;
         ddr_write32(desc_addr + 28, 32'h00000000);
     endtask
 
+    // ---- Q5_0 descriptor setup (tensor_type=1) ----
+    task setup_q5_desc(input [31:0] desc_addr, input [31:0] next_addr,
+                       input [31:0] weight_addr, input [31:0] act_addr,
+                       input [31:0] res_addr, input [23:0] act_bytes,
+                       input [15:0] num_tiles);
+        ddr_write32(desc_addr + 0,  next_addr);
+        ddr_write32(desc_addr + 4,  weight_addr);
+        ddr_write32(desc_addr + 8,  act_addr);
+        ddr_write32(desc_addr + 12, res_addr);
+        ddr_write32(desc_addr + 16, 32'h00000001);  // tensor_type=1 (Q5_0)
+        ddr_write32(desc_addr + 20, {num_tiles[15:8], num_tiles[7:0], 8'h00, 8'h00});
+        ddr_write32(desc_addr + 24, {8'h00, act_bytes});
+        ddr_write32(desc_addr + 28, 32'h00000000);
+    endtask
+
+    // Fill Q5_0 weight data: 56 blocks x 48 bytes (all q5=+1, d=1.0), then 8 B row_norm.
+    task fill_q5_weight_all1(input [31:0] base);
+        integer b, k;
+        for (b = 0; b < 56; b = b + 1) begin
+            ddr_write8(base + b*48 + 0, 8'h00);   // core0 d = 0x3C00 (f16 1.0)
+            ddr_write8(base + b*48 + 1, 8'h3C);
+            for (k = 0; k < 4; k = k + 1) ddr_write8(base + b*48 + 2 + k, 8'hFF);  // qh
+            for (k = 0; k < 16; k = k + 1) ddr_write8(base + b*48 + 6 + k, 8'h11); // qs = +1
+            ddr_write8(base + b*48 + 22, 8'h00);  // core1 d = 0x3C00
+            ddr_write8(base + b*48 + 23, 8'h3C);
+            for (k = 0; k < 4; k = k + 1) ddr_write8(base + b*48 + 24 + k, 8'hFF);
+            for (k = 0; k < 16; k = k + 1) ddr_write8(base + b*48 + 28 + k, 8'h11);
+        end
+        for (k = 0; k < 4; k = k + 1) begin  // row_norm = 1.0 (UQ8.8 0x0100)
+            ddr_write8(base + 2688 + k*2, 8'h00);
+            ddr_write8(base + 2688 + k*2 + 1, 8'h01);
+        end
+    endtask
+
+    // byte-level write into ddr_mem (64-bit words, little-endian byte order)
+    task ddr_write8(input [31:0] addr, input [7:0] val);
+        integer w;
+        reg [63:0] cur;
+        w = addr[31:3];
+        cur = ddr_mem[w];
+        case (addr[2:0])
+            0: ddr_mem[w] = {cur[63:8], val};
+            1: ddr_mem[w] = {cur[63:16], val, cur[7:0]};
+            2: ddr_mem[w] = {cur[63:24], val, cur[15:0]};
+            3: ddr_mem[w] = {cur[63:32], val, cur[23:0]};
+            4: ddr_mem[w] = {cur[63:40], val, cur[31:0]};
+            5: ddr_mem[w] = {cur[63:48], val, cur[39:0]};
+            6: ddr_mem[w] = {cur[63:56], val, cur[47:0]};
+            7: ddr_mem[w] = {val, cur[55:0]};
+        endcase
+    endtask
+
+    // Fill 896 x int16 activations (little-endian)
+    task fill_q5_acts(input [31:0] base, input [15:0] val);
+        integer a;
+        for (a = 0; a < 896; a = a + 1) begin
+            ddr_write8(base + a*2, val[7:0]);
+            ddr_write8(base + a*2 + 1, val[15:8]);
+        end
+    endtask
+
     // Fill activation with INT16 1 (0x0001 little-endian)
     task fill_act_all1(input [31:0] base_addr, input [23:0] nbytes);
         integer j;
@@ -387,7 +452,7 @@ module tb_hw_fsm_comprehensive;
         pass_count = 0; fail_count = 0; test_num = 0;
 
         // ===================================================================
-        // Test 1: Basic 64 bytes (regression — matches working hardware test)
+        // Test 1: Basic 64 bytes (regression �?matches working hardware test)
         // ===================================================================
         test_num = test_num + 1;
         $display("\n--- Test %0d: Basic 64 bytes ---", test_num);
@@ -403,7 +468,7 @@ module tb_hw_fsm_comprehensive;
         verify_pattern_inc(32'h00302000, 64, test_num);
 
         // ===================================================================
-        // Test 2: Minimum 8 bytes (1 word — edge case for write master)
+        // Test 2: Minimum 8 bytes (1 word �?edge case for write master)
         // ===================================================================
         test_num = test_num + 1;
         $display("\n--- Test %0d: Minimum 8 bytes ---", test_num);
@@ -422,7 +487,7 @@ module tb_hw_fsm_comprehensive;
         end
 
         // ===================================================================
-        // Test 3: 128 bytes (2 HP read bursts — verifies multi-burst path)
+        // Test 3: 128 bytes (2 HP read bursts �?verifies multi-burst path)
         // ===================================================================
         test_num = test_num + 1;
         $display("\n--- Test %0d: 128 bytes (2 bursts) ---", test_num);
@@ -437,7 +502,7 @@ module tb_hw_fsm_comprehensive;
         verify_pattern_inc(32'h00302100, 128, test_num);
 
         // ===================================================================
-        // Test 4: 256 bytes max (4 HP read bursts — max act_buf)
+        // Test 4: 256 bytes max (4 HP read bursts �?max act_buf)
         // ===================================================================
         test_num = test_num + 1;
         $display("\n--- Test %0d: 256 bytes max (4 bursts) ---", test_num);
@@ -527,7 +592,7 @@ module tb_hw_fsm_comprehensive;
         // Verify first run result
         verify_pattern_inc(32'h00302500, 64, test_num);
 
-        // Set up second descriptor — must use different DDR addresses
+        // Set up second descriptor �?must use different DDR addresses
         setup_desc(32'h00300220, 32'h00000000, 32'h00301540, 32'h00302540, 32);
         write_pattern_const(32'h00301540, 32, 8'h5A);
         zero_fill(32'h00302540, 32);
@@ -604,6 +669,63 @@ module tb_hw_fsm_comprehensive;
         $display("  Test %0d: verify done (failures counted above)", test_num);
 
         // ===================================================================
+        // Test 14: Q5_0 -> Q8 real-data (blk.0.attn_v tile 0) transition
+        //   Loads the real DDR image (q8_real.mem) + golden (q8_golden.mem),
+        //   runs a Q5_0 descriptor first (stale-state trigger), then the Q8
+        //   descriptor with real (saturated) scales, verifies vs golden.
+        // ===================================================================
+        test_num = test_num + 1;
+        $display("\n--- Test %0d: Q5->Q8 real-data transition (multi-tile Q5) ---", test_num);
+        // Reset the FSM + core so the Q8 below is the "first Q8 ever" (board condition).
+        rst_n = 0; #40; rst_n = 1; #40;
+        // Load real Q8 DDR image: 7840 x 64-bit words at ddr_mem index 0x60000 (= addr 0x00300000)
+        $readmemh("q8_real.mem", ddr_mem, 32'h60000, 32'h60000 + 7840 - 1);
+        // Q5_0 descriptor first: 32 tiles (matches attn_k), weights at 0x00400000
+        for (qt = 0; qt < 32; qt = qt + 1)
+            fill_q5_weight_all1(32'h00400000 + qt*2696);
+        fill_q5_acts(32'h00410000, 16'h0001);
+        zero_fill(32'h00411000, 32*32);
+        setup_q5_desc(32'h00412000, 32'h00000000, 32'h00400000,
+                      32'h00410000, 32'h00411000, 24'd1792, 16'd32);
+        start_chain(32'h00412000);
+        wait_done(1);
+        axil_read(16'h14, rd_val);
+        $display("  Q5 STATUS=0x%08x (expect 0x300)", rd_val);
+        // Q8 descriptor: weights at 0x00300000, acts at 0x0030EE00, result at 0x00311000
+        zero_fill(32'h00311000, 1024);
+        setup_q8_desc_mg(32'h00310000, 32'h00000000, 32'h00300000,
+                         32'h0030EE00, 32'h00311000, 8'd14);
+        start_chain(32'h00310000);
+        wait_done(1);
+        axil_read(16'h14, rd_val);
+        $display("  Q8 STATUS=0x%08x (expect 0x300)", rd_val);
+        axil_read(16'h28, rd_val); $display("  Q8 DEBUG=0x%08x", rd_val);
+        axil_read(16'h20, rd_val); $display("  Q8 HEAD=%d (expect 1)", rd_val);
+        // verify vs golden
+        gf = $fopen("q8_golden.mem", "r");
+        if (gf == 0) begin
+            $display("  FATAL: no q8_golden.mem"); fail_count = fail_count + 1;
+        end else begin
+            for (i = 0; i < 64; i = i + 1) begin
+                gok = $fscanf(gf, "%x", gold_val);
+                // FPGA raw is 48-bit sign-extended to 64 by the FSM writeback? no: zero-extended.
+                // Sign-extend FPGA result from bit 47 before compare.
+                got_lo = ddr_read32(32'h00311000 + i*8);
+                got_hi = ddr_read32(32'h00311000 + i*8 + 4);
+                got64 = {got_hi, got_lo};
+                if (got64[47]) got64 = got64 | 64'hFFFF000000000000;
+                if (got64 !== gold_val) begin
+                    if (i < 8 || fail_count < 16)
+                        $display("  FAIL[%0d]: row %0d got=0x%016x gold=0x%016x",
+                                 test_num, i, got64, gold_val);
+                    fail_count = fail_count + 1;
+                end
+            end
+            $fclose(gf);
+        end
+        $display("  Test %0d: real-data verify done", test_num);
+
+        // ===================================================================
         // Summary
         // ===================================================================
         $display("\n==============================================");
@@ -615,7 +737,7 @@ module tb_hw_fsm_comprehensive;
         #100 $finish;
     end
 
-    initial #1000000 begin
+    initial #200000000 begin
         $display("TIMEOUT");
         $finish;
     end

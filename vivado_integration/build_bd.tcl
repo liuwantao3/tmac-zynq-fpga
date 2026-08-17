@@ -124,7 +124,6 @@ connect_bd_net [get_bd_pins ps7/FCLK_RESET0_N] [get_bd_pins axi_lite/S00_ARESETN
 connect_bd_net [get_bd_pins ps7/FCLK_RESET0_N] [get_bd_pins axi_lite/M00_ARESETN]
 connect_bd_net [get_bd_pins ps7/FCLK_RESET0_N] [get_bd_pins axi_hp_top/rst_n]
 
-
 # Validate
 validate_bd_design
 

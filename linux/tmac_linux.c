@@ -102,6 +102,10 @@ static Tensor* get_tensor(const char* name); /* fwd decl (used by load_model) */
 static int g_use_cpu = 0;
 /* --compare flag: run BOTH CPU + FPGA paths per matmul and print the diff */
 static int g_compare = 0;
+/* --clkdiv flag: runtime FCLK_CLK0 divisor (SLCR FPGA_CLK_CTRL[13:8],
+ * default 4 = 100 MHz). 8 = 50 MHz, 16 = 25 MHz. Diagnostic for the Q8
+ * first-run corruption (timing-margin test, no bitstream rebuild needed). */
+static int g_clkdiv = 0;
 
 /* F32 scratch for forward_layer (avoids stack overflow) */
 static float* g_scratch = NULL;
@@ -507,34 +511,11 @@ static int fpga_q8_tile(const Tensor* A, const uint8_t* wt, const int16_t* xq,
                FPGA_WEIGHT_REFMT+Q8_TILE_STRIDE+0x10000, DESC_Q8,
                Q8_NUM_GROUPS, 1, Q8_GROUP_COLS*2);
 
-    if (chain_run(DESC_CHAIN_BASE, 1) < 0) return -1;
-
     // Golden raw reference (bit-exact fixed point, no float mismatch)
     int64_t gold[Q8_TILE_ROWS];
     q8_golden_raw(A, row0, nrows, (int)A->cols, xq, row_scale, gold);
 
     uint32_t* r = (uint32_t*)ddr(FPGA_WEIGHT_REFMT+Q8_TILE_STRIDE+0x10000);
-    dcache_inval(r, nrows*8);
-
-    /* ---- Q8 first-run warm-up (2026-08-14) ----
-     * Root cause (hardware-verified): a Q8 descriptor processed immediately
-     * after a Q5_0 descriptor produces corrupted results on rows 16-63 (acc
-     * bank groups g=2..7). Re-running the identical descriptor produces
-     * bit-exact correct results (verified via rerun + per-group isolation:
-     * grp14 fpga == golden exactly). The corruption is stale FSM/core state
-     * left by the Q5->Q8 transition that is cleared by the first Q8 compute.
-     *
-     * Mitigation: run every Q8 descriptor twice (warm-up + real). The first
-     * run clears the stale state and its result is discarded; the second run
-     * is bit-exact correct. This adds one extra chain_run per Q8 tile (2x
-     * cost on Q8 matmuls: attn_v + logits), which is small vs the Q5/Q6/Q4
-     * CPU-side work. */
-    {
-        /* The descriptor and DDR data are already set up above (weights/scales/
-         * acts copied + flushed, descriptor written). Run once as warm-up to
-         * clear any stale FSM state left by a preceding Q5_0 descriptor. */
-        if (chain_run(DESC_CHAIN_BASE, 1) < 0) return -1;
-    }
 
     if (chain_run(DESC_CHAIN_BASE, 1) < 0) return -1;
     dcache_inval(r, nrows*8);
@@ -900,6 +881,7 @@ int main(int argc, char** argv) {
     /* --compare flag: run both CPU+FPGA per matmul and print the diff */
     /* --trace flag: per-layer hidden-state comparison (FPGA vs CPU) */
     /* --selftest: minimal CPU_OP DDR copy (isolates PL DDR path from compute) */
+    /* --clkdiv N: runtime FCLK_CLK0 divisor (4=100MHz, 8=50MHz, 16=25MHz) */
     const char* model_path = NULL;
     int prompt[256];
     int np = 0;
@@ -914,6 +896,8 @@ int main(int argc, char** argv) {
             do_trace = 1;
         } else if (strcmp(argv[i], "--selftest") == 0) {
             do_selftest = 1;
+        } else if (strcmp(argv[i], "--clkdiv") == 0 && i+1 < argc) {
+            g_clkdiv = atoi(argv[++i]);
         } else if (model_path == NULL) {
             model_path = argv[i];          /* first non-flag arg = model */
         } else if (np < 256) {
@@ -954,6 +938,24 @@ int main(int argc, char** argv) {
             volatile uint32_t* slcr = map_mem(0xF8000000, 0x10000);
             if (!slcr) { fprintf(stderr,"Cannot map SLCR\n"); return 1; }
             slcr[0x0008/4] = 0x0000DF0D;      /* unlock SLCR (SLCR_UNLOCK) */
+
+            /* Optional runtime PL clock slowdown (--clkdiv N). FPGA_CLK_CTRL
+             * DIVISOR0 field [13:8] divides the 400 MHz PLL source; 4 => 100
+             * MHz, 8 => 50 MHz, 16 => 25 MHz. Read-modify-write to preserve
+             * SRCSEL/DIVISOR1/CLK_ACT. Diagnostic only: no bitstream rebuild.
+             * NOTE: in the XSA ps7_init DIVISOR0=4 (0x00400400); build_bd.tcl
+             * patches in CLK0/CLK1_EN (0x00480480), so never overwrite bits
+             * [7:0]/[25:20] blindly. */
+            if (g_clkdiv > 0) {
+                const uint32_t DIVISOR0_MASK = 0x00003F00U;   /* bits [13:8] */
+                uint32_t ctrl = slcr[0x0170/4];
+                uint32_t old_div = (ctrl & DIVISOR0_MASK) >> 8;
+                ctrl = (ctrl & ~DIVISOR0_MASK) | ((uint32_t)g_clkdiv << 8);
+                slcr[0x0170/4] = ctrl;
+                printf("FCLK_CLK0 divisor %u -> %d (FPGA_CLK_CTRL=0x%08lx)\n",
+                       old_div, g_clkdiv, (unsigned long)ctrl);
+            }
+
             slcr[0x8000/4] = 0x00000005;      /* AFI0_CTRL: enable + SLVERR */
             slcr[0x8008/4] = 0x00000001;      /* AFI0_WRCHAN: write enable */
             slcr[0x0004/4] = 0x0000767B;      /* lock SLCR (SLCR_LOCK) */

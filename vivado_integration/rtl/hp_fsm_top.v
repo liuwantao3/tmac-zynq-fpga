@@ -110,7 +110,24 @@ module hp_fsm_top (
     (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 M_AXI_HP RLAST" *)
     input  wire         m_axi_rlast,
     // Interrupt output (CPU_OP descriptor)
-    output wire         interrupt
+    output wire         interrupt,
+    // ===== ILA debug probe bus (2026-08-16) =====
+    // Packs FSM + Q8-core signals to observe the first-Q8-after-Q5 corruption.
+    // Trimmed to 142 bits (slice budget: full 238-bit bus failed placement).
+    // 48-bit acc values are reduced to their low 32 bits (enough to distinguish
+    // garbage from zero at first RMW).
+    // Bit layout (142 total):
+    //   [0]      dbg_first_q8 (1-cycle pulse on first Q8 COMPUTE after a Q5)
+    //   [5:1]    FSM state
+    //   [8:6]    q8_busy / q8_start / q8_done
+    //   [12:9]   col_group
+    //   [18:13]  q8_res_addr
+    //   [50:19]  q8_res_dout[31:0]
+    //   [53:51]  core dbg_state   [59:54] dbg_k   [62:60] dbg_g
+    //   [67:63]  core acc_clr_cnt [68] p2_valid   [74:69] p2_row_base
+    //   [106:75] core acc_rw_rd[31:0]   [138:107] p2_partial0[31:0]
+    //   [141:139] core pre_read_g
+    output wire [141:0] dbg_bus
 );
 
     // ===== Registers =====
@@ -224,6 +241,14 @@ module hp_fsm_top (
     wire [2:0]  q8_core_state;
     wire [5:0]  q8_core_k;
     wire [2:0]  q8_core_g;
+    // Q8 core ILA probes
+    wire [4:0]  q8_acc_clr_cnt;
+    wire        q8_p2_valid;
+    wire [5:0]  q8_p2_row_base;
+    wire [47:0] q8_acc_rw_rd;
+    wire [47:0] q8_p2_partial0;
+    wire [2:0]  q8_pre_read_g;
+    wire [47:0] q8_acc_r0;
 
     reg        q8_start;
     reg        q8_wt_we;
@@ -245,7 +270,11 @@ module hp_fsm_top (
         .sc_we(q8_sc_we), .sc_addr(q8_sc_addr), .sc_din(q8_sc_din),
         .act_we(q8_act_we), .act_addr(q8_act_addr), .act_din(q8_act_din),
         .res_addr(q8_res_addr), .res_dout(q8_res_dout),
-        .dbg_state(q8_core_state), .dbg_k(q8_core_k), .dbg_g(q8_core_g)
+        .dbg_state(q8_core_state), .dbg_k(q8_core_k), .dbg_g(q8_core_g),
+        .dbg_acc_clr_cnt(q8_acc_clr_cnt), .dbg_p2_valid(q8_p2_valid),
+        .dbg_p2_row_base(q8_p2_row_base), .dbg_acc_rw_rd(q8_acc_rw_rd),
+        .dbg_p2_partial0(q8_p2_partial0), .dbg_pre_read_g(q8_pre_read_g),
+        .dbg_acc_r0(q8_acc_r0)
     );
 
     // ===== Q5_0 Compute Cores (2 parallel, each handles 2 of 4 rows) =====
@@ -513,6 +542,48 @@ module hp_fsm_top (
     assign wr_wdata = act_buf[wr_byte_offset[8:3]];
     assign q8_done_rise = q8_done && !q8_done_d;
 
+    // ===== ILA trigger (2026-08-16) =====
+    // dbg_first_q8 pulses once on the FIRST Q8 COMPUTE entry after a Q5_0
+    // descriptor has completed. The corruption is "first Q8 after a Q5", so this
+    // captures the CLEAR_ACC + first COMPUTE + first READ_RES_ACC window.
+    reg q5_seen;              // set when a Q5_0 descriptor compute completes
+    reg dbg_q8_trig_done;     // latch so the pulse fires only once
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            q5_seen <= 0;
+            dbg_q8_trig_done <= 0;
+        end else begin
+            if (state == Q5_READ_RES) q5_seen <= 1;
+            if (dbg_first_q8)        dbg_q8_trig_done <= 1;
+        end
+    end
+    wire dbg_first_q8 = (state == COMPUTE) && q5_seen && !dbg_q8_trig_done;
+
+    // Pack the ILA probe bus (see port comment for bit layout)
+    // NOTE: q8_acc_r0 deliberately NOT probed — that would force the core's
+    // dead acc_r pre-read block (and its LUTRAM read port) live, changing the
+    // acc-bank access structure vs. the current bitstream. Keep it unused so
+    // the observed behavior matches the deployed design.
+    assign dbg_bus = {
+        q8_pre_read_g,          // [141:139]
+        q8_p2_partial0[31:0],   // [138:107]
+        q8_acc_rw_rd[31:0],     // [106:75]
+        q8_p2_row_base,         // [74:69]
+        q8_p2_valid,            // [68]
+        q8_acc_clr_cnt,         // [67:63]
+        q8_core_g,              // [62:60]
+        q8_core_k,              // [59:54]
+        q8_core_state,          // [53:51]
+        q8_res_dout[31:0],      // [50:19]
+        q8_res_addr,            // [18:13]
+        col_group,              // [12:9]
+        q8_done,                // [8]
+        q8_start,               // [7]
+        q8_busy,                // [6]
+        state,                  // [5:1]
+        dbg_first_q8            // [0]
+    };
+
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             state <= IDLE;
@@ -688,6 +759,7 @@ module hp_fsm_top (
                             col_group     <= 0;
                             wt_byte_idx   <= 0;
                             wt_remaining  <= 4096;
+                            sc_burst_done <= 0;
                             state <= LOAD_WEIGHT;
                         end
                     end else if (&timeout_cnt) begin

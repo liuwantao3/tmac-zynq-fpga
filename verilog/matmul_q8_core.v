@@ -27,7 +27,17 @@ module matmul_q8_core (
     output wire [47:0]  res_dout,
     output wire [2:0]   dbg_state,
     output wire [5:0]   dbg_k,
-    output wire [2:0]   dbg_g
+    output wire [2:0]   dbg_g,
+    // ===== ILA debug probes (2026-08-16) =====
+    // Expose the acc-bank RMW path so the first-Q8-after-Q5 corruption can be
+    // observed on silicon. All are existing internal signals (no logic change).
+    output wire [4:0]   dbg_acc_clr_cnt,    // CLEAR_ACC write address (0..7)
+    output wire         dbg_p2_valid,       // Stage 2b RMW active
+    output wire [5:0]   dbg_p2_row_base,    // RMW write address {g,row}
+    output wire [47:0]  dbg_acc_rw_rd,      // bank0 combinational RMW read value
+    output wire [47:0]  dbg_p2_partial0,    // bank0 partial product being added
+    output wire [2:0]   dbg_pre_read_g,     // pre-read bank address (dq stage)
+    output wire [47:0]  dbg_acc_r0          // registered pre-read of bank0
 );
 
     localparam IDLE      = 4'd0;
@@ -44,6 +54,13 @@ module matmul_q8_core (
     assign dbg_state = state;
     assign dbg_k = k;
     assign dbg_g = g;
+    assign dbg_acc_clr_cnt = acc_clr_cnt;
+    assign dbg_p2_valid    = p2_valid;
+    assign dbg_p2_row_base = p2_row_base;
+    assign dbg_acc_rw_rd   = acc_b0[p2_row_base[5:3]];
+    assign dbg_p2_partial0 = p2_partial[0];
+    assign dbg_pre_read_g  = pre_read_g;
+    assign dbg_acc_r0      = acc_r[0];
     integer wi_i;
 
     // ======================================================================
@@ -213,7 +230,19 @@ module matmul_q8_core (
 
     reg        p2a_valid;
 
-`ifdef __ICARUS__
+    // ======================================================================
+    // Power-up initialization (synthesizable on Xilinx: initial-block constant
+    // assignments to distributed RAM become the LUT INIT/power-up values).
+    //
+    // 2026-08-14: previously this was gated behind `__ICARUS__`, so on real
+    // silicon acc_b0..7 / smem_bank0..7 (distributed RAM) powered up with
+    // garbage. CLEAR_ACC/LOAD_SCALES should overwrite them before use, but the
+    // first-ever Q8 compute after a Q5_0 descriptor showed stale-value
+    // corruption (rows 16-63 = acc groups g=2..7) that a re-run cleared. Zero
+    // them at power-up so the first compute never depends on CLEAR_ACC timing.
+    // (wmem/act are BRAM or fully rewritten every group, but zeroed too for
+    //  uniformity in sim.)
+    // ======================================================================
     integer _init_i;
     initial begin
         for (_init_i = 0; _init_i < 512; _init_i = _init_i + 1) begin
@@ -236,7 +265,6 @@ module matmul_q8_core (
             act_bram[_init_i] = 0;
         end
     end
-`endif
 
     // PRE-stage address registration (only update in COMPUTE state)
     reg [8:0]  pre_wmem_addr;  // {g,k} for wmem banks
