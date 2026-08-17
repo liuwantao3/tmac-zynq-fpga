@@ -126,6 +126,14 @@ module tb_hp_fsm_q5_0;
     reg [31:0] rd_val;
     integer i, j, fail_count, test_num;
 
+    // Cycle-count gate (Step 1, 2026-08-17): count cycles while the FSM is
+    // busy (uut.reg_status[15], high from chain start until DONE). start_chain
+    // snapshots the counter; wait_done reports the delta. This is the relative
+    // per-chain cost used to confirm Q5 DMA changes (baseline ~<measured below>).
+    reg [31:0] sim_cyc_busy = 0;
+    reg [31:0] cyc_mark = 0;
+    always @(posedge clk) if (uut.reg_status[15]) sim_cyc_busy <= sim_cyc_busy + 1;
+
     task axil_write(input [15:0] addr, input [31:0] data);
         @(negedge clk);
         axil_awaddr = addr; axil_awvalid = 1;
@@ -179,6 +187,7 @@ module tb_hp_fsm_q5_0;
     endtask
 
     task start_chain(input [31:0] desc_base);
+        cyc_mark = sim_cyc_busy;
         axil_write(16'h18, desc_base);
         axil_write(16'h1C, 32'd1);
         axil_write(16'h00, 32'd1);
@@ -196,6 +205,7 @@ module tb_hp_fsm_q5_0;
             else begin timeout = timeout + 1; #10; end
         end
         if (!completed) $display("  WARN: wait_done timeout");
+        $display("  [cyc] chain busy cycles = %0d", sim_cyc_busy - cyc_mark);
     endtask
 
     // Write Q5_0 weight data in per-block layout:

@@ -6,6 +6,8 @@
 - [infrastructure.md](infrastructure.md) — Board infrastructure & lessons learned: UART0 console, DDR3/AXI HP0, PS7 clocks/PLL, JTAG/DAP
 - [debug_experiences.md](debug_experiences.md) — Debugging toolbox: ILA (Integrated Logic Analyzer) implementation + runtime + analysis (first ILA campaign 2026-08-16), iVerilog sim discipline, on-board compare/trace, golden models, host-side repros
 - [debug_procedures.md](debug_procedures.md) — XSDB/DAP/ps7_init quick reference, AFI regs, FSM-hang decode
+- [q5_q8_optimization_plan.md](q5_q8_optimization_plan.md) — Q5/Q8 optimization plan (throughput-first): phases, levers, sequencing
+- [q5_q8_core_analysis.md](q5_q8_core_analysis.md) — Line-by-line walkthrough of the Q5_0/Q8_0 cores + FSM interaction, with a cycle-level model
 - [Q4_K_IMPLEMENTATION_PLAN.md](Q4_K_IMPLEMENTATION_PLAN.md) — Q4_K implementation plan (archived post-implementation)
 - [PROGRESS_SUMMARY.md](PROGRESS_SUMMARY.md) — Historical progress tracking (INT4 era, kept for reference)
 - [hls_q8_kernel_explanation.md](hls_q8_kernel_explanation.md) — Legacy HLS Q8 kernel line-by-line explanation

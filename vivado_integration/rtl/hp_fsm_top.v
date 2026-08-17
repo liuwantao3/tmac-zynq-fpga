@@ -446,6 +446,9 @@ module hp_fsm_top (
     reg [7:0]  q5_unpack_cnt;       // counter for packing rd_data words (0..5)
     reg [9:0]  q5_copy_act_idx;     // activation copy index (0..895)
     reg [3:0]  q5_unpack_word;      // which 64-bit rd_data word being captured (0..5)
+    reg [5:0]  q5_dispatched;       // block index last pulsed to the cores (63 = none)
+    reg        q5_done_pending;     // latched core-compute-done (q5_done_rise) for overlap dispatch
+    reg        q5_last_pulsed;      // set when block 55 is dispatched (no more fetches)
 
     // ===== Buffer =====
     reg [7:0] desc_buf [0:31];    // 32-byte descriptor
@@ -651,6 +654,9 @@ module hp_fsm_top (
             q5_blk_valid_pulsed <= 0;
             q5_act_we       <= 0; q5_act_addr <= 0; q5_act_din <= 0;
             q5_blk_counter  <= 0;
+            q5_dispatched   <= 6'd63;
+            q5_done_pending <= 0;
+            q5_last_pulsed  <= 0;
             q5_unpack_cnt   <= 0;
             q5_copy_act_idx <= 0;
             q5_unpack_word  <= 0;
@@ -1074,13 +1080,18 @@ module hp_fsm_top (
                 end
 
                 Q5_BLOCK_COMPUTE: begin
-                    // Read 48 bytes (12 AXI beats = 6 × 64-bit) per-block data from DDR
+                    // Issue the FIRST block read (block 0). Subsequent reads are
+                    // issued by the overlap dispatch in Q5_BLOCK_COMPUTE_W while the
+                    // previous block computes (Step 2, 2026-08-17).
                     rd_addr <= weight_addr + q5_tile_counter * 2696 + q5_blk_counter * 48;
                     rd_len <= 8'd11;    // 12 beats × 4 bytes = 48 bytes
                     rd_start <= 1;      // pulse start for read master
                     q5_unpack_cnt <= 0;
                     q5_unpack_word <= 0;
                     q5_blk_valid_pulsed <= 0;
+                    q5_dispatched <= 6'd63;  // no block dispatched yet
+                    q5_done_pending <= 0;
+                    q5_last_pulsed <= 0;
                     sc_burst_done <= 0;
                     timeout_cnt <= 0;   // reset timeout counter at entry
                     if (q5_blk_counter == 0) begin
@@ -1138,24 +1149,45 @@ module hp_fsm_top (
                         sc_burst_done <= 1;
                         timeout_cnt <= 0;
                     end
-                    // After all 6 words captured, pulse blk_valid to Q5 core
-                    if (q5_unpack_word == 6 && !q5_blk_valid && !q5_blk_valid_pulsed) begin
-                        q5_blk_valid <= 1;
-                        q5_blk_valid_pulsed <= 1;
-                        timeout_cnt <= 0;
-                    end
-                    // Wait for compute done
-                    if (q5_done_rise) begin
-                        q5_blk_counter <= q5_blk_counter + 1;
-                        q5_blk_valid <= 0;  // clear so next block can re-pulse
-                        timeout_cnt <= 0;
-                        if (q5_blk_counter == 55) begin
-                            q5_unpack_word <= 0;
-                            state <= Q5_READ_RES;
+                    // Latch core-compute-done for the overlap dispatch
+                    // (q5_done_rise is a 1-cycle pulse).
+                    if (q5_done_rise) q5_done_pending <= 1;
+                    // Overlap dispatch (Step 2, 2026-08-17): when the loaded block's
+                    // 6 words are unpacked AND nothing is computing (first block) or
+                    // the previous block's compute is done, pulse blk_valid and
+                    // immediately start fetching the next block. The cores latch
+                    // d/qh/qs on the blk_valid pulse, so the q5_blk_* regs are free
+                    // to be reused - the block g+1 DDR read runs behind block g's
+                    // 37-cycle compute instead of after it.
+                    if (q5_unpack_word == 6 && q5_blk_counter != q5_dispatched &&
+                        (q5_dispatched == 6'd63 || q5_done_pending)) begin
+                        q5_blk_valid <= 1;            // 1-cycle pulse (default-off)
+                        q5_done_pending <= 0;
+                        if (q5_blk_counter < 55) begin
+                            q5_dispatched   <= q5_blk_counter;
+                            q5_blk_counter  <= q5_blk_counter + 1;
+                            rd_addr         <= weight_addr + q5_tile_counter * 2696
+                                             + (q5_blk_counter + 1) * 48;
+                            rd_start        <= 1;     // fetch g+1 while g computes
+                            rd_len          <= 8'd11;
+                            q5_unpack_cnt   <= 0;
+                            q5_unpack_word  <= 0;     // restart unpack for g+1
+                            sc_burst_done   <= 0;
+                            timeout_cnt     <= 0;
                         end else begin
-                            state <= Q5_BLOCK_COMPUTE;
+                            q5_dispatched   <= 6'd55;
+                            q5_last_pulsed  <= 1;     // block 55 dispatched; no more fetches
+                            timeout_cnt     <= 0;
                         end
-                    end else if (&timeout_cnt && !rd_unpack_active) begin
+                    end
+                    // Last block dispatched: wait for its compute to finish, then
+                    // read the results.
+                    if (q5_last_pulsed && q5_done_rise) begin
+                        q5_unpack_word <= 0;
+                        state <= Q5_READ_RES;
+                    end
+                    // Timeout (stall detector): count cycles with no unpack active
+                    if (&timeout_cnt && !rd_unpack_active) begin
                         timeout_cnt <= 0;
                         timeout_src <= state;
                         state <= TIMEOUT_ERROR;

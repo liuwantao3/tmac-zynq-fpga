@@ -106,6 +106,9 @@ static int g_compare = 0;
  * default 4 = 100 MHz). 8 = 50 MHz, 16 = 25 MHz. Diagnostic for the Q8
  * first-run corruption (timing-margin test, no bitstream rebuild needed). */
 static int g_clkdiv = 0;
+/* --cycles flag: report per-matmul FPGA busy cycles (DMA + compute) */
+static int g_cycles = 0;
+static uint64_t g_cyc_q5 = 0, g_cyc_q8 = 0;
 
 /* F32 scratch for forward_layer (avoids stack overflow) */
 static float* g_scratch = NULL;
@@ -517,7 +520,9 @@ static int fpga_q8_tile(const Tensor* A, const uint8_t* wt, const int16_t* xq,
 
     uint32_t* r = (uint32_t*)ddr(FPGA_WEIGHT_REFMT+Q8_TILE_STRIDE+0x10000);
 
+    uint32_t c0 = reg_read(REG_CLK_CNT);
     if (chain_run(DESC_CHAIN_BASE, 1) < 0) return -1;
+    g_cyc_q8 += reg_read(REG_CLK_CNT) - c0;
     dcache_inval(r, nrows*8);
 
     int64_t max_raw_diff = 0; int max_raw_row = -1;
@@ -557,7 +562,9 @@ static int fpga_q5_tile(const Tensor* A, int row0, const int16_t* xq,
     Descriptor* d = (Descriptor*)ddr(DESC_CHAIN_BASE);
     desc_write(d, 0, wt, wt+Q5_TILE_TOTAL, res, DESC_Q5_0, 0, 1, (int)A->cols*2);
 
+    uint32_t c0 = reg_read(REG_CLK_CNT);
     if (chain_run(DESC_CHAIN_BASE, 1) < 0) return -1;
+    g_cyc_q5 += reg_read(REG_CLK_CNT) - c0;
 
     // Golden raw reference (bit-exact fixed point, no float mismatch)
     int64_t gold[Q5_TILE_ROWS];
@@ -605,14 +612,22 @@ static void matmul_impl(const Tensor* A, const float* x, float* y, int rows, int
     memset(y, 0, rows*4);
 
     if (A->type == TENSOR_Q8_0) {
+        uint64_t cyc0 = g_cyc_q8;
         for (int r0=0; r0<rows; r0+=Q8_TILE_ROWS) {
             int nr = (rows-r0 < Q8_TILE_ROWS) ? rows-r0 : Q8_TILE_ROWS;
             float row_scale[Q8_TILE_ROWS];
             q8_preprocess_tile(A, r0, (uint8_t*)ddr(FPGA_WEIGHT_REFMT), row_scale);
             fpga_q8_tile(A, (uint8_t*)ddr(FPGA_WEIGHT_REFMT), xq, y, r0, xs, nr, row_scale);
         }
+        if (g_cycles) printf("  cyc %-28s Q8 %5dx%-5d %9llu\n",
+                             A->name, rows, cols,
+                             (unsigned long long)(g_cyc_q8 - cyc0));
     } else if (A->type == TENSOR_Q5_0) {
+        uint64_t cyc0 = g_cyc_q5;
         for (int r0=0; r0<rows; r0+=Q5_TILE_ROWS) fpga_q5_tile(A, r0, xq, y, xs);
+        if (g_cycles) printf("  cyc %-28s Q5 %5dx%-5d %9llu\n",
+                             A->name, rows, cols,
+                             (unsigned long long)(g_cyc_q5 - cyc0));
     } else {
         cpu_matmul(A, x, y, rows, cols);
     }
@@ -882,6 +897,7 @@ int main(int argc, char** argv) {
     /* --trace flag: per-layer hidden-state comparison (FPGA vs CPU) */
     /* --selftest: minimal CPU_OP DDR copy (isolates PL DDR path from compute) */
     /* --clkdiv N: runtime FCLK_CLK0 divisor (4=100MHz, 8=50MHz, 16=25MHz) */
+    /* --cycles: report per-matmul FPGA busy cycles (DMA + compute) */
     const char* model_path = NULL;
     int prompt[256];
     int np = 0;
@@ -898,6 +914,8 @@ int main(int argc, char** argv) {
             do_selftest = 1;
         } else if (strcmp(argv[i], "--clkdiv") == 0 && i+1 < argc) {
             g_clkdiv = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--cycles") == 0) {
+            g_cycles = 1;
         } else if (model_path == NULL) {
             model_path = argv[i];          /* first non-flag arg = model */
         } else if (np < 256) {
@@ -999,6 +1017,12 @@ int main(int argc, char** argv) {
     if (do_trace) return run_trace(prompt, np);
 
     int tokens = run_inference(prompt, np);
+    if (g_cycles) {
+        uint64_t tot = g_cyc_q5 + g_cyc_q8;
+        printf("FPGA busy: Q5=%llu cyc  Q8=%llu cyc  total=%llu @100MHz=%.2f ms\n",
+               (unsigned long long)g_cyc_q5, (unsigned long long)g_cyc_q8,
+               (unsigned long long)tot, tot / 100000.0);
+    }
     printf("\nGenerated %d tokens\n", tokens);
     return 0;
 }
