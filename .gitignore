@@ -157,3 +157,7 @@ linux/boot/.analytics
 
 # Vitis Linux workspace (regenerable via XSCT — see linux/README.md "Vitis GUI")
 vitis_linux/workspace/
+
+# Learning/annotation copies of RTL (commented versions for study; not part of the build)
+learning/
+.temp/
